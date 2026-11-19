@@ -27,6 +27,7 @@ use crate::transport::{AppEvent, start_transport};
 #[derive(Debug, Parser)]
 #[command(
     name = "usher",
+    version,
     about = "Zero-daemon, SSH-bootstrapped low-latency remote desktop & game streamer"
 )]
 struct Args {

@@ -38,3 +38,50 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Verify Windows Setup installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --bin usher --bin usher-host
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build failed with exit code $LASTEXITCODE"
+          }
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          foreach ($cand in @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files (x86)\Inno Setup 7\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 7\ISCC.exe"
+          )) {
+            if (-not $iscc -and (Test-Path $cand)) {
+              $iscc = $cand
+            }
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            foreach ($cand in @(
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+              "C:\Program Files (x86)\Inno Setup 7\ISCC.exe",
+              "C:\Program Files\Inno Setup 6\ISCC.exe",
+              "C:\Program Files\Inno Setup 7\ISCC.exe"
+            )) {
+              if (Test-Path $cand) {
+                $iscc = $cand
+                break
+              }
+            }
+          }
+          if (-not $iscc) {
+            throw "Inno Setup compiler (ISCC.exe) not found"
+          }
+          $outDir = Join-Path $env:RUNNER_TEMP "usher-setup-test"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          & $iscc `
+            "/DBinDir=$((Resolve-Path target\debug).Path)" `
+            "/DRepoRoot=$((Resolve-Path .).Path)" `
+            "/O$outDir" `
+            contrib\usher.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe failed with exit code $LASTEXITCODE"
+          }

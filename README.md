@@ -34,11 +34,14 @@ Host desktop
 
 ### 2. Install & Run
 
-#### Option A: Prebuilt GitHub Releases (Recommended for Client Laptop)
+#### Option A: Prebuilt GitHub Releases (Recommended for Windows)
 
-Download and extract the release archive for your OS from the GitHub Releases page (`usher-windows-x86_64.zip`, `usher-linux-x86_64.tar.gz`, `usher-macos-aarch64.tar.gz`). *(Note: `usher-windows-x86_64.exe` is the standalone `usher` CLI binary itself, not a setup wizard.)*
+- **Windows**: Download **`usher-setup-windows-x86_64.exe`** from the GitHub Releases page and run it. It installs `usher.exe` (and optionally `usher-host.exe`) into `%LOCALAPPDATA%\Programs\Usher`, adds it to your User `PATH`, and registers a Windows uninstaller. To update later, download and run the newer `usher-setup-windows-x86_64.exe` — it upgrades in place while preserving your install folder and Client/Host selection. *(A portable `usher-windows-x86_64.zip` with `install-windows.cmd` / `install-windows.ps1` is also published if you prefer manual or scripted installs.)*
+- **Linux / macOS**: Download and extract `usher-linux-x86_64.tar.gz` or `usher-macos-aarch64.tar.gz` from Releases.
 
-On **Windows**, either double-click `install-windows.cmd` inside the extracted zip folder, or run in PowerShell:
+After installing on Windows, open a **new** PowerShell window (or refresh `PATH` in your current window with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
+
+You can also install or build locally on Windows with PowerShell:
 
 ```powershell
 # Windows client laptop (downloads/installs latest release & adds usher.exe to User PATH):
@@ -50,8 +53,6 @@ powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role hos
 # Or build from source locally instead of downloading a release:
 powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role both -FromSource
 ```
-
-After running the installer, open a **new** PowerShell window (or refresh `PATH` in your current window with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
 
 #### Option B: Build from Source
 

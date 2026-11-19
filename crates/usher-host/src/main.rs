@@ -40,7 +40,7 @@ use crate::video::{
 const UDEV_RULE: &str = r#"KERNEL=="uinput", GROUP="input", MODE="0660""#;
 
 #[derive(Debug, Parser)]
-#[command(name = "usher-host", about = "Zero-daemon SSH-bootstrapped Usher host")]
+#[command(name = "usher-host", version, about = "Zero-daemon SSH-bootstrapped Usher host")]
 struct Args {
     /// Explicit IP address to bind the ephemeral UDP socket to (defaults to SSH_CONNECTION server IP or 127.0.0.1)
     #[arg(long)]

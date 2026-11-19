@@ -53,8 +53,6 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/bundle | Out-Null
-          Copy-Item target/release/usher.exe dist/usher-windows-x86_64.exe
-          Copy-Item target/release/usher-host.exe dist/usher-host-windows-x86_64.exe
           Copy-Item target/release/usher.exe dist/bundle/usher.exe
           Copy-Item target/release/usher-host.exe dist/bundle/usher-host.exe
           Copy-Item contrib/install-windows.ps1 dist/bundle/install-windows.ps1
@@ -62,6 +60,53 @@ jobs:
           Copy-Item README.md dist/bundle/README.md
           Compress-Archive -Path dist/bundle/* -DestinationPath dist/usher-windows-x86_64.zip -Force
           Remove-Item -Recurse -Force dist/bundle
+
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          foreach ($cand in @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files (x86)\Inno Setup 7\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 7\ISCC.exe"
+          )) {
+            if (-not $iscc -and (Test-Path $cand)) {
+              $iscc = $cand
+            }
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            foreach ($cand in @(
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+              "C:\Program Files (x86)\Inno Setup 7\ISCC.exe",
+              "C:\Program Files\Inno Setup 6\ISCC.exe",
+              "C:\Program Files\Inno Setup 7\ISCC.exe"
+            )) {
+              if (Test-Path $cand) {
+                $iscc = $cand
+                break
+              }
+            }
+          }
+          if (-not $iscc) {
+            throw "Inno Setup compiler (ISCC.exe) not found"
+          }
+
+          $rawTag = "${{ github.event.inputs.tag || github.ref_name }}".TrimStart('v')
+          $appVer = if ($rawTag -match '^\d+\.\d+\.\d+') { $rawTag } else { "0.1.1" }
+          $numVer = ([regex]::Match($appVer, '^\d+\.\d+\.\d+')).Value
+
+          & $iscc `
+            "/DAppVersion=$appVer" `
+            "/DVersionInfoVersion=$numVer" `
+            "/DBinDir=$((Resolve-Path target\release).Path)" `
+            "/DRepoRoot=$((Resolve-Path .).Path)" `
+            "/O$((Resolve-Path dist).Path)" `
+            contrib\usher.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path dist\usher-setup-windows-x86_64.exe)) {
+            throw "Expected installer dist\usher-setup-windows-x86_64.exe was not generated"
+          }
 
       - name: Package Linux artifacts
         if: runner.os == 'Linux'
