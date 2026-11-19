@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 pub mod pipewire_linux;
 pub mod test_tone;
+#[cfg(target_os = "windows")]
+pub mod wasapi_windows;
 
 use anyhow::{Result, anyhow};
 use rusty_opus::{Application, OpusEncoder};
@@ -62,9 +64,23 @@ pub fn spawn_audio_task(
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
         {
-            tracing::info!("desktop audio capture not supported on non-Linux hosts unless testsrc is active");
+            if let Err(err) =
+                wasapi_windows::run_wasapi_loopback(tx.clone(), start, cancel.clone()).await
+            {
+                tracing::warn!(
+                    "WASAPI loopback capture unavailable ({err:#}); falling back to silent test audio"
+                );
+                if !cancel.is_cancelled() {
+                    let _ = test_tone::run_test_tone(tx, start, cancel).await;
+                }
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            tracing::info!("desktop audio capture not supported on this OS unless testsrc is active");
             let _ = tx;
             let _ = start;
             cancel.cancelled().await;

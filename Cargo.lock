@@ -2637,6 +2637,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cpal",
  "evdev",
  "openh264",
  "rusty-opus",
@@ -2645,6 +2646,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usher-proto",
+ "windows",
 ]
 
 [[package]]

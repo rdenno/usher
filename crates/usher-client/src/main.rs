@@ -69,11 +69,11 @@ struct Args {
     #[arg(long, default_value = "h264")]
     codec: VideoCodec,
 
-    /// Capture source passed to usher-host (auto, drm, pipewire, x11, testsrc)
+    /// Capture source passed to usher-host (auto, drm, pipewire, x11, dxgi, testsrc)
     #[arg(long, default_value = "auto")]
     capture: String,
 
-    /// Encoder backend passed to usher-host (auto, vaapi, nvenc, openh264)
+    /// Encoder backend passed to usher-host (auto, vaapi, nvenc, amf, qsv, openh264)
     #[arg(long, default_value = "auto")]
     encoder: String,
 

@@ -34,17 +34,37 @@ Host desktop
 
 ### 2. Install & Run
 
-Build both binaries (or copy `usher-host` to `/usr/local/bin/` on your Linux host):
+#### Option A: Prebuilt GitHub Releases (Recommended for Client Laptop)
+
+Download the release bundle for your OS from the GitHub Releases page (`usher-windows-x86_64.zip`, `usher-linux-x86_64.tar.gz`, `usher-macos-aarch64.tar.gz`), or run the Windows installer script via GitHub CLI (`gh`):
+
+```powershell
+# Windows client laptop (downloads latest release & adds usher.exe to User PATH):
+.\contrib\install-windows.ps1 -Role client
+
+# Windows host PC (installs usher-host.exe, checks sshd, sets UDP firewall rule):
+.\contrib\install-windows.ps1 -Role host
+
+# Or build from source locally instead of downloading a release:
+.\contrib\install-windows.ps1 -Role both -FromSource
+```
+
+#### Option B: Build from Source
 
 ```bash
 cargo build --release --workspace
 ```
 
-On the Linux host (one-time setup for virtual keyboard/mouse/Xbox 360 gamepad):
+On a **Linux host** (one-time setup for `/dev/uinput` virtual keyboard/mouse/Xbox 360 gamepad):
 
 ```bash
 ./contrib/install-host.sh
 ```
+
+On a **Windows host**:
+- Ensure OpenSSH Server (`sshd`) is running and your client's public key is authorized (`C:\ProgramData\ssh\administrators_authorized_keys` for admin accounts or `%USERPROFILE%\.ssh\authorized_keys`).
+- Ensure `usher-host.exe` is in your system/user `PATH` (`contrib/install-windows.ps1 -Role host` handles installation, User `PATH`, firewall rule, and prints a ready-to-paste `~/.ssh/config` block).
+- When `ssh` connects to Windows OpenSSH Server (Session 0), `usher-host.exe` automatically bridges into your active interactive desktop session via Windows Task Scheduler (`InteractiveToken`) and a local named pipe to run `ddagrab` + NVENC/AMF/QSV (or built-in DXGI Desktop Duplication + OpenH264), WASAPI loopback Opus audio, and Win32 `SendInput`, tearing down immediately when the SSH connection drops.
 
 Then connect from Windows, macOS, or Linux:
 
@@ -62,15 +82,15 @@ usher --local --capture testsrc
 
 ---
 
-## Linux Host Options
+## Host Options
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--capture` | `auto` | `auto`, `drm` (kmsgrab), `pipewire` (Wayland), `x11`, or `testsrc` |
-| `--encoder` | `auto` | `auto`, `vaapi` (AMD/Intel DMA-BUF), `nvenc`, or `openh264` |
-| `--headless` | `none` | Spin up an ephemeral `WLR_BACKENDS=headless` compositor (`sway`, `gamescope`, `cage`) for the duration of the session |
+| `--capture` | `auto` | `auto`, `drm` (Linux kmsgrab), `pipewire` (Wayland), `x11`, `dxgi` (Windows Desktop Duplication / `ddagrab`), or `testsrc` |
+| `--encoder` | `auto` | `auto`, `vaapi` (Linux AMD/Intel DMA-BUF), `nvenc` (Linux/Windows NVIDIA), `amf` (Windows AMD), `qsv` (Windows Intel), or `openh264` |
+| `--headless` | `none` | Linux only: spin up an ephemeral `WLR_BACKENDS=headless` compositor (`sway`, `gamescope`, `cage`) for the duration of the session |
 | `--codec` | `h264` | `h264`, `hevc`, or `av1` |
-| `--width` / `--height` | `0` (auto) | `0` auto-detects connected DRM display resolution or defaults to `1280x720` |
+| `--width` / `--height` | `0` (auto) | `0` auto-detects connected display resolution (DRM on Linux, primary monitor on Windows) or defaults to `1280x720` |
 | `--fps` | `60` | Target frame rate |
 | `--bitrate-kbps` | `20000` | CBR target video bitrate |
 | `--mtu` | `1200` | Outer UDP packet cap (recommended `<= 1200` for Tailscale/ZeroTier) |
@@ -94,5 +114,5 @@ Live telemetry (`fps`, `RTT`, `Mbps`, `FEC` recoveries, pointer mode) is shown i
 ## Workspace Crates
 
 - `crates/usher-proto`: Wire envelope, directional ChaCha20-Poly1305 AEAD + replay protection, striped XOR-FEC, MTU-bounded frame fragmenter/reassembler, Annex-B AU splitter, input & audio codecs, and `USHER_HELLO` / `SSH_CONNECTION` parsers.
-- `crates/usher-host` (`usher-host`): SSH-bootstrapped host supporting Linux DRM/KMS + VAAPI, NVENC, PipeWire Wayland + ephemeral headless compositors (`sway`/`gamescope`/`cage`), `/dev/uinput` virtual devices, PipeWire Opus audio, and built-in OpenH264 `testsrc`.
+- `crates/usher-host` (`usher-host`): SSH-bootstrapped host supporting Linux (DRM/KMS + VAAPI, NVENC, PipeWire Wayland + ephemeral headless `sway`/`gamescope`/`cage`, `/dev/uinput` virtual devices, PipeWire Opus audio), Windows (Session 0 -> Session 1 SSH bridge, `ddagrab` NVENC/AMF/QSV or built-in DXGI Desktop Duplication + OpenH264, WASAPI loopback Opus audio, Win32 `SendInput`), and built-in cross-platform `testsrc`.
 - `crates/usher-client` (`usher`): Zero-config SSH bootstrapper + `wgpu` BT.709 YUV420P GPU renderer + `winit` input capture + `gilrs` gamepad + `cpal` / pure-Rust Opus playback (`rusty-opus`).

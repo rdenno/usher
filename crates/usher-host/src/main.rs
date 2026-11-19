@@ -2,6 +2,8 @@ mod audio;
 mod input;
 mod net;
 mod video;
+#[cfg(target_os = "windows")]
+mod windows_session;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -11,6 +13,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+#[cfg(target_os = "windows")]
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -101,6 +105,18 @@ struct Args {
     /// Print the recommended static udev rule for /dev/uinput access and exit
     #[arg(long)]
     print_udev_rule: bool,
+
+    /// Internal flag: running inside Windows interactive Session 1 spawned by Session 0 bridge
+    #[arg(long, hide = true)]
+    windows_worker: bool,
+
+    /// Internal flag: named pipe path used by Windows Session 0 <-> Session 1 bridge
+    #[arg(long, hide = true)]
+    bridge_pipe: Option<String>,
+
+    /// Internal flag: preserve SSH_CONNECTION peer IP across Windows Session 0 -> Session 1 bridge
+    #[arg(long, hide = true)]
+    expected_client_ip: Option<IpAddr>,
 }
 
 fn resolve_bind_ip(explicit: Option<IpAddr>, allow_public: bool) -> Result<(IpAddr, Option<IpAddr>)> {
@@ -147,16 +163,50 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let (bind_ip, expected_client_ip) = resolve_bind_ip(args.bind_ip, args.allow_public)?;
+    let (bind_ip, detected_client_ip) = resolve_bind_ip(args.bind_ip, args.allow_public)?;
+    let expected_client_ip = args.expected_client_ip.or(detected_client_ip);
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut capture = args.capture;
+
+    #[cfg(target_os = "windows")]
+    if windows_session::needs_session_bridge(args.windows_worker, capture) {
+        tracing::info!(
+            "running inside Windows Session 0; launching Session 1 interactive worker for DXGI/WASAPI/SendInput"
+        );
+        let worker_args = build_worker_args(&args, bind_ip, expected_client_ip);
+        match windows_session::run_session_bridge(&worker_args).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if capture == CaptureSource::Dxgi {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    "Session 0 -> Session 1 bridge failed ({err:#}); falling back to in-process OpenH264 testsrc"
+                );
+                capture = CaptureSource::Testsrc;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut worker_pipe = if let Some(ref pipe_name) = args.bridge_pipe {
+        Some(windows_session::connect_worker_pipe(pipe_name).await?)
+    } else {
+        None
+    };
+
     let probe = probe_drm();
 
     let (raw_w, raw_h) = if args.width > 0 && args.height > 0 {
         (args.width, args.height)
-    } else if args.headless == HeadlessBackend::None
-        && args.capture != CaptureSource::Testsrc
-        && let Some((w, h)) = probe.active_mode
-    {
-        (w, h)
+    } else if args.headless == HeadlessBackend::None && capture != CaptureSource::Testsrc {
+        #[cfg(target_os = "linux")]
+        let detected = probe.active_mode;
+        #[cfg(target_os = "windows")]
+        let detected = video::windows_capture::primary_monitor_resolution();
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let detected = None;
+        detected.unwrap_or((1280, 720))
     } else {
         (1280, 720)
     };
@@ -174,14 +224,14 @@ async fn main() -> Result<()> {
         fps,
         bitrate_kbps: args.bitrate_kbps,
         codec: args.codec,
-        capture: args.capture,
+        capture,
         encoder: args.encoder,
         render_node: probe.render_node,
         wayland_runtime_dir: headless_session.runtime_dir().map(std::path::Path::to_path_buf),
         wayland_display: headless_session.wayland_display().map(str::to_string),
     };
     let resolved_backend = resolve_video_backend(&video_cfg);
-    let effective_codec = match resolved_backend {
+    let effective_codec = match &resolved_backend {
         ResolvedBackend::Software => {
             if args.codec != VideoCodec::H264 {
                 tracing::warn!(
@@ -192,6 +242,19 @@ async fn main() -> Result<()> {
         }
         #[cfg(target_os = "linux")]
         ResolvedBackend::Hw(_) => args.codec,
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(video::windows_capture::WinVideoBackend::NativeDxgiOpenH264) => {
+            if args.codec != VideoCodec::H264 {
+                tracing::warn!(
+                    "built-in DXGI + OpenH264 backend emits H.264; adjusting handshake codec to h264"
+                );
+            }
+            VideoCodec::H264
+        }
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(video::windows_capture::WinVideoBackend::DdagrabHw { .. }) => {
+            args.codec
+        }
     };
     video_cfg.codec = effective_codec;
 
@@ -219,6 +282,22 @@ async fn main() -> Result<()> {
     };
 
     let hello_line = encode_hello_line(&hello)?;
+    #[cfg(target_os = "windows")]
+    if let Some(ref mut pipe) = worker_pipe {
+        pipe.write_all(hello_line.as_bytes()).await?;
+        pipe.write_all(b"\n").await?;
+        let info = format!(
+            "backend={resolved_backend:?} codec={effective_codec} audio={}\n",
+            !args.no_audio
+        );
+        let _ = pipe.write_all(info.as_bytes()).await;
+        pipe.flush().await?;
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{hello_line}")?;
+        stdout.flush()?;
+    }
+    #[cfg(not(target_os = "windows"))]
     {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{hello_line}")?;
@@ -241,7 +320,42 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let keyframe_req = Arc::new(AtomicBool::new(true));
 
-    // Watchdog 1: SSH stdin EOF / close
+    // Watchdog 1: SSH stdin EOF (or bridge pipe EOF when running as Windows Session 1 worker)
+    #[cfg(target_os = "windows")]
+    if let Some(pipe) = worker_pipe.take() {
+        let cancel_pipe = cancel.clone();
+        tokio::spawn(async move {
+            let (mut pipe_rx, _pipe_tx) = tokio::io::split(pipe);
+            let mut buf = [0u8; 64];
+            loop {
+                match pipe_rx.read(&mut buf).await {
+                    Ok(0) | Err(_) => {
+                        tracing::info!("Session 0 bridge pipe closed; tearing down Session 1 worker");
+                        cancel_pipe.cancel();
+                        break;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+    } else {
+        let cancel_stdin = cancel.clone();
+        tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 64];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) | Err(_) => {
+                        tracing::info!("SSH stdin closed (EOF); tearing down session");
+                        cancel_stdin.cancel();
+                        break;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
     {
         let cancel_stdin = cancel.clone();
         tokio::spawn(async move {
@@ -333,9 +447,8 @@ async fn main() -> Result<()> {
         cancel.clone(),
     );
 
-    let use_test_audio = args.capture == CaptureSource::Testsrc
-        || args.encoder == EncoderKind::Openh264
-        || cfg!(not(target_os = "linux"));
+    let use_test_audio = capture == CaptureSource::Testsrc
+        || (!cfg!(target_os = "linux") && !cfg!(target_os = "windows"));
     let audio_handle = spawn_audio_task(
         AudioStreamConfig {
             enabled: !args.no_audio,
@@ -360,6 +473,68 @@ async fn main() -> Result<()> {
     drop(headless_session);
     tracing::info!("usher-host exited cleanly");
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn build_worker_args(
+    args: &Args,
+    bind_ip: IpAddr,
+    expected_client_ip: Option<IpAddr>,
+) -> Vec<String> {
+    let capture_str = match args.capture {
+        CaptureSource::Auto => "auto",
+        CaptureSource::Drm => "drm",
+        CaptureSource::Pipewire => "pipewire",
+        CaptureSource::X11 => "x11",
+        CaptureSource::Dxgi => "dxgi",
+        CaptureSource::Testsrc => "testsrc",
+    };
+    let encoder_str = match args.encoder {
+        EncoderKind::Auto => "auto",
+        EncoderKind::Vaapi => "vaapi",
+        EncoderKind::Nvenc => "nvenc",
+        EncoderKind::Amf => "amf",
+        EncoderKind::Qsv => "qsv",
+        EncoderKind::Openh264 => "openh264",
+    };
+    let mut out = vec![
+        "--bind-ip".into(),
+        bind_ip.to_string(),
+        "--width".into(),
+        args.width.to_string(),
+        "--height".into(),
+        args.height.to_string(),
+        "--fps".into(),
+        args.fps.to_string(),
+        "--bitrate-kbps".into(),
+        args.bitrate_kbps.to_string(),
+        "--codec".into(),
+        args.codec.to_string(),
+        "--capture".into(),
+        capture_str.into(),
+        "--encoder".into(),
+        encoder_str.into(),
+        "--mtu".into(),
+        args.mtu.to_string(),
+        "--fec".into(),
+        args.fec.to_string(),
+        "--idle-timeout-secs".into(),
+        args.idle_timeout_secs.to_string(),
+    ];
+    if let Some(ip) = expected_client_ip {
+        out.push("--expected-client-ip".into());
+        out.push(ip.to_string());
+    }
+    if args.allow_public {
+        out.push("--allow-public".into());
+    }
+    if args.no_audio {
+        out.push("--no-audio".into());
+    }
+    if args.no_input {
+        out.push("--no-input".into());
+    }
+    out
 }
 
 #[cfg(test)]

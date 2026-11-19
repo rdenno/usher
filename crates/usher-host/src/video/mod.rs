@@ -2,7 +2,11 @@ pub mod drm_probe;
 pub mod headless;
 #[cfg(target_os = "linux")]
 pub mod hw_pipeline;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub mod ivf;
 pub mod software;
+#[cfg(target_os = "windows")]
+pub mod windows_capture;
 
 use clap::ValueEnum;
 use std::path::PathBuf;
@@ -19,6 +23,7 @@ pub enum CaptureSource {
     Drm,
     Pipewire,
     X11,
+    Dxgi,
     Testsrc,
 }
 
@@ -27,6 +32,8 @@ pub enum EncoderKind {
     Auto,
     Vaapi,
     Nvenc,
+    Amf,
+    Qsv,
     Openh264,
 }
 
@@ -52,21 +59,30 @@ pub struct VideoPipelineConfig {
     pub wayland_display: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedBackend {
     #[cfg(target_os = "linux")]
     Hw(hw_pipeline::HwPipelineKind),
+    #[cfg(target_os = "windows")]
+    Win(windows_capture::WinVideoBackend),
     Software,
 }
 
 pub fn resolve_video_backend(cfg: &VideoPipelineConfig) -> ResolvedBackend {
-    if cfg.capture == CaptureSource::Testsrc || cfg.encoder == EncoderKind::Openh264 {
+    if cfg.capture == CaptureSource::Testsrc {
         return ResolvedBackend::Software;
     }
 
     #[cfg(target_os = "linux")]
-    if let Some(hw_kind) = select_linux_hw_pipeline(cfg) {
+    if cfg.encoder != EncoderKind::Openh264
+        && let Some(hw_kind) = select_linux_hw_pipeline(cfg)
+    {
         return ResolvedBackend::Hw(hw_kind);
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(win_backend) = windows_capture::select_windows_backend(cfg) {
+        return ResolvedBackend::Win(win_backend);
     }
 
     ResolvedBackend::Software
@@ -100,6 +116,41 @@ pub fn spawn_video_task(
                         tracing::warn!(
                             "hardware video pipeline failed ({err:#}); falling back to OpenH264 testsrc"
                         );
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            ResolvedBackend::Win(win_backend) => {
+                let was_hw = matches!(win_backend, windows_capture::WinVideoBackend::DdagrabHw { .. });
+                match windows_capture::run_windows_backend(
+                    win_backend,
+                    cfg.clone(),
+                    tx.clone(),
+                    keyframe_req.clone(),
+                    start,
+                    cancel.clone(),
+                )
+                .await
+                {
+                    Ok(()) => return,
+                    Err(err) => {
+                        tracing::warn!("Windows capture pipeline failed ({err:#})");
+                        if was_hw && !cancel.is_cancelled() && cfg.codec == VideoCodec::H264 {
+                            tracing::info!("falling back to built-in DXGI + OpenH264 capture");
+                            if windows_capture::run_windows_backend(
+                                windows_capture::WinVideoBackend::NativeDxgiOpenH264,
+                                cfg.clone(),
+                                tx.clone(),
+                                keyframe_req.clone(),
+                                start,
+                                cancel.clone(),
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -143,7 +194,7 @@ fn select_linux_hw_pipeline(cfg: &VideoPipelineConfig) -> Option<hw_pipeline::Hw
         EncoderKind::Nvenc => true,
         EncoderKind::Vaapi => false,
         EncoderKind::Auto => matches!(probe.vendor, Some(GpuVendor::Nvidia)),
-        EncoderKind::Openh264 => return None,
+        EncoderKind::Amf | EncoderKind::Qsv | EncoderKind::Openh264 => return None,
     };
 
     match cfg.capture {
@@ -195,6 +246,6 @@ fn select_linux_hw_pipeline(cfg: &VideoPipelineConfig) -> Option<hw_pipeline::Hw
             }
             None
         }
-        CaptureSource::Testsrc => None,
+        CaptureSource::Dxgi | CaptureSource::Testsrc => None,
     }
 }
