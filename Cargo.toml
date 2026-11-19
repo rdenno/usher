@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/usher-proto",
     "crates/usher-host",
+    "crates/usher-client",
 ]
 
 [workspace.package]

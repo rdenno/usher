@@ -28,7 +28,10 @@ use crate::input::create_input_sink;
 use crate::net::{NetConfig, spawn_network_tasks};
 use crate::video::drm_probe::probe_drm;
 use crate::video::headless::{HeadlessBackend, HeadlessSession};
-use crate::video::{CaptureSource, EncoderKind, VideoPipelineConfig, spawn_video_task};
+use crate::video::{
+    CaptureSource, EncoderKind, ResolvedBackend, VideoPipelineConfig, resolve_video_backend,
+    spawn_video_task,
+};
 
 const UDEV_RULE: &str = r#"KERNEL=="uinput", GROUP="input", MODE="0660""#;
 
@@ -163,20 +166,34 @@ async fn main() -> Result<()> {
     let mtu = args.mtu.max(512);
     let fec = args.fec.min(50);
 
-    // If software testsrc or openh264 is forced (or non-Linux fallback), codec is H.264.
-    let effective_codec = if args.capture == CaptureSource::Testsrc
-        || args.encoder == EncoderKind::Openh264
-        || cfg!(not(target_os = "linux"))
-    {
-        if args.codec != VideoCodec::H264 {
-            tracing::warn!("OpenH264 software backend emits H.264; adjusting handshake codec to h264");
-        }
-        VideoCodec::H264
-    } else {
-        args.codec
-    };
-
     let headless_session = HeadlessSession::start(args.headless, width, height, fps)?;
+
+    let mut video_cfg = VideoPipelineConfig {
+        width,
+        height,
+        fps,
+        bitrate_kbps: args.bitrate_kbps,
+        codec: args.codec,
+        capture: args.capture,
+        encoder: args.encoder,
+        render_node: probe.render_node,
+        wayland_runtime_dir: headless_session.runtime_dir().map(std::path::Path::to_path_buf),
+        wayland_display: headless_session.wayland_display().map(str::to_string),
+    };
+    let resolved_backend = resolve_video_backend(&video_cfg);
+    let effective_codec = match resolved_backend {
+        ResolvedBackend::Software => {
+            if args.codec != VideoCodec::H264 {
+                tracing::warn!(
+                    "resolved OpenH264 software backend emits H.264; adjusting handshake codec to h264"
+                );
+            }
+            VideoCodec::H264
+        }
+        #[cfg(target_os = "linux")]
+        ResolvedBackend::Hw(_) => args.codec,
+    };
+    video_cfg.codec = effective_codec;
 
     let session_key = generate_session_key()?;
     let socket = Arc::new(
@@ -307,20 +324,9 @@ async fn main() -> Result<()> {
         audio_rx,
     );
 
-    let video_cfg = VideoPipelineConfig {
-        width,
-        height,
-        fps,
-        bitrate_kbps: args.bitrate_kbps,
-        codec: effective_codec,
-        capture: args.capture,
-        encoder: args.encoder,
-        render_node: probe.render_node,
-        wayland_runtime_dir: headless_session.runtime_dir().map(std::path::Path::to_path_buf),
-        wayland_display: headless_session.wayland_display().map(str::to_string),
-    };
     let video_handle = spawn_video_task(
         video_cfg,
+        resolved_backend,
         video_tx,
         keyframe_req,
         start,

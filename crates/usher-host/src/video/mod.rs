@@ -52,30 +52,38 @@ pub struct VideoPipelineConfig {
     pub wayland_display: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedBackend {
+    #[cfg(target_os = "linux")]
+    Hw(hw_pipeline::HwPipelineKind),
+    Software,
+}
+
+pub fn resolve_video_backend(cfg: &VideoPipelineConfig) -> ResolvedBackend {
+    if cfg.capture == CaptureSource::Testsrc || cfg.encoder == EncoderKind::Openh264 {
+        return ResolvedBackend::Software;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(hw_kind) = select_linux_hw_pipeline(cfg) {
+        return ResolvedBackend::Hw(hw_kind);
+    }
+
+    ResolvedBackend::Software
+}
+
 pub fn spawn_video_task(
     cfg: VideoPipelineConfig,
+    backend: ResolvedBackend,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if cfg.capture == CaptureSource::Testsrc || cfg.encoder == EncoderKind::Openh264 {
-            if cfg.codec != VideoCodec::H264 {
-                tracing::warn!(
-                    "OpenH264 software fallback only supports H.264; encoding stream as H.264"
-                );
-            }
-            if let Err(err) = software::run_software_testsrc(cfg, tx, keyframe_req, start, cancel).await
-            {
-                tracing::error!("software video encoder stopped: {err:#}");
-            }
-            return;
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(hw_kind) = select_linux_hw_pipeline(&cfg) {
+        match backend {
+            #[cfg(target_os = "linux")]
+            ResolvedBackend::Hw(hw_kind) => {
                 tracing::info!(?hw_kind, codec = %cfg.codec, "starting hardware zero-copy video pipeline");
                 match hw_pipeline::run_hw_pipeline(
                     hw_kind,
@@ -94,21 +102,17 @@ pub fn spawn_video_task(
                         );
                     }
                 }
-            } else {
-                tracing::info!(
-                    "no active DRM/Wayland/X11 hardware encode pipeline available; using OpenH264 testsrc"
-                );
+            }
+            ResolvedBackend::Software => {
+                tracing::info!("starting built-in OpenH264 video stream");
             }
         }
-
-        #[cfg(not(target_os = "linux"))]
-        tracing::info!("non-Linux host defaulting to built-in OpenH264 testsrc video stream");
 
         if !cancel.is_cancelled()
             && let Err(err) =
                 software::run_software_testsrc(cfg, tx, keyframe_req, start, cancel).await
         {
-            tracing::error!("fallback software encoder stopped: {err:#}");
+            tracing::error!("software encoder stopped: {err:#}");
         }
     })
 }

@@ -1,0 +1,26 @@
+[package]
+name = "usher-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightweight SSH-bootstrapped GPU remote desktop and game client for Usher"
+
+[[bin]]
+name = "usher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cpal.workspace = true
+gilrs.workspace = true
+openh264.workspace = true
+rusty-opus.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+usher-proto = { path = "../usher-proto" }
+wgpu.workspace = true
+winit.workspace = true
