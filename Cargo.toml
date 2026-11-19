@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/usher-proto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rdenno/usher"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.23"
+blake3 = "1.8"
+chacha20poly1305 = "0.11"
+clap = { version = "4.6", features = ["derive"] }
+cpal = "0.18"
+evdev = "0.13"
+gilrs = "0.11"
+openh264 = "0.9"
+rand = "0.10"
+rusty-opus = "1.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.50", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "30.0"
+winit = "0.30"

@@ -1,0 +1,272 @@
+use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::str::FromStr;
+
+pub const HELLO_PREFIX: &str = "USHER_HELLO ";
+pub const PROTOCOL_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VideoCodec::H264 => write!(f, "h264"),
+            VideoCodec::Hevc => write!(f, "hevc"),
+            VideoCodec::Av1 => write!(f, "av1"),
+        }
+    }
+}
+
+impl FromStr for VideoCodec {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "h264" | "h.264" | "avc" => Ok(VideoCodec::H264),
+            "hevc" | "h265" | "h.265" => Ok(VideoCodec::Hevc),
+            "av1" => Ok(VideoCodec::Av1),
+            other => bail!("unsupported video codec: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloMessage {
+    pub version: u8,
+    pub bind_ip: IpAddr,
+    pub port: u16,
+    pub session_key: String,
+    pub width: u16,
+    pub height: u16,
+    pub fps: u16,
+    pub codec: VideoCodec,
+    pub audio: bool,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u8,
+    pub mtu: u16,
+}
+
+impl HelloMessage {
+    pub fn decode_session_key(&self) -> Result<[u8; 32]> {
+        let bytes = BASE64_STD
+            .decode(self.session_key.trim())
+            .context("invalid base64 session_key")?;
+        if bytes.len() != 32 {
+            bail!(
+                "invalid session_key length: expected 32 bytes, got {}",
+                bytes.len()
+            );
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(key)
+    }
+
+    pub fn encode_session_key(key: &[u8; 32]) -> String {
+        BASE64_STD.encode(key)
+    }
+}
+
+pub fn encode_hello_line(msg: &HelloMessage) -> Result<String> {
+    let json = serde_json::to_string(msg).context("failed to serialize HelloMessage")?;
+    Ok(format!("{HELLO_PREFIX}{json}"))
+}
+
+/// Parses a line from the SSH host's stdout.
+/// Returns `None` if the line does not carry the `USHER_HELLO ` handshake prefix
+/// (allowing unrelated login MOTD / shell noise before the handshake).
+pub fn parse_hello_line(line: &str) -> Option<Result<HelloMessage>> {
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    let json_part = trimmed.strip_prefix(HELLO_PREFIX)?;
+    Some(parse_and_validate_hello(json_part))
+}
+
+fn parse_and_validate_hello(json_part: &str) -> Result<HelloMessage> {
+    let msg: HelloMessage =
+        serde_json::from_str(json_part).context("malformed USHER_HELLO JSON")?;
+    if msg.version != PROTOCOL_VERSION {
+        bail!(
+            "unsupported protocol version {} (expected {})",
+            msg.version,
+            PROTOCOL_VERSION
+        );
+    }
+    if msg.port == 0 {
+        bail!("invalid UDP port 0 in handshake");
+    }
+    if msg.mtu < 512 {
+        bail!("MTU {} is too small (minimum 512)", msg.mtu);
+    }
+    if msg.width == 0 || msg.height == 0 || msg.fps == 0 {
+        bail!("invalid video geometry {}x{}@{}fps", msg.width, msg.height, msg.fps);
+    }
+    let _ = msg.decode_session_key()?;
+    Ok(msg)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshConnection {
+    pub client_ip: IpAddr,
+    pub client_port: u16,
+    pub server_ip: IpAddr,
+    pub server_port: u16,
+}
+
+/// Parses OpenSSH's `SSH_CONNECTION` environment variable:
+/// `<client_ip> <client_port> <server_ip> <server_port>`.
+pub fn parse_ssh_connection(val: &str) -> Result<SshConnection> {
+    let parts: Vec<&str> = val.split_whitespace().collect();
+    if parts.len() != 4 {
+        bail!(
+            "invalid SSH_CONNECTION format: expected 4 whitespace-separated fields, got {}",
+            parts.len()
+        );
+    }
+    let client_ip = parse_ip_stripping_zone(parts[0])
+        .with_context(|| format!("invalid SSH_CONNECTION client IP '{}'", parts[0]))?;
+    let client_port = parts[1]
+        .parse::<u16>()
+        .with_context(|| format!("invalid SSH_CONNECTION client port '{}'", parts[1]))?;
+    let server_ip = parse_ip_stripping_zone(parts[2])
+        .with_context(|| format!("invalid SSH_CONNECTION server IP '{}'", parts[2]))?;
+    let server_port = parts[3]
+        .parse::<u16>()
+        .with_context(|| format!("invalid SSH_CONNECTION server port '{}'", parts[3]))?;
+
+    Ok(SshConnection {
+        client_ip,
+        client_port,
+        server_ip,
+        server_port,
+    })
+}
+
+fn parse_ip_stripping_zone(raw: &str) -> Result<IpAddr> {
+    let without_zone = raw.split('%').next().unwrap_or(raw);
+    IpAddr::from_str(without_zone).map_err(Into::into)
+}
+
+/// Returns true for private mesh overlay addresses (Tailscale 100.64.0.0/10,
+/// ZeroTier/WireGuard RFC1918, IPv6 ULA fc00::/7), link-local, and loopback.
+/// Rejects public WAN addresses and unspecified `0.0.0.0` / `::`.
+pub fn is_overlay_or_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_overlay_or_private_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_overlay_or_private_v4(mapped);
+            }
+            is_overlay_or_private_v6(v6)
+        }
+    }
+}
+
+fn is_overlay_or_private_v4(v4: Ipv4Addr) -> bool {
+    if v4.is_unspecified() {
+        return false;
+    }
+    if v4.is_loopback() || v4.is_private() || v4.is_link_local() {
+        return true;
+    }
+    let octets = v4.octets();
+    // Tailscale / CGNAT RFC 6598: 100.64.0.0/10
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 64
+}
+
+fn is_overlay_or_private_v6(v6: Ipv6Addr) -> bool {
+    if v6.is_unspecified() {
+        return false;
+    }
+    if v6.is_loopback() {
+        return true;
+    }
+    let seg0 = v6.segments()[0];
+    // Unique Local Addresses fc00::/7 (Tailscale IPv6 uses fd7a:115c:a1e0::/48)
+    let is_ula = (seg0 & 0xfe00) == 0xfc00;
+    // Link-local unicast fe80::/10
+    let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+    is_ula || is_link_local
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_roundtrip_ignores_noise() {
+        let key = [42u8; 32];
+        let msg = HelloMessage {
+            version: PROTOCOL_VERSION,
+            bind_ip: "100.88.12.34".parse().unwrap(),
+            port: 51842,
+            session_key: HelloMessage::encode_session_key(&key),
+            width: 1920,
+            height: 1080,
+            fps: 120,
+            codec: VideoCodec::H264,
+            audio: true,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            mtu: 1200,
+        };
+        let encoded = encode_hello_line(&msg).unwrap();
+        assert!(parse_hello_line("Welcome to Ubuntu 24.04 LTS").is_none());
+        assert!(parse_hello_line("").is_none());
+
+        let parsed = parse_hello_line(&format!("{encoded}\r\n"))
+            .expect("should detect prefix")
+            .expect("should parse valid hello");
+        assert_eq!(parsed, msg);
+        assert_eq!(parsed.decode_session_key().unwrap(), key);
+    }
+
+    #[test]
+    fn parse_ssh_connection_v4_and_v6() {
+        let v4 = parse_ssh_connection("100.64.0.10 54321 100.64.0.20 22").unwrap();
+        assert_eq!(v4.client_ip, "100.64.0.10".parse::<IpAddr>().unwrap());
+        assert_eq!(v4.client_port, 54321);
+        assert_eq!(v4.server_ip, "100.64.0.20".parse::<IpAddr>().unwrap());
+        assert_eq!(v4.server_port, 22);
+
+        let v6 = parse_ssh_connection("fd7a:115c:a1e0::1 40000 fd7a:115c:a1e0::2 22").unwrap();
+        assert_eq!(
+            v6.server_ip,
+            "fd7a:115c:a1e0::2".parse::<IpAddr>().unwrap()
+        );
+        assert!(parse_ssh_connection("bad").is_err());
+    }
+
+    #[test]
+    fn overlay_and_private_ip_policy() {
+        // Tailscale CGNAT 100.64.0.0/10
+        assert!(is_overlay_or_private_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_overlay_or_private_ip("100.127.255.254".parse().unwrap()));
+        assert!(!is_overlay_or_private_ip("100.63.255.254".parse().unwrap()));
+        assert!(!is_overlay_or_private_ip("100.128.0.1".parse().unwrap()));
+
+        // RFC1918, loopback, link-local, Tailscale IPv6 ULA
+        assert!(is_overlay_or_private_ip("10.147.20.5".parse().unwrap()));
+        assert!(is_overlay_or_private_ip("172.16.0.5".parse().unwrap()));
+        assert!(is_overlay_or_private_ip("192.168.1.50".parse().unwrap()));
+        assert!(is_overlay_or_private_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_overlay_or_private_ip("::1".parse().unwrap()));
+        assert!(is_overlay_or_private_ip("fd7a:115c:a1e0::1234".parse().unwrap()));
+
+        // Unspecified and public WAN IPs rejected
+        assert!(!is_overlay_or_private_ip("0.0.0.0".parse().unwrap()));
+        assert!(!is_overlay_or_private_ip("::".parse().unwrap()));
+        assert!(!is_overlay_or_private_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_overlay_or_private_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_overlay_or_private_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+}
