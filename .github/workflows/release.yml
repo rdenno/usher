@@ -58,6 +58,7 @@ jobs:
           Copy-Item target/release/usher.exe dist/bundle/usher.exe
           Copy-Item target/release/usher-host.exe dist/bundle/usher-host.exe
           Copy-Item contrib/install-windows.ps1 dist/bundle/install-windows.ps1
+          Copy-Item contrib/install-windows.cmd dist/bundle/install-windows.cmd
           Copy-Item README.md dist/bundle/README.md
           Compress-Archive -Path dist/bundle/* -DestinationPath dist/usher-windows-x86_64.zip -Force
           Remove-Item -Recurse -Force dist/bundle

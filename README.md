@@ -36,18 +36,22 @@ Host desktop
 
 #### Option A: Prebuilt GitHub Releases (Recommended for Client Laptop)
 
-Download the release bundle for your OS from the GitHub Releases page (`usher-windows-x86_64.zip`, `usher-linux-x86_64.tar.gz`, `usher-macos-aarch64.tar.gz`), or run the Windows installer script via GitHub CLI (`gh`):
+Download and extract the release archive for your OS from the GitHub Releases page (`usher-windows-x86_64.zip`, `usher-linux-x86_64.tar.gz`, `usher-macos-aarch64.tar.gz`). *(Note: `usher-windows-x86_64.exe` is the standalone `usher` CLI binary itself, not a setup wizard.)*
+
+On **Windows**, either double-click `install-windows.cmd` inside the extracted zip folder, or run in PowerShell:
 
 ```powershell
-# Windows client laptop (downloads latest release & adds usher.exe to User PATH):
-.\contrib\install-windows.ps1 -Role client
+# Windows client laptop (downloads/installs latest release & adds usher.exe to User PATH):
+powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role client
 
 # Windows host PC (installs usher-host.exe, checks sshd, sets UDP firewall rule):
-.\contrib\install-windows.ps1 -Role host
+powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role host
 
 # Or build from source locally instead of downloading a release:
-.\contrib\install-windows.ps1 -Role both -FromSource
+powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role both -FromSource
 ```
+
+After running the installer, open a **new** PowerShell window (or refresh `PATH` in your current window with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
 
 #### Option B: Build from Source
 

@@ -204,9 +204,11 @@ async fn main() -> Result<()> {
         let detected = probe.active_mode;
         #[cfg(target_os = "windows")]
         let detected = video::windows_capture::primary_monitor_resolution();
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        let res = detected.unwrap_or((1280, 720));
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        let detected = None;
-        detected.unwrap_or((1280, 720))
+        let res = (1280, 720);
+        res
     } else {
         (1280, 720)
     };
