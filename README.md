@@ -1,29 +1,45 @@
-# Usher
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+    <img src="assets/logo-light.svg" width="260" alt="Usher">
+  </picture>
+  <p><strong>U</strong>DP + <strong>S</strong>S<strong>H</strong> = <strong>E</strong>phemeral <strong>R</strong>emote desktop</p>
+  <p>Zero-daemon, SSH-bootstrapped remote desktop &amp; game streaming over Tailscale, ZeroTier, or WireGuard.</p>
+  <p>Zero open ports when idle &middot; No pairing PINs or accounts &middot; Direct ChaCha20-Poly1305 UDP + XOR-FEC</p>
+</div>
 
-**Zero-daemon, SSH-bootstrapped, ultra-low-latency remote desktop and game streamer.**
-
-Usher streams video, audio, keyboard/mouse, and gamepad input over direct UDP on your private mesh network (Tailscale, ZeroTier, or WireGuard) using **only** your existing OpenSSH key and `~/.ssh/config` host aliases. No background daemons, no pairing PINs, no accounts, and zero open ports when idle.
+---
 
 ```bash
 usher my-host
 ```
 
----
-
-## How It Works
-
-1. **Bootstrap (`ssh -T`)**: `usher` launches a single non-interactive SSH command (`usher-host`) over public-key auth (`BatchMode=yes`, no password prompts).
-2. **Ephemeral Bind & Handshake**: `usher-host` reads `SSH_CONNECTION`, binds an ephemeral high UDP port **strictly on the overlay/private IP** (never `0.0.0.0`), generates a 256-bit CSPRNG session key, and prints one JSON line to stdout (`USHER_HELLO {...}`).
-3. **Direct Encrypted UDP**: The client connects directly to `<overlay_ip>:<port>`. All video, XOR-FEC parity, Opus audio, input, and control datagrams are capped at `<= 1200` bytes (safe inside Tailscale's 1280-byte MTU without fragmentation) and authenticated/encrypted with **ChaCha20-Poly1305** + directional BLAKE3 subkeys + a 128-packet sliding anti-replay window.
-4. **Zero-State Teardown**: Closing the window (`Ctrl+Alt+Q`) or dropping the SSH connection immediately sends `EOF`/`SIGHUP` to `usher-host`, destroying its virtual display/input devices, closing the UDP socket, and exiting.
+- **SSH key auth only**: Reuses your existing `~/.ssh/config` aliases and public keys with no background server or manual pairing.
+- **Mesh-native UDP**: Caps packets at `<= 1200` bytes for Tailscale/ZeroTier MTU safety and recovers dropped packets with striped XOR-FEC instead of TCP retransmits.
+- **Hardware capture & encode**: Linux (DRM/PipeWire + VAAPI/NVENC, ephemeral headless `sway`/`gamescope`/`cage`) and Windows (DXGI/`ddagrab` + NVENC/AMF/QSV or built-in OpenH264).
+- **Zero-state teardown**: Closing the client window or dropping SSH exits `usher-host`, destroys virtual input/display devices, and closes the UDP port.
 
 ---
 
 ## Quickstart
 
-### 1. SSH Config (`~/.ssh/config`)
+### 1. Install
 
-Point your host alias at its Tailscale / ZeroTier / WireGuard IP (or MagicDNS name):
+Download the release artifact for your platform from **Releases** (or build from source):
+
+| Platform | Install / Update |
+| :--- | :--- |
+| **Windows** | Run **`usher-setup-windows-x86_64.exe`** (installs Client/Host to `%LOCALAPPDATA%\Programs\Usher` and updates User `PATH`; re-run newer releases to upgrade in place while keeping settings). Portable `usher-windows-x86_64.zip` and [`contrib/install-windows.ps1`](contrib/install-windows.ps1) are also available. |
+| **Linux** | Extract `usher-linux-x86_64.tar.gz` (`usher` + `usher-host`) and run [`./contrib/install-host.sh`](contrib/install-host.sh) once on the host for `/dev/uinput` permissions. |
+| **macOS** | Extract `usher-macos-aarch64.tar.gz` (`usher` client). |
+| **From Source** | `cargo build --release --workspace` |
+
+> After a fresh Windows install, open a **new** PowerShell window (or refresh your current session with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
+
+### 2. Configure SSH (`~/.ssh/config`)
+
+Point a host alias at your desktop's Tailscale, ZeroTier, or WireGuard IP:
 
 ```sshconfig
 Host desktop
@@ -32,54 +48,15 @@ Host desktop
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-### 2. Install & Run
+- **Windows hosts**: Enable OpenSSH Server (`sshd`), authorize your key (`C:\ProgramData\ssh\administrators_authorized_keys` for admin users or `%USERPROFILE%\.ssh\authorized_keys`), and select **Host** or **Client + Host** in the installer. `usher-host` automatically bridges Session 0 SSH shells into your active desktop session (`InteractiveToken`).
 
-#### Option A: Prebuilt GitHub Releases (Recommended for Windows)
-
-- **Windows**: Download **`usher-setup-windows-x86_64.exe`** from the GitHub Releases page and run it. It installs `usher.exe` (and optionally `usher-host.exe`) into `%LOCALAPPDATA%\Programs\Usher`, adds it to your User `PATH`, and registers a Windows uninstaller. To update later, download and run the newer `usher-setup-windows-x86_64.exe` — it upgrades in place while preserving your install folder and Client/Host selection. *(A portable `usher-windows-x86_64.zip` with `install-windows.cmd` / `install-windows.ps1` is also published if you prefer manual or scripted installs.)*
-- **Linux / macOS**: Download and extract `usher-linux-x86_64.tar.gz` or `usher-macos-aarch64.tar.gz` from Releases.
-
-After installing on Windows, open a **new** PowerShell window (or refresh `PATH` in your current window with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
-
-You can also install or build locally on Windows with PowerShell:
-
-```powershell
-# Windows client laptop (downloads/installs latest release & adds usher.exe to User PATH):
-powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role client
-
-# Windows host PC (installs usher-host.exe, checks sshd, sets UDP firewall rule):
-powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role host
-
-# Or build from source locally instead of downloading a release:
-powershell -ExecutionPolicy Bypass -File .\contrib\install-windows.ps1 -Role both -FromSource
-```
-
-#### Option B: Build from Source
-
-```bash
-cargo build --release --workspace
-```
-
-On a **Linux host** (one-time setup for `/dev/uinput` virtual keyboard/mouse/Xbox 360 gamepad):
-
-```bash
-./contrib/install-host.sh
-```
-
-On a **Windows host**:
-- Ensure OpenSSH Server (`sshd`) is running and your client's public key is authorized (`C:\ProgramData\ssh\administrators_authorized_keys` for admin accounts or `%USERPROFILE%\.ssh\authorized_keys`).
-- Ensure `usher-host.exe` is in your system/user `PATH` (`contrib/install-windows.ps1 -Role host` handles installation, User `PATH`, firewall rule, and prints a ready-to-paste `~/.ssh/config` block).
-- When `ssh` connects to Windows OpenSSH Server (Session 0), `usher-host.exe` automatically bridges into your active interactive desktop session via Windows Task Scheduler (`InteractiveToken`) and a local named pipe to run `ddagrab` + NVENC/AMF/QSV (or built-in DXGI Desktop Duplication + OpenH264), WASAPI loopback Opus audio, and Win32 `SendInput`, tearing down immediately when the SSH connection drops.
-
-Then connect from Windows, macOS, or Linux:
+### 3. Connect
 
 ```bash
 usher desktop
 ```
 
-### Local Loopback Test (No SSH Required)
-
-Test the full pipeline (OpenH264 test pattern + Opus audio + ChaCha20-Poly1305 UDP + XOR-FEC + `wgpu` window) locally on one machine:
+Or run a single-machine loopback sanity check without SSH:
 
 ```bash
 usher --local --capture testsrc
@@ -87,37 +64,50 @@ usher --local --capture testsrc
 
 ---
 
-## Host Options
+## Controls & Hotkeys
 
-| Flag | Default | Description |
+Window title bar shows live `fps`, `RTT`, `Mbps`, `FEC` recoveries, and pointer mode.
+
+| Shortcut / Input | Action |
+| :--- | :--- |
+| **`Ctrl+Alt+G`** | Toggle **Absolute** desktop pointer / **Locked Relative** raw mouse (3D games) |
+| **`Ctrl+Alt+F`** | Toggle borderless fullscreen |
+| **`Ctrl+Alt+Q`** | Disconnect and tear down the remote host session |
+| **Gamepads** | Polled automatically via `gilrs` and forwarded as a virtual Xbox 360 pad on Linux hosts |
+
+---
+
+## How It Works
+
+1. **Bootstrap (`ssh -T`)**: `usher` runs `usher-host` over OpenSSH public-key auth (`BatchMode=yes`).
+2. **Ephemeral Bind & Handshake**: `usher-host` reads `SSH_CONNECTION`, binds an ephemeral UDP port **strictly on the overlay/private IP** (never `0.0.0.0`), generates a 256-bit CSPRNG session key, and prints one `USHER_HELLO {...}` JSON line to stdout.
+3. **Direct Encrypted UDP**: Video frames, striped XOR-FEC parity, 48 kHz Opus audio, and input events flow over `<= 1200`-byte UDP datagrams encrypted with **ChaCha20-Poly1305**, directional BLAKE3 subkeys, and a 128-packet anti-replay window.
+4. **Zero-State Teardown**: SSH `EOF`/`SIGHUP` or `Ctrl+Alt+Q` shuts down pipelines, virtual devices, and sockets immediately.
+
+---
+
+## Options
+
+| Flag | Default | Values / Notes |
 | :--- | :--- | :--- |
-| `--capture` | `auto` | `auto`, `drm` (Linux kmsgrab), `pipewire` (Wayland), `x11`, `dxgi` (Windows Desktop Duplication / `ddagrab`), or `testsrc` |
-| `--encoder` | `auto` | `auto`, `vaapi` (Linux AMD/Intel DMA-BUF), `nvenc` (Linux/Windows NVIDIA), `amf` (Windows AMD), `qsv` (Windows Intel), or `openh264` |
-| `--headless` | `none` | Linux only: spin up an ephemeral `WLR_BACKENDS=headless` compositor (`sway`, `gamescope`, `cage`) for the duration of the session |
-| `--codec` | `h264` | `h264`, `hevc`, or `av1` |
-| `--width` / `--height` | `0` (auto) | `0` auto-detects connected display resolution (DRM on Linux, primary monitor on Windows) or defaults to `1280x720` |
+| `--capture` | `auto` | `auto`, `drm`, `pipewire`, `x11`, `dxgi` (Windows), `testsrc` |
+| `--encoder` | `auto` | `auto`, `vaapi`, `nvenc`, `amf`, `qsv`, `openh264` |
+| `--headless` | `none` | Linux ephemeral `WLR_BACKENDS=headless`: `none`, `sway`, `gamescope`, `cage` |
+| `--codec` | `h264` | `h264`, `hevc`, `av1` |
+| `--width` / `--height` | `0` | `0` auto-detects connected display resolution (or `1280x720`) |
 | `--fps` | `60` | Target frame rate |
-| `--bitrate-kbps` | `20000` | CBR target video bitrate |
-| `--mtu` | `1200` | Outer UDP packet cap (recommended `<= 1200` for Tailscale/ZeroTier) |
-| `--fec` | `10` | Striped XOR parity percentage (`0..=50`) for single/burst packet-loss recovery without retransmit latency |
+| `--bitrate-kbps` | `20000` | CBR target bitrate |
+| `--mtu` | `1200` | Outer UDP packet cap (`<= 1200` recommended for Tailscale/ZeroTier) |
+| `--fec` | `10` | XOR parity percentage (`0..=50`) for packet-loss recovery |
 
-> **Tip for Tailscale/ZeroTier:** Make sure peer-to-peer UDP hole punching is active (`tailscale status` shows direct IP rather than `relay`). If RTT exceeds `60 ms`, `usher` logs a warning that traffic may be hitting a DERP relay.
-
----
-
-## Client Controls & Hotkeys
-
-Live telemetry (`fps`, `RTT`, `Mbps`, `FEC` recoveries, pointer mode) is shown in the window title bar.
-
-- **`Ctrl+Alt+G`**: Toggle between **Absolute** pointer (desktop) and **Locked Relative** raw mouse (3D games)
-- **`Ctrl+Alt+F`**: Toggle borderless fullscreen
-- **`Ctrl+Alt+Q`**: Disconnect and tear down the remote session cleanly
-- **Gamepads**: Automatically polled via `gilrs` and mapped to a virtual Xbox 360 controller on the Linux host
+> Keep peer-to-peer UDP hole punching active (`tailscale status` showing a direct peer rather than `relay`); `usher` warns if RTT rises above `60 ms`.
 
 ---
 
-## Workspace Crates
+## Workspace
 
-- `crates/usher-proto`: Wire envelope, directional ChaCha20-Poly1305 AEAD + replay protection, striped XOR-FEC, MTU-bounded frame fragmenter/reassembler, Annex-B AU splitter, input & audio codecs, and `USHER_HELLO` / `SSH_CONNECTION` parsers.
-- `crates/usher-host` (`usher-host`): SSH-bootstrapped host supporting Linux (DRM/KMS + VAAPI, NVENC, PipeWire Wayland + ephemeral headless `sway`/`gamescope`/`cage`, `/dev/uinput` virtual devices, PipeWire Opus audio), Windows (Session 0 -> Session 1 SSH bridge, `ddagrab` NVENC/AMF/QSV or built-in DXGI Desktop Duplication + OpenH264, WASAPI loopback Opus audio, Win32 `SendInput`), and built-in cross-platform `testsrc`.
-- `crates/usher-client` (`usher`): Zero-config SSH bootstrapper + `wgpu` BT.709 YUV420P GPU renderer + `winit` input capture + `gilrs` gamepad + `cpal` / pure-Rust Opus playback (`rusty-opus`).
+| Crate | Purpose |
+| :--- | :--- |
+| [`crates/usher-proto`](crates/usher-proto) | Wire framing, ChaCha20-Poly1305 AEAD, anti-replay, striped XOR-FEC, MTU fragmenter, Annex-B & audio/input codecs |
+| [`crates/usher-host`](crates/usher-host) | `usher-host` binary (Linux DRM/PipeWire/headless + `uinput`, Windows Session 0→1 `ddagrab`/DXGI + WASAPI + `SendInput`) |
+| [`crates/usher-client`](crates/usher-client) | `usher` binary (SSH bootstrapper, `wgpu` BT.709 renderer, `winit` input, `gilrs` gamepad, `cpal` + Opus audio) |
