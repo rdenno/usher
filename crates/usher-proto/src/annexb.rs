@@ -85,10 +85,7 @@ impl AnnexBSplitter {
         };
 
         let mut cursor = first_start.0;
-        loop {
-            let Some((sc_pos, sc_len)) = find_start_code(&self.buf, cursor) else {
-                break;
-            };
+        while let Some((sc_pos, sc_len)) = find_start_code(&self.buf, cursor) {
             let nal_body_start = sc_pos + sc_len;
             let Some((next_pos, _)) = find_start_code(&self.buf, nal_body_start) else {
                 // Keep from `sc_pos` onward until the next start code arrives (or flush()).
