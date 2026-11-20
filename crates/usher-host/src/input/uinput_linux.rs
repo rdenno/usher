@@ -13,6 +13,8 @@ pub struct UinputSink {
     rel_mouse: VirtualDevice,
     gamepad: VirtualDevice,
     last_gamepad_buttons: u16,
+    wheel_accum_x: i32,
+    wheel_accum_y: i32,
 }
 
 impl UinputSink {
@@ -27,6 +29,8 @@ impl UinputSink {
             rel_mouse,
             gamepad,
             last_gamepad_buttons: 0,
+            wheel_accum_x: 0,
+            wheel_accum_y: 0,
         })
     }
 }
@@ -55,6 +59,8 @@ fn build_abs_mouse() -> Result<VirtualDevice> {
     let mut rels = AttributeSet::<RelativeAxisCode>::new();
     rels.insert(RelativeAxisCode::REL_WHEEL);
     rels.insert(RelativeAxisCode::REL_HWHEEL);
+    rels.insert(RelativeAxisCode::REL_WHEEL_HI_RES);
+    rels.insert(RelativeAxisCode::REL_HWHEEL_HI_RES);
 
     let mut props = AttributeSet::<PropType>::new();
     props.insert(PropType::DIRECT);
@@ -87,6 +93,8 @@ fn build_rel_mouse() -> Result<VirtualDevice> {
     rels.insert(RelativeAxisCode::REL_Y);
     rels.insert(RelativeAxisCode::REL_WHEEL);
     rels.insert(RelativeAxisCode::REL_HWHEEL);
+    rels.insert(RelativeAxisCode::REL_WHEEL_HI_RES);
+    rels.insert(RelativeAxisCode::REL_HWHEEL_HI_RES);
 
     let dev = VirtualDevice::builder()?
         .name("Usher Virtual Mouse")
@@ -170,20 +178,70 @@ impl InputSink for UinputSink {
                     .emit(&[KernelEvent::new(EventType::KEY.0, code, i32::from(pressed))])
             }
             InputEvent::MouseWheel { dx, dy } => {
-                let mut batch = Vec::with_capacity(2);
+                let mut batch = Vec::with_capacity(4);
                 if dx != 0 {
+                    let dx_i32 = dx as i32;
                     batch.push(KernelEvent::new(
                         EventType::RELATIVE.0,
                         RelativeAxisCode::REL_HWHEEL.0,
+                        dx_i32,
+                    ));
+                    batch.push(KernelEvent::new(
+                        EventType::RELATIVE.0,
+                        RelativeAxisCode::REL_HWHEEL_HI_RES.0,
+                        dx_i32.saturating_mul(120),
+                    ));
+                }
+                if dy != 0 {
+                    let dy_i32 = dy as i32;
+                    batch.push(KernelEvent::new(
+                        EventType::RELATIVE.0,
+                        RelativeAxisCode::REL_WHEEL.0,
+                        dy_i32,
+                    ));
+                    batch.push(KernelEvent::new(
+                        EventType::RELATIVE.0,
+                        RelativeAxisCode::REL_WHEEL_HI_RES.0,
+                        dy_i32.saturating_mul(120),
+                    ));
+                }
+                if batch.is_empty() {
+                    Ok(())
+                } else {
+                    self.rel_mouse.emit(&batch)
+                }
+            }
+            InputEvent::MouseWheelHiRes { dx, dy } => {
+                let mut batch = Vec::with_capacity(4);
+                if dx != 0 {
+                    batch.push(KernelEvent::new(
+                        EventType::RELATIVE.0,
+                        RelativeAxisCode::REL_HWHEEL_HI_RES.0,
                         dx as i32,
                     ));
+                    let detents = accumulate_hi_res_detents(&mut self.wheel_accum_x, dx);
+                    if detents != 0 {
+                        batch.push(KernelEvent::new(
+                            EventType::RELATIVE.0,
+                            RelativeAxisCode::REL_HWHEEL.0,
+                            detents,
+                        ));
+                    }
                 }
                 if dy != 0 {
                     batch.push(KernelEvent::new(
                         EventType::RELATIVE.0,
-                        RelativeAxisCode::REL_WHEEL.0,
+                        RelativeAxisCode::REL_WHEEL_HI_RES.0,
                         dy as i32,
                     ));
+                    let detents = accumulate_hi_res_detents(&mut self.wheel_accum_y, dy);
+                    if detents != 0 {
+                        batch.push(KernelEvent::new(
+                            EventType::RELATIVE.0,
+                            RelativeAxisCode::REL_WHEEL.0,
+                            detents,
+                        ));
+                    }
                 }
                 if batch.is_empty() {
                     Ok(())
@@ -247,5 +305,36 @@ impl InputSink for UinputSink {
         if let Err(err) = res {
             tracing::warn!("uinput emit error: {err}");
         }
+    }
+}
+
+fn accumulate_hi_res_detents(accum: &mut i32, delta: i16) -> i32 {
+    let delta_i32 = delta as i32;
+    if delta_i32 != 0 && *accum != 0 && delta_i32.signum() != accum.signum() {
+        *accum = 0;
+    }
+    *accum += delta_i32;
+    let detents = *accum / 120;
+    *accum %= 120;
+    detents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accumulate_hi_res_detents;
+
+    #[test]
+    fn accumulates_hi_res_scroll_into_legacy_detents() {
+        let mut acc = 0i32;
+        assert_eq!(accumulate_hi_res_detents(&mut acc, -30), 0);
+        assert_eq!(acc, -30);
+        assert_eq!(accumulate_hi_res_detents(&mut acc, -60), 0);
+        assert_eq!(acc, -90);
+        assert_eq!(accumulate_hi_res_detents(&mut acc, -60), -1);
+        assert_eq!(acc, -30);
+
+        // Direction reversal clears stale opposite remainder cleanly.
+        assert_eq!(accumulate_hi_res_detents(&mut acc, 120), 1);
+        assert_eq!(acc, 0);
     }
 }

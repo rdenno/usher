@@ -151,6 +151,62 @@ impl InputSink for Win32InputSink {
     }
 }
 
+fn mouse_wheel_data_from_detents(detents: i16) -> u32 {
+    (detents as i32).saturating_mul(WHEEL_DELTA as i32) as u32
+}
+
+fn mouse_wheel_data_from_hires(delta: i16) -> u32 {
+    (delta as i32) as u32
+}
+
+fn dispatch_wheel_data(
+    dx_data: u32,
+    dy_data: u32,
+    dx_nonzero: bool,
+    dy_nonzero: bool,
+    prev_desk: &mut Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+    last_attach: &mut Instant,
+) {
+    if dy_nonzero {
+        send_single(
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: dy_data,
+                        dwFlags: MOUSEEVENTF_WHEEL,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            prev_desk,
+            last_attach,
+        );
+    }
+    if dx_nonzero {
+        send_single(
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: dx_data,
+                        dwFlags: MOUSEEVENTF_HWHEEL,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            prev_desk,
+            last_attach,
+        );
+    }
+}
+
 fn dispatch_input_event(
     event: InputEvent,
     prev_desk: &mut Option<windows::Win32::System::StationsAndDesktops::HDESK>,
@@ -260,44 +316,24 @@ fn dispatch_input_event(
             );
         }
         InputEvent::MouseWheel { dx, dy } => {
-            if dy != 0 {
-                send_single(
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dx: 0,
-                                dy: 0,
-                                mouseData: (dy as i32 * WHEEL_DELTA as i32) as u32,
-                                dwFlags: MOUSEEVENTF_WHEEL,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    },
-                    prev_desk,
-                    last_attach,
-                );
-            }
-            if dx != 0 {
-                send_single(
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dx: 0,
-                                dy: 0,
-                                mouseData: (dx as i32 * WHEEL_DELTA as i32) as u32,
-                                dwFlags: MOUSEEVENTF_HWHEEL,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    },
-                    prev_desk,
-                    last_attach,
-                );
-            }
+            dispatch_wheel_data(
+                mouse_wheel_data_from_detents(dx),
+                mouse_wheel_data_from_detents(dy),
+                dx != 0,
+                dy != 0,
+                prev_desk,
+                last_attach,
+            );
+        }
+        InputEvent::MouseWheelHiRes { dx, dy } => {
+            dispatch_wheel_data(
+                mouse_wheel_data_from_hires(dx),
+                mouse_wheel_data_from_hires(dy),
+                dx != 0,
+                dy != 0,
+                prev_desk,
+                last_attach,
+            );
         }
         InputEvent::GamepadState {
             buttons,
@@ -360,6 +396,22 @@ mod tests {
         assert_eq!(evdev_to_win32_scancode(97), Some((0x1D, true))); // RightCtrl
         assert_eq!(evdev_to_win32_scancode(103), Some((0x48, true))); // ArrowUp
         assert_eq!(evdev_to_win32_scancode(125), Some((0x5B, true))); // LeftMeta
+    }
+
+    #[test]
+    fn wheel_mouse_data_preserves_signed_deltas() {
+        assert_eq!(mouse_wheel_data_from_hires(12), 12u32);
+        assert_eq!(mouse_wheel_data_from_hires(-12), (-12i32) as u32);
+        assert_eq!(mouse_wheel_data_from_hires(1), 1u32);
+        assert_eq!(mouse_wheel_data_from_hires(-1), (-1i32) as u32);
+        assert_eq!(mouse_wheel_data_from_hires(i16::MIN), (i16::MIN as i32) as u32);
+        assert_eq!(mouse_wheel_data_from_hires(i16::MAX), (i16::MAX as i32) as u32);
+
+        assert_eq!(mouse_wheel_data_from_detents(1), WHEEL_DELTA);
+        assert_eq!(
+            mouse_wheel_data_from_detents(-1),
+            (-(WHEEL_DELTA as i32)) as u32
+        );
     }
 
     #[ignore]

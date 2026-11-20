@@ -610,7 +610,14 @@ impl MfHwEncoder {
         self.pending_keyframe = false;
         if let Some(ref api) = self.codec_api {
             let mut one = variant_u32(1);
-            let _ = unsafe { api.set_value(&CODECAPI_AVEncVideoForceKeyFrame, &mut one) };
+            let hr = unsafe { api.set_value(&CODECAPI_AVEncVideoForceKeyFrame, &mut one) };
+            if hr.is_err() {
+                tracing::debug!(
+                    ?hr,
+                    encoder = %self.encoder_name,
+                    "CODECAPI_AVEncVideoForceKeyFrame failed"
+                );
+            }
         }
     }
 
@@ -823,6 +830,7 @@ mod tests {
             };
             let mut total_bytes = 0usize;
             let mut saw_keyframe = false;
+            let mut forced_keyframe = false;
             for idx in 0..8u64 {
                 let frame = synthetic_nv12(640, 360, idx as u8);
                 if idx == 3 {
@@ -834,10 +842,17 @@ mod tests {
                 for (bytes, kf) in pkts {
                     total_bytes += bytes.len();
                     saw_keyframe |= kf;
+                    if idx >= 3 {
+                        forced_keyframe |= kf;
+                    }
                 }
             }
             assert!(total_bytes > 200, "expected compressed {codec} output");
             assert!(saw_keyframe, "expected at least one {codec} keyframe");
+            assert!(
+                forced_keyframe,
+                "expected forced keyframe at/after idx 3 for {codec}"
+            );
         }
     }
 }

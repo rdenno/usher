@@ -13,7 +13,9 @@ use usher_proto::input::{InputEvent, MouseButton as UsherMouseButton};
 use usher_proto::packet::ControlMessage;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
+};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
@@ -25,6 +27,7 @@ pub struct ConnectedSession {
     pub initial_fullscreen: bool,
     pub relative_mouse: bool,
     pub input_enabled: bool,
+    pub hi_res_scroll: bool,
     pub input_tx: mpsc::Sender<InputEvent>,
     pub control_tx: mpsc::Sender<ControlMessage>,
     pub frame_slot: Arc<LatestSlot<crate::decoder::Yuv420Frame>>,
@@ -32,6 +35,119 @@ pub struct ConnectedSession {
     pub audio_muted: Arc<AtomicBool>,
     pub overlay: OverlayState,
     pub _audio_player: Option<AudioPlayer>,
+}
+
+const WHEEL_DELTA_UNITS: f64 = 120.0;
+const PIXELS_PER_WHEEL_NOTCH: f64 = 40.0;
+const SCROLL_ACCUM_RESET_TIMEOUT: Duration = Duration::from_millis(500);
+
+pub(crate) struct ScrollAccumulator {
+    accum_x: f64,
+    accum_y: f64,
+    last_event: Instant,
+}
+
+impl ScrollAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            accum_x: 0.0,
+            accum_y: 0.0,
+            last_event: Instant::now(),
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.accum_x = 0.0;
+        self.accum_y = 0.0;
+    }
+
+    fn accumulate_axis(accum: &mut f64, delta: f64) {
+        if !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        if *accum != 0.0 && delta.signum() != accum.signum() {
+            *accum = 0.0;
+        }
+        *accum += delta;
+    }
+
+    fn take_steps(accum: &mut f64, step_size: f64) -> i16 {
+        let scaled = *accum / step_size;
+        let rounded = scaled.round();
+        if (scaled - rounded).abs() < 1e-4 {
+            *accum = rounded * step_size;
+        }
+        let steps = (*accum / step_size)
+            .trunc()
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        *accum -= (steps as f64) * step_size;
+        steps
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+        scale_factor: f64,
+        hi_res: bool,
+        now: Instant,
+    ) -> Option<InputEvent> {
+        if phase == TouchPhase::Started
+            || now.saturating_duration_since(self.last_event) >= SCROLL_ACCUM_RESET_TIMEOUT
+        {
+            self.reset();
+        }
+        self.last_event = now;
+
+        let (raw_dx, raw_dy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                (-(x as f64) * WHEEL_DELTA_UNITS, (y as f64) * WHEEL_DELTA_UNITS)
+            }
+            MouseScrollDelta::PixelDelta(pos) => {
+                let scale = if scale_factor.is_finite() {
+                    scale_factor.max(0.5)
+                } else {
+                    1.0
+                };
+                let factor = WHEEL_DELTA_UNITS / (PIXELS_PER_WHEEL_NOTCH * scale);
+                (-pos.x * factor, pos.y * factor)
+            }
+        };
+
+        Self::accumulate_axis(&mut self.accum_x, raw_dx);
+        Self::accumulate_axis(&mut self.accum_y, raw_dy);
+
+        if hi_res {
+            let dx = Self::take_steps(&mut self.accum_x, 1.0);
+            let dy = Self::take_steps(&mut self.accum_y, 1.0);
+            if dx != 0 || dy != 0 {
+                Some(InputEvent::MouseWheelHiRes { dx, dy })
+            } else {
+                None
+            }
+        } else {
+            let dx = Self::take_steps(&mut self.accum_x, WHEEL_DELTA_UNITS);
+            let dy = Self::take_steps(&mut self.accum_y, WHEEL_DELTA_UNITS);
+            if dx != 0 || dy != 0 {
+                Some(InputEvent::MouseWheel { dx, dy })
+            } else {
+                None
+            }
+        }
+    }
+
+    pub(crate) fn restore_unsent(&mut self, ev: InputEvent) {
+        let (dx, dy) = match ev {
+            InputEvent::MouseWheelHiRes { dx, dy } => (dx as f64, dy as f64),
+            InputEvent::MouseWheel { dx, dy } => (
+                (dx as f64) * WHEEL_DELTA_UNITS,
+                (dy as f64) * WHEEL_DELTA_UNITS,
+            ),
+            _ => return,
+        };
+        self.accum_x = (self.accum_x + dx).clamp(-1200.0, 1200.0);
+        self.accum_y = (self.accum_y + dy).clamp(-1200.0, 1200.0);
+    }
 }
 
 pub type ConnectFn = Box<dyn FnOnce(Option<(u16, u16, u16)>) -> anyhow::Result<ConnectedSession>>;
@@ -49,6 +165,7 @@ pub struct UsherApp {
     alt_down: bool,
     rel_accum_x: f64,
     rel_accum_y: f64,
+    scroll_accum: ScrollAccumulator,
     cursor_pos: (f64, f64),
     cursor_inside: bool,
     last_title_update: Instant,
@@ -69,6 +186,7 @@ impl UsherApp {
             alt_down: false,
             rel_accum_x: 0.0,
             rel_accum_y: 0.0,
+            scroll_accum: ScrollAccumulator::new(),
             cursor_pos: (0.0, 0.0),
             cursor_inside: false,
             last_title_update: Instant::now(),
@@ -325,6 +443,7 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                 if !focused {
                     self.ctrl_down = false;
                     self.alt_down = false;
+                    self.scroll_accum.reset();
                 }
                 self.apply_mouse_mode();
             }
@@ -371,6 +490,9 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                         KeyCode::KeyS if pressed && self.ctrl_down && self.alt_down => {
                             if let Some(sess) = &mut self.session {
                                 sess.overlay.toggle_open();
+                                if sess.overlay.open {
+                                    self.scroll_accum.reset();
+                                }
                             }
                             self.apply_mouse_mode();
                             if let Some(win) = &self.window {
@@ -523,22 +645,28 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                     pressed: state == ElementState::Pressed,
                 });
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let Some(sess) = &self.session else {
-                    return;
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                let (input_tx, hi_res_scroll) = {
+                    let Some(sess) = &self.session else {
+                        return;
+                    };
+                    if sess.overlay.open || !sess.input_enabled {
+                        return;
+                    }
+                    (sess.input_tx.clone(), sess.hi_res_scroll)
                 };
-                if sess.overlay.open || !sess.input_enabled {
-                    return;
-                }
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x.round() as i16, y.round() as i16),
-                    MouseScrollDelta::PixelDelta(pos) => (
-                        (pos.x / 16.0).round() as i16,
-                        (pos.y / 16.0).round() as i16,
-                    ),
-                };
-                if dx != 0 || dy != 0 {
-                    let _ = sess.input_tx.try_send(InputEvent::MouseWheel { dx, dy });
+                let scale_factor = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+                if let Some(ev) = self.scroll_accum.push(
+                    delta,
+                    phase,
+                    scale_factor,
+                    hi_res_scroll,
+                    Instant::now(),
+                ) {
+                    tracing::trace!(?delta, ?phase, ?ev, "forwarding mouse wheel");
+                    if input_tx.try_send(ev).is_err() {
+                        self.scroll_accum.restore_unsent(ev);
+                    }
                 }
             }
             _ => {}
@@ -570,5 +698,198 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                     .try_send(InputEvent::MouseMoveRel { dx: ix, dy: iy });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::dpi::PhysicalPosition;
+
+    #[test]
+    fn windows_sub_detent_scroll_never_loses_units() {
+        let mut acc = ScrollAccumulator::new();
+        let t0 = Instant::now();
+        for n in 1i16..=120 {
+            let pos = acc.push(
+                MouseScrollDelta::LineDelta(0.0, n as f32 / 120.0),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0,
+            );
+            assert_eq!(
+                pos,
+                Some(InputEvent::MouseWheelHiRes { dx: 0, dy: n }),
+                "positive sub-detent {n}/120 truncated"
+            );
+
+            let neg = acc.push(
+                MouseScrollDelta::LineDelta(0.0, -(n as f32) / 120.0),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0,
+            );
+            assert_eq!(
+                neg,
+                Some(InputEvent::MouseWheelHiRes { dx: 0, dy: -n }),
+                "negative sub-detent -{n}/120 truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_inverts_winit_sign_to_right_positive() {
+        let mut acc = ScrollAccumulator::new();
+        let t0 = Instant::now();
+        let right = acc.push(
+            MouseScrollDelta::LineDelta(-0.1, 0.0),
+            TouchPhase::Moved,
+            1.0,
+            true,
+            t0,
+        );
+        assert_eq!(right, Some(InputEvent::MouseWheelHiRes { dx: 12, dy: 0 }));
+
+        let left = acc.push(
+            MouseScrollDelta::LineDelta(0.1, 0.0),
+            TouchPhase::Moved,
+            1.0,
+            true,
+            t0,
+        );
+        assert_eq!(left, Some(InputEvent::MouseWheelHiRes { dx: -12, dy: 0 }));
+    }
+
+    #[test]
+    fn pixel_delta_accumulates_fractional_scroll_events() {
+        let mut acc = ScrollAccumulator::new();
+        let t0 = Instant::now();
+        // At scale_factor = 2.0, factor = 120 / (40 * 2) = 1.5 units/px -> 0.2 px = 0.3 units.
+        for _ in 0..3 {
+            assert_eq!(
+                acc.push(
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.2)),
+                    TouchPhase::Moved,
+                    2.0,
+                    true,
+                    t0,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.2)),
+                TouchPhase::Moved,
+                2.0,
+                true,
+                t0,
+            ),
+            Some(InputEvent::MouseWheelHiRes { dx: 0, dy: 1 })
+        );
+    }
+
+    #[test]
+    fn legacy_fallback_accumulates_small_touchpad_events_into_detents() {
+        let mut acc = ScrollAccumulator::new();
+        let t0 = Instant::now();
+        for _ in 0..19 {
+            assert_eq!(
+                acc.push(
+                    MouseScrollDelta::LineDelta(0.0, -0.05),
+                    TouchPhase::Moved,
+                    1.0,
+                    false,
+                    t0,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::LineDelta(0.0, -0.05),
+                TouchPhase::Moved,
+                1.0,
+                false,
+                t0,
+            ),
+            Some(InputEvent::MouseWheel { dx: 0, dy: -1 })
+        );
+    }
+
+    #[test]
+    fn reversal_start_and_timeout_clear_stale_remainder() {
+        let mut acc = ScrollAccumulator::new();
+        let t0 = Instant::now();
+
+        // Accumulate 0.5 units vertically (below 1.0 threshold).
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::LineDelta(0.0, 0.5 / 120.0),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0,
+            ),
+            None
+        );
+        // Reversing immediately clears the positive 0.5 remainder rather than requiring 1.5 downward.
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::LineDelta(0.0, -1.0 / 120.0),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0,
+            ),
+            Some(InputEvent::MouseWheelHiRes { dx: 0, dy: -1 })
+        );
+
+        // Leave 0.6 units accumulated, then send TouchPhase::Started.
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.2)),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0,
+            ),
+            None
+        );
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.2)),
+                TouchPhase::Started,
+                1.0,
+                true,
+                t0 + Duration::from_millis(10),
+            ),
+            None
+        );
+        // After reset at Started, only 0.6 units accumulated, so 0.2 more reaches 1.2 -> dy=1 (not >1 from old sum).
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.2)),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0 + Duration::from_millis(20),
+            ),
+            Some(InputEvent::MouseWheelHiRes { dx: 0, dy: 1 })
+        );
+
+        // Leave 0.6 units, then wait >= 500ms timeout.
+        assert_eq!(
+            acc.push(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.2)),
+                TouchPhase::Moved,
+                1.0,
+                true,
+                t0 + Duration::from_millis(600),
+            ),
+            None
+        );
     }
 }

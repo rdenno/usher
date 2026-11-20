@@ -635,6 +635,11 @@ async fn run_video_tx_loop(
         };
 
         let fec = fec_percent.load(Ordering::Acquire);
+        let frame_fec = if frame.keyframe && fec > 0 {
+            fec.max(25)
+        } else {
+            fec
+        };
         let flags = if frame.keyframe {
             FRAME_FLAG_KEYFRAME
         } else {
@@ -646,7 +651,7 @@ async fn run_video_tx_loop(
             flags,
             &frame.data,
             mtu,
-            fec,
+            frame_fec,
         ) {
             Ok(s) => s,
             Err(err) => {

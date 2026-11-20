@@ -493,6 +493,7 @@ fn main() -> Result<()> {
             initial_fullscreen: eff.fullscreen,
             relative_mouse: eff.pointer_mode == PointerMode::Relative,
             input_enabled: !no_input,
+            hi_res_scroll: hello.hi_res_scroll,
             input_tx: transport.input_tx,
             control_tx: transport.control_tx,
             frame_slot: transport.decoded_frame_slot,

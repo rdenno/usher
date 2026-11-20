@@ -529,6 +529,7 @@ async fn main() -> Result<()> {
         host_version: env!("CARGO_PKG_VERSION").to_string(),
         video_backend: format!("{resolved_backend:?}"),
         gamepad_backend,
+        hi_res_scroll: true,
     };
 
     let hello_line = encode_hello_line(&hello)?;

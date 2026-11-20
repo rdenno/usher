@@ -42,7 +42,14 @@ pub enum InputEvent {
         button: MouseButton,
         pressed: bool,
     },
+    /// Whole mouse wheel detents (`+dy` = scroll up, `+dx` = scroll right).
     MouseWheel {
+        dx: i16,
+        dy: i16,
+    },
+    /// High-resolution mouse wheel deltas in `1/120`th detent units
+    /// (`120` = one standard detent; `+dy` = scroll up, `+dx` = scroll right).
+    MouseWheelHiRes {
         dx: i16,
         dy: i16,
     },
@@ -94,6 +101,13 @@ impl InputEvent {
             InputEvent::MouseWheel { dx, dy } => {
                 let mut out = Vec::with_capacity(5);
                 out.push(0x05);
+                out.extend_from_slice(&dx.to_le_bytes());
+                out.extend_from_slice(&dy.to_le_bytes());
+                out
+            }
+            InputEvent::MouseWheelHiRes { dx, dy } => {
+                let mut out = Vec::with_capacity(5);
+                out.push(0x07);
                 out.extend_from_slice(&dx.to_le_bytes());
                 out.extend_from_slice(&dy.to_le_bytes());
                 out
@@ -185,6 +199,15 @@ impl InputEvent {
                     ry: i16::from_le_bytes([rest[10], rest[11]]),
                 })
             }
+            0x07 => {
+                if rest.len() != 4 {
+                    bail!("invalid MouseWheelHiRes len {}", rest.len());
+                }
+                Ok(Self::MouseWheelHiRes {
+                    dx: i16::from_le_bytes([rest[0], rest[1]]),
+                    dy: i16::from_le_bytes([rest[2], rest[3]]),
+                })
+            }
             other => bail!("unknown input event tag {other}"),
         }
     }
@@ -211,6 +234,7 @@ mod tests {
                 pressed: false,
             },
             InputEvent::MouseWheel { dx: 0, dy: -120 },
+            InputEvent::MouseWheelHiRes { dx: -15, dy: 24 },
             InputEvent::GamepadState {
                 buttons: 0b1010_0000_0001_0001,
                 lt: 200,

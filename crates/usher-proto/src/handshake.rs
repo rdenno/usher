@@ -258,6 +258,8 @@ pub struct HelloMessage {
     pub video_backend: String,
     #[serde(default)]
     pub gamepad_backend: String,
+    #[serde(default)]
+    pub hi_res_scroll: bool,
 }
 
 impl HelloMessage {
@@ -437,6 +439,7 @@ mod tests {
             host_version: "0.4.0".into(),
             video_backend: "Win(NativeDxgiMf)".into(),
             gamepad_backend: "ViGEmBus".into(),
+            hi_res_scroll: true,
         };
         let encoded = encode_hello_line(&msg).unwrap();
         assert!(parse_hello_line("Welcome to Ubuntu 24.04 LTS").is_none());
@@ -458,6 +461,7 @@ mod tests {
             .expect("valid legacy hello");
         assert_eq!(parsed_legacy.max_bitrate_kbps, 0);
         assert_eq!(parsed_legacy.prefer, QualityPreference::Latency);
+        assert!(!parsed_legacy.hi_res_scroll);
     }
 
     #[test]
