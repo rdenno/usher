@@ -26,8 +26,11 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1,
+    IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -44,6 +47,10 @@ pub enum WinHwVendor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WinVideoBackend {
+    NativeDxgiMf {
+        codec: VideoCodec,
+        encoder: EncoderKind,
+    },
     DdagrabHw {
         ffmpeg_path: PathBuf,
         encoder_name: &'static str,
@@ -380,17 +387,25 @@ fn encoder_candidates(
 
 pub fn probe_supported_codecs(capture: CaptureSource, encoder: EncoderKind) -> Vec<VideoCodec> {
     let mut out = Vec::new();
-    if capture != CaptureSource::Testsrc
-        && encoder != EncoderKind::Openh264
-        && let Some(ffmpeg) = find_working_ffmpeg()
-        && let Some((true, encs_text)) = query_ffmpeg_caps(&ffmpeg)
-    {
-        let (vendors, _) = enumerate_windows_adapters_and_outputs();
-        for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
-            for (enc_name, _) in encoder_candidates(encoder, codec, &vendors) {
-                if encs_text.contains(enc_name) {
-                    out.push(codec);
-                    break;
+    if capture != CaptureSource::Testsrc && encoder != EncoderKind::Openh264 {
+        for codec in super::mf_encoder::probe_mf_hw_codecs(encoder) {
+            if !out.contains(&codec) {
+                out.push(codec);
+            }
+        }
+        if let Some(ffmpeg) = find_working_ffmpeg()
+            && let Some((true, encs_text)) = query_ffmpeg_caps(&ffmpeg)
+        {
+            let (vendors, _) = enumerate_windows_adapters_and_outputs();
+            for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
+                if out.contains(&codec) {
+                    continue;
+                }
+                for (enc_name, _) in encoder_candidates(encoder, codec, &vendors) {
+                    if encs_text.contains(enc_name) {
+                        out.push(codec);
+                        break;
+                    }
                 }
             }
         }
@@ -401,14 +416,12 @@ pub fn probe_supported_codecs(capture: CaptureSource, encoder: EncoderKind) -> V
     out
 }
 
-pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBackend> {
-    if !matches!(cfg.capture, CaptureSource::Auto | CaptureSource::Dxgi) {
+pub fn select_ddagrab_fallback(cfg: &VideoPipelineConfig) -> Option<WinVideoBackend> {
+    if !matches!(cfg.capture, CaptureSource::Auto | CaptureSource::Dxgi)
+        || cfg.encoder == EncoderKind::Openh264
+    {
         return None;
     }
-    if cfg.encoder == EncoderKind::Openh264 {
-        return Some(WinVideoBackend::NativeDxgiOpenH264);
-    }
-
     if let Some(ffmpeg) = find_working_ffmpeg()
         && let Some((true, encs_text)) = query_ffmpeg_caps(&ffmpeg)
     {
@@ -423,8 +436,25 @@ pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBacke
             }
         }
     }
+    None
+}
 
-    Some(WinVideoBackend::NativeDxgiOpenH264)
+pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBackend> {
+    if !matches!(cfg.capture, CaptureSource::Auto | CaptureSource::Dxgi) {
+        return None;
+    }
+    if cfg.encoder == EncoderKind::Openh264 {
+        return Some(WinVideoBackend::NativeDxgiOpenH264);
+    }
+
+    if super::mf_encoder::probe_mf_hw_codecs(cfg.encoder).contains(&cfg.codec) {
+        return Some(WinVideoBackend::NativeDxgiMf {
+            codec: cfg.codec,
+            encoder: cfg.encoder,
+        });
+    }
+
+    select_ddagrab_fallback(cfg).or(Some(WinVideoBackend::NativeDxgiOpenH264))
 }
 
 pub async fn run_windows_backend(
@@ -437,6 +467,29 @@ pub async fn run_windows_backend(
     cancel: CancellationToken,
 ) -> Result<()> {
     match backend {
+        WinVideoBackend::NativeDxgiMf { codec, encoder } => {
+            tracing::info!(
+                codec = %codec,
+                encoder = ?encoder,
+                display = cfg.display_index,
+                width = cfg.width,
+                height = cfg.height,
+                fps = cfg.fps,
+                bitrate_kbps = cfg.bitrate_kbps,
+                "starting built-in DXGI + Media Foundation hardware video pipeline"
+            );
+            run_native_dxgi_mf(
+                cfg,
+                codec,
+                encoder,
+                live_bitrate_kbps,
+                tx,
+                keyframe_req,
+                start,
+                cancel,
+            )
+            .await
+        }
         WinVideoBackend::DdagrabHw {
             ffmpeg_path,
             encoder_name,
@@ -1078,6 +1131,165 @@ fn ddagrab_exit_error(
     }
 }
 
+struct PointerOverlay<'a> {
+    x: i32,
+    y: i32,
+    info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    data: &'a [u8],
+}
+
+impl<'a> PointerOverlay<'a> {
+    #[inline]
+    fn sample(&self, sx: usize, sy: usize, bgra: (i32, i32, i32)) -> (i32, i32, i32) {
+        let px = sx as i32 - self.x;
+        let py = sy as i32 - self.y;
+        let pw = self.info.Width as i32;
+        let ptype = self.info.Type as i32;
+        let ph = if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+            (self.info.Height as i32) / 2
+        } else {
+            self.info.Height as i32
+        };
+        if px < 0 || py < 0 || px >= pw || py >= ph {
+            return bgra;
+        }
+        let pitch = self.info.Pitch as usize;
+        let ux = px as usize;
+        let uy = py as usize;
+        if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 {
+            let off = uy * pitch + ux * 4;
+            if off + 4 <= self.data.len() {
+                let pb = self.data[off] as i32;
+                let pg = self.data[off + 1] as i32;
+                let pr = self.data[off + 2] as i32;
+                let pa = self.data[off + 3] as i32;
+                if pa == 255 {
+                    return (pb, pg, pr);
+                } else if pa > 0 {
+                    let inv = 255 - pa;
+                    let ob = (bgra.0 * inv) / 255 + if pb <= pa { pb } else { (pb * pa) / 255 };
+                    let og = (bgra.1 * inv) / 255 + if pg <= pa { pg } else { (pg * pa) / 255 };
+                    let or = (bgra.2 * inv) / 255 + if pr <= pa { pr } else { (pr * pa) / 255 };
+                    return (ob.min(255), og.min(255), or.min(255));
+                }
+            }
+        } else if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 {
+            let off = uy * pitch + ux * 4;
+            if off + 4 <= self.data.len() {
+                let pb = self.data[off] as i32;
+                let pg = self.data[off + 1] as i32;
+                let pr = self.data[off + 2] as i32;
+                let mask = self.data[off + 3];
+                if mask == 0 {
+                    return (pb, pg, pr);
+                }
+                return (bgra.0 ^ pb, bgra.1 ^ pg, bgra.2 ^ pr);
+            }
+        } else if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+            let half_h = ph as usize;
+            let and_off = uy * pitch + (ux / 8);
+            let xor_off = (uy + half_h) * pitch + (ux / 8);
+            if xor_off < self.data.len() {
+                let bit = 1u8 << (7 - (ux & 7));
+                let and_set = (self.data[and_off] & bit) != 0;
+                let xor_set = (self.data[xor_off] & bit) != 0;
+                return match (and_set, xor_set) {
+                    (false, false) => (0, 0, 0),
+                    (false, true) => (255, 255, 255),
+                    (true, true) => (255 - bgra.0, 255 - bgra.1, 255 - bgra.2),
+                    (true, false) => bgra,
+                };
+            }
+        }
+        bgra
+    }
+}
+
+struct BgraSrc<'a> {
+    data: &'a [u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+}
+
+enum ChromaPlanes<'a> {
+    Planar { u: &'a mut [u8], v: &'a mut [u8] },
+    InterleavedNv12(&'a mut [u8]),
+}
+
+fn convert_bgra_planes(
+    src: BgraSrc<'_>,
+    dst_w: usize,
+    dst_h: usize,
+    pointer: Option<&PointerOverlay<'_>>,
+    y_dst: &mut [u8],
+    mut chroma_dst: ChromaPlanes<'_>,
+) {
+    if src.width == 0 || src.height == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+
+    #[inline]
+    fn sample_bgra(
+        src: &BgraSrc<'_>,
+        sx: usize,
+        sy: usize,
+        pointer: Option<&PointerOverlay<'_>>,
+    ) -> (i32, i32, i32) {
+        let px = sy * src.pitch + sx * 4;
+        let base = (
+            src.data[px] as i32,
+            src.data[px + 1] as i32,
+            src.data[px + 2] as i32,
+        );
+        match pointer {
+            Some(ptr) => ptr.sample(sx, sy, base),
+            None => base,
+        }
+    }
+
+    for dy in 0..dst_h {
+        let sy = (dy * src.height) / dst_h;
+        let y_row = &mut y_dst[dy * dst_w..(dy + 1) * dst_w];
+        for (dx, out_y) in y_row.iter_mut().enumerate() {
+            let sx = (dx * src.width) / dst_w;
+            let (b, g, r) = sample_bgra(&src, sx, sy, pointer);
+            *out_y = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
+        }
+    }
+
+    let cw = dst_w / 2;
+    let ch = dst_h / 2;
+    for cy in 0..ch {
+        let sy = (((cy * 2) * src.height) / dst_h).min(src.height - 1);
+        for cx in 0..cw {
+            let sx = (((cx * 2) * src.width) / dst_w).min(src.width - 1);
+            let (b, g, r) = sample_bgra(&src, sx, sy, pointer);
+            let u = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+            let v = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+            match chroma_dst {
+                ChromaPlanes::Planar {
+                    u: ref mut u_buf,
+                    v: ref mut v_buf,
+                } => {
+                    let idx = cy * cw + cx;
+                    u_buf[idx] = u;
+                    v_buf[idx] = v;
+                }
+                ChromaPlanes::InterleavedNv12(ref mut uv_buf) => {
+                    let idx = (cy * cw + cx) * 2;
+                    uv_buf[idx] = u;
+                    uv_buf[idx + 1] = v;
+                }
+            }
+        }
+    }
+}
+
+trait BgraFrameTarget {
+    fn write_bgra(&mut self, src: BgraSrc<'_>, pointer: Option<&PointerOverlay<'_>>);
+}
+
 struct DxgiI420Frame {
     width: usize,
     height: usize,
@@ -1098,49 +1310,56 @@ impl DxgiI420Frame {
             v: vec![128u8; (w / 2) * (h / 2)],
         }
     }
+}
 
-    fn convert_bgra(&mut self, src: &[u8], src_pitch: usize, src_w: usize, src_h: usize) {
-        let dst_w = self.width;
-        let dst_h = self.height;
-        if src_w == 0 || src_h == 0 {
-            return;
-        }
+impl BgraFrameTarget for DxgiI420Frame {
+    fn write_bgra(&mut self, src: BgraSrc<'_>, pointer: Option<&PointerOverlay<'_>>) {
+        convert_bgra_planes(
+            src,
+            self.width,
+            self.height,
+            pointer,
+            &mut self.y,
+            ChromaPlanes::Planar {
+                u: &mut self.u,
+                v: &mut self.v,
+            },
+        );
+    }
+}
 
-        // Luma plane (BT.709 limited range)
-        for dy in 0..dst_h {
-            let sy = (dy * src_h) / dst_h;
-            let row = &src[sy * src_pitch..];
-            let y_row = &mut self.y[dy * dst_w..(dy + 1) * dst_w];
-            for (dx, out_y) in y_row.iter_mut().enumerate() {
-                let sx = (dx * src_w) / dst_w;
-                let px = sx * 4;
-                let b = row[px] as i32;
-                let g = row[px + 1] as i32;
-                let r = row[px + 2] as i32;
-                *out_y = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
-            }
-        }
+struct DxgiNv12Frame {
+    width: usize,
+    height: usize,
+    nv12: Vec<u8>,
+}
 
-        // 4:2:0 chroma planes (2x2 box average on source pixels mapped to each chroma cell)
-        let cw = dst_w / 2;
-        let ch = dst_h / 2;
-        for cy in 0..ch {
-            let sy = (((cy * 2) * src_h) / dst_h).min(src_h - 1);
-            let row = &src[sy * src_pitch..];
-            let u_row = &mut self.u[cy * cw..(cy + 1) * cw];
-            let v_row = &mut self.v[cy * cw..(cy + 1) * cw];
-            for cx in 0..cw {
-                let sx = (((cx * 2) * src_w) / dst_w).min(src_w - 1);
-                let px = sx * 4;
-                let b = row[px] as i32;
-                let g = row[px + 1] as i32;
-                let r = row[px + 2] as i32;
-                let u = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
-                let v = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
-                u_row[cx] = u;
-                v_row[cx] = v;
-            }
+impl DxgiNv12Frame {
+    fn new(width: usize, height: usize) -> Self {
+        let w = width & !1;
+        let h = height & !1;
+        let mut nv12 = vec![128u8; w * h * 3 / 2];
+        nv12[..w * h].fill(16);
+        Self {
+            width: w,
+            height: h,
+            nv12,
         }
+    }
+}
+
+impl BgraFrameTarget for DxgiNv12Frame {
+    fn write_bgra(&mut self, src: BgraSrc<'_>, pointer: Option<&PointerOverlay<'_>>) {
+        let y_len = self.width * self.height;
+        let (y_dst, uv_dst) = self.nv12.split_at_mut(y_len);
+        convert_bgra_planes(
+            src,
+            self.width,
+            self.height,
+            pointer,
+            y_dst,
+            ChromaPlanes::InterleavedNv12(uv_dst),
+        );
     }
 }
 
@@ -1174,6 +1393,11 @@ struct DxgiSession {
     src_w: usize,
     src_h: usize,
     display_index: u8,
+    pointer_shape: Vec<u8>,
+    pointer_info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    pointer_x: i32,
+    pointer_y: i32,
+    pointer_visible: bool,
     orig_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
     prev_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
 }
@@ -1267,6 +1491,11 @@ impl DxgiSession {
                 src_w,
                 src_h,
                 display_index,
+                pointer_shape: Vec::new(),
+                pointer_info: DXGI_OUTDUPL_POINTER_SHAPE_INFO::default(),
+                pointer_x: 0,
+                pointer_y: 0,
+                pointer_visible: false,
                 orig_desk,
                 prev_desk,
             })
@@ -1334,7 +1563,7 @@ impl DxgiSession {
 
     /// Captures the next changed desktop frame into `frame`, returning `Ok(true)` if a new
     /// frame was copied, `Ok(false)` on timeout (desktop unchanged).
-    fn capture_into(&mut self, frame: &mut DxgiI420Frame, timeout_ms: u32) -> Result<bool> {
+    fn capture_into<F: BgraFrameTarget>(&mut self, frame: &mut F, timeout_ms: u32) -> Result<bool> {
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut res = None;
@@ -1347,6 +1576,44 @@ impl DxgiSession {
                 }
                 Err(e) => return Err(anyhow!("AcquireNextFrame failed: {e}")),
             }
+
+            if info.LastMouseUpdateTime != 0 {
+                self.pointer_visible = info.PointerPosition.Visible.as_bool();
+                self.pointer_x = info.PointerPosition.Position.x;
+                self.pointer_y = info.PointerPosition.Position.y;
+                if info.PointerShapeBufferSize > 0 {
+                    let needed = info.PointerShapeBufferSize as usize;
+                    if self.pointer_shape.len() < needed {
+                        self.pointer_shape.resize(needed, 0);
+                    }
+                    let mut req_size = 0u32;
+                    let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                    if self
+                        .dupl
+                        .GetFramePointerShape(
+                            info.PointerShapeBufferSize,
+                            self.pointer_shape.as_mut_ptr().cast(),
+                            &mut req_size,
+                            &mut shape_info,
+                        )
+                        .is_ok()
+                    {
+                        self.pointer_shape.resize(req_size as usize, 0);
+                        self.pointer_info = shape_info;
+                    }
+                }
+            }
+
+            let pointer = if self.pointer_visible && !self.pointer_shape.is_empty() {
+                Some(PointerOverlay {
+                    x: self.pointer_x,
+                    y: self.pointer_y,
+                    info: self.pointer_info,
+                    data: &self.pointer_shape,
+                })
+            } else {
+                None
+            };
 
             let copy_res = (|| -> Result<()> {
                 let desktop_res = res.ok_or_else(|| anyhow!("missing desktop resource"))?;
@@ -1361,7 +1628,15 @@ impl DxgiSession {
                 let pitch = mapped.RowPitch as usize;
                 let total_bytes = pitch * self.src_h;
                 let slice = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), total_bytes);
-                frame.convert_bgra(slice, pitch, self.src_w, self.src_h);
+                frame.write_bgra(
+                    BgraSrc {
+                        data: slice,
+                        pitch,
+                        width: self.src_w,
+                        height: self.src_h,
+                    },
+                    pointer.as_ref(),
+                );
                 self.ctx.Unmap(&self.staging, 0);
                 Ok(())
             })();
@@ -1384,6 +1659,157 @@ impl Drop for DxgiSession {
             let _ = unsafe { windows::Win32::System::StationsAndDesktops::CloseDesktop(old) };
         }
     }
+}
+
+#[inline]
+fn pace_frame(next_tick: &mut Instant, frame_period: Duration, cancel: &CancellationToken) {
+    *next_tick += frame_period;
+    let now = Instant::now();
+    if *next_tick > now {
+        let remaining = *next_tick - now;
+        if remaining > Duration::from_millis(2) {
+            std::thread::sleep(remaining - Duration::from_millis(1));
+        }
+        while Instant::now() < *next_tick {
+            if cancel.is_cancelled() {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    } else {
+        *next_tick = now;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_native_dxgi_mf(
+    cfg: VideoPipelineConfig,
+    codec: VideoCodec,
+    encoder: EncoderKind,
+    live_bitrate_kbps: Arc<AtomicU32>,
+    tx: mpsc::Sender<EncodedFrame>,
+    keyframe_req: Arc<AtomicBool>,
+    start: Instant,
+    cancel: CancellationToken,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        run_native_dxgi_mf_blocking(
+            cfg,
+            codec,
+            encoder,
+            live_bitrate_kbps,
+            tx,
+            keyframe_req,
+            start,
+            cancel,
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("DXGI MF worker panicked: {e}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_dxgi_mf_blocking(
+    cfg: VideoPipelineConfig,
+    codec: VideoCodec,
+    encoder_kind: EncoderKind,
+    live_bitrate_kbps: Arc<AtomicU32>,
+    tx: mpsc::Sender<EncodedFrame>,
+    keyframe_req: Arc<AtomicBool>,
+    start: Instant,
+    cancel: CancellationToken,
+) -> Result<()> {
+    wake_console_display();
+    let initial_session = crate::windows_session::current_session_id();
+    let mut dxgi = DxgiSession::new(cfg.display_index)?;
+    let initial_kbps = live_bitrate_kbps.load(Ordering::Acquire).max(500);
+    let mut encoder = super::mf_encoder::MfHwEncoder::new(
+        codec,
+        encoder_kind,
+        cfg.width,
+        cfg.height,
+        cfg.fps,
+        initial_kbps,
+        cfg.prefer == QualityPreference::Latency,
+    )?;
+    tracing::info!(
+        mf_encoder = %encoder.encoder_name(),
+        vendor = encoder.vendor_label(),
+        codec = %codec,
+        width = cfg.width,
+        height = cfg.height,
+        fps = cfg.fps,
+        bitrate_kbps = initial_kbps,
+        "Media Foundation hardware encoder active (zero ffmpeg dependency)"
+    );
+
+    let mut applied_bitrate = initial_kbps;
+    let mut have_encoded_first = false;
+    let mut frame = DxgiNv12Frame::new(cfg.width as usize, cfg.height as usize);
+    let frame_period = Duration::from_micros(1_000_000 / cfg.fps.max(1) as u64);
+    let timeout_ms = frame_period.as_millis().clamp(4, 33) as u32;
+    let mut next_tick = Instant::now();
+    let mut have_first_frame = false;
+    let mut initial_timeouts = 0u32;
+
+    while !cancel.is_cancelled() {
+        if initial_session != 0
+            && crate::windows_session::active_console_session_id() != initial_session
+        {
+            return Err(anyhow!("Windows console session changed during capture"));
+        }
+
+        match dxgi.capture_into(&mut frame, timeout_ms) {
+            Ok(true) => {
+                have_first_frame = true;
+            }
+            Ok(false) => {
+                if !have_first_frame {
+                    initial_timeouts += 1;
+                    if initial_timeouts < 5 {
+                        continue;
+                    }
+                    have_first_frame = true;
+                }
+            }
+            Err(err) => {
+                tracing::warn!("DXGI capture error ({err:#}); retrying");
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = dxgi.recreate();
+                continue;
+            }
+        }
+
+        if have_encoded_first {
+            let desired = live_bitrate_kbps.load(Ordering::Acquire).max(500);
+            if desired != applied_bitrate {
+                if encoder.set_bitrate_kbps(desired) {
+                    tracing::debug!(
+                        old_kbps = applied_bitrate,
+                        new_kbps = desired,
+                        "applied in-place MF bitrate update"
+                    );
+                }
+                applied_bitrate = desired;
+            }
+        }
+
+        let force_idr = keyframe_req.swap(false, Ordering::AcqRel) || !have_encoded_first;
+        let pts_us = start.elapsed().as_micros() as u64;
+        let pkts = encoder.encode_nv12(&frame.nv12, pts_us, force_idr)?;
+        have_encoded_first = true;
+        for (data, keyframe) in pkts {
+            let _ = tx.try_send(EncodedFrame {
+                data,
+                keyframe,
+                timestamp_us: pts_us as u32,
+            });
+        }
+
+        pace_frame(&mut next_tick, frame_period, &cancel);
+    }
+
+    Ok(())
 }
 
 async fn run_native_dxgi_openh264(
@@ -1409,6 +1835,8 @@ fn run_dxgi_blocking(
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
+    wake_console_display();
+    let initial_session = crate::windows_session::current_session_id();
     let mut dxgi = DxgiSession::new(cfg.display_index)?;
     let initial_kbps = live_bitrate_kbps.load(Ordering::Acquire).max(500);
     let complexity = match cfg.prefer {
@@ -1439,6 +1867,12 @@ fn run_dxgi_blocking(
     let mut initial_timeouts = 0u32;
 
     while !cancel.is_cancelled() {
+        if initial_session != 0
+            && crate::windows_session::active_console_session_id() != initial_session
+        {
+            return Err(anyhow!("Windows console session changed during capture"));
+        }
+
         match dxgi.capture_into(&mut frame, timeout_ms) {
             Ok(true) => {
                 have_first_frame = true;
@@ -1488,22 +1922,7 @@ fn run_dxgi_blocking(
             });
         }
 
-        next_tick += frame_period;
-        let now = Instant::now();
-        if next_tick > now {
-            let remaining = next_tick - now;
-            if remaining > Duration::from_millis(2) {
-                std::thread::sleep(remaining - Duration::from_millis(1));
-            }
-            while Instant::now() < next_tick {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-        } else {
-            next_tick = now;
-        }
+        pace_frame(&mut next_tick, frame_period, &cancel);
     }
 
     Ok(())

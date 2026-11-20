@@ -9,13 +9,14 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use usher_proto::audio::AudioPacket;
+use usher_proto::clipboard::{ClipboardReassembler, packetize_clipboard_text};
 use usher_proto::crypto::{Role, SessionCrypto};
 use usher_proto::fragment::{CompletedFrame, FRAME_FLAG_KEYFRAME, FrameReassembler};
 use usher_proto::handshake::{HelloMessage, VideoCodec};
 use usher_proto::input::InputEvent;
 use usher_proto::packet::{
     ControlMessage, PacketKind, PingPayload, PongPayload, STREAM_STATUS_FLAG_STEPPED_DOWN,
-    open_packet, seal_packet,
+    max_plaintext_len, open_packet, seal_packet,
 };
 
 #[derive(Debug, Default)]
@@ -141,11 +142,14 @@ pub struct ClientTransportHandles {
     pub telemetry: Arc<Telemetry>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_transport(
     hello: HelloMessage,
     decoder_kind: DecoderKind,
     audio_tx: Option<mpsc::Sender<AudioPacket>>,
     audio_muted: Arc<AtomicBool>,
+    clipboard_in_tx: Option<mpsc::Sender<String>>,
+    mut clipboard_out_rx: mpsc::Receiver<String>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     cancel: CancellationToken,
 ) -> Result<ClientTransportHandles> {
@@ -422,6 +426,7 @@ pub async fn start_transport(
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let mut reassembler = FrameReassembler::new(8);
+            let mut clip_reasm = ClipboardReassembler::new();
             let mut bytes_in_window = 0u64;
             let mut pkts_ok_in_win = 0u64;
             let mut fec_rec_in_win = 0u64;
@@ -573,6 +578,13 @@ pub async fn start_transport(
                                     let _ = atx.try_send(pkt);
                                 }
                             }
+                            PacketKind::Clipboard => {
+                                if let Some(ref ctx) = clipboard_in_tx
+                                    && let Ok(Some(text)) = clip_reasm.push_chunk(&plaintext)
+                                {
+                                    let _ = ctx.try_send(text);
+                                }
+                            }
                             PacketKind::Pong => {
                                 if let Ok(pong) = PongPayload::decode(&plaintext) {
                                     let now_us = start_rx.elapsed().as_micros() as u64;
@@ -636,7 +648,8 @@ pub async fn start_transport(
                                             desired_dec.lock().expect("decoder spec lock poisoned");
                                         let uses_ffmpeg_pipe = decoder_kind == DecoderKind::Ffmpeg
                                             || (decoder_kind == DecoderKind::Auto
-                                                && codec != VideoCodec::H264);
+                                                && codec != VideoCodec::H264
+                                                && !crate::decoder::has_native_decoder(codec));
                                         if guard.codec != codec
                                             || (uses_ffmpeg_pipe
                                                 && (guard.width != width
@@ -694,6 +707,8 @@ pub async fn start_transport(
 
             let mut ping_tick = tokio::time::interval(Duration::from_secs(1));
             let mut retry_tick = tokio::time::interval(Duration::from_millis(200));
+            let mut clip_transfer_id = 1u32;
+            let clip_max_pt = max_plaintext_len(mtu);
 
             loop {
                 tokio::select! {
@@ -721,6 +736,14 @@ pub async fn start_transport(
                     }
                     Some(ev) = input_rx.recv() => {
                         send_sealed(&sock, &cry, PacketKind::Input, &ev.encode(), mtu).await;
+                    }
+                    Some(text) = clipboard_out_rx.recv() => {
+                        let tid = clip_transfer_id;
+                        clip_transfer_id = clip_transfer_id.wrapping_add(1).max(1);
+                        for chunk in packetize_clipboard_text(tid, &text, clip_max_pt) {
+                            send_sealed(&sock, &cry, PacketKind::Clipboard, &chunk, mtu).await;
+                            send_sealed(&sock, &cry, PacketKind::Clipboard, &chunk, mtu).await;
+                        }
                     }
                     Some(ctrl) = control_rx.recv() => {
                         let is_disc = matches!(ctrl, ControlMessage::Disconnect);

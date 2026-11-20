@@ -1,14 +1,20 @@
 mod app;
 mod audio;
+mod clipboard;
 mod config;
 mod decoder;
+mod doctor;
 mod gamepad;
 mod icon;
 mod keymap;
+#[cfg(target_os = "windows")]
+mod mf_decoder;
 mod overlay;
 mod renderer;
 mod ssh;
 mod transport;
+#[cfg(target_os = "macos")]
+mod vt_decoder;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -140,6 +146,14 @@ struct Args {
     #[arg(long)]
     no_input: bool,
 
+    /// Disable bidirectional clipboard synchronization
+    #[arg(long)]
+    no_clipboard: bool,
+
+    /// Run end-to-end local and/or SSH + mesh P2P diagnostics and exit
+    #[arg(long)]
+    doctor: bool,
+
     /// Start in borderless fullscreen (default)
     #[arg(long)]
     fullscreen: bool,
@@ -190,6 +204,7 @@ fn build_cli_overrides(args: &Args) -> HostSettings {
         codec: args.codec,
         prefer: args.prefer,
         audio: if args.no_audio { Some(false) } else { None },
+        clipboard: if args.no_clipboard { Some(false) } else { None },
         display: args.display,
         pointer_mode,
         stats_overlay,
@@ -275,13 +290,16 @@ fn build_host_args(
     if !eff.audio {
         out.push("--no-audio".into());
     }
+    if !eff.clipboard {
+        out.push("--no-clipboard".into());
+    }
     out
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if !args.local && args.host.is_none() {
-        bail!("usage: usher <ssh-host> (or pass --local for local testing)");
+    if !args.doctor && !args.local && args.host.is_none() {
+        bail!("usage: usher <ssh-host> (or pass --local / --doctor)");
     }
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -311,18 +329,27 @@ fn main() -> Result<()> {
         args.bitrate_kbps,
     );
 
-    let event_loop = EventLoop::<AppEvent>::with_user_event()
-        .build()
-        .context("creating winit EventLoop")?;
-    let proxy = event_loop.create_proxy();
-    let cancel = CancellationToken::new();
-
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("creating Tokio runtime")?,
     );
+
+    if args.doctor {
+        return rt.block_on(doctor::run_doctor(
+            args.host.as_deref(),
+            args.local,
+            &eff,
+            &config_path,
+        ));
+    }
+
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .context("creating winit EventLoop")?;
+    let proxy = event_loop.create_proxy();
+    let cancel = CancellationToken::new();
 
     let rt_conn = rt.clone();
     let cancel_conn = cancel.clone();
@@ -403,11 +430,26 @@ fn main() -> Result<()> {
             (None, None)
         };
 
+        let (clip_in_tx, clip_in_rx) = mpsc::channel::<String>(16);
+        let (clip_out_tx, clip_out_rx) = mpsc::channel::<String>(16);
+        if eff.clipboard {
+            clipboard::spawn_clipboard_thread(clip_out_tx, clip_in_rx, cancel_conn.clone());
+        } else {
+            drop(clip_out_tx);
+            drop(clip_in_rx);
+        }
+
         let transport = rt_conn.block_on(start_transport(
             hello.clone(),
             eff.decoder,
             audio_tx,
             audio_muted.clone(),
+            if eff.clipboard {
+                Some(clip_in_tx)
+            } else {
+                None
+            },
+            clip_out_rx,
             proxy.clone(),
             cancel_conn.clone(),
         ))?;

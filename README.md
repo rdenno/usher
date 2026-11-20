@@ -15,11 +15,13 @@
 usher my-host
 ```
 
-With zero flags, `usher my-host` launches fullscreen (`--windowed` for a desktop window), matches your monitor & refresh rate, picks the best mutual hardware codec (`HEVC`/`AV1` when both ends support it, otherwise `H.264`), and adapts bitrate & FEC automatically to link conditions.
+With zero flags, `usher my-host` launches fullscreen (`--windowed` for a desktop window), preserves the host's native aspect ratio inside your monitor bounds, picks the best mutual hardware codec (`HEVC`/`AV1`/`H.264` via native Media Foundation / VideoToolbox without requiring `ffmpeg`, falling back to `ffmpeg` or OpenH264 when needed), syncs clipboard text bidirectionally, forwards Xbox 360 gamepads, and adapts bitrate & FEC automatically to link conditions.
 
 - **SSH key auth only**: Reuses `~/.ssh/config` aliases and public keys with no background server, PINs, or accounts.
+- **Zero-dependency native hardware video**: Windows uses DXGI Desktop Duplication + Media Foundation (`NVENC`/`AMF`/`QSV`/`DX12` encode & DXVA/D3D11 decode with zero-hitch in-place bitrate scaling); macOS uses VideoToolbox hardware decode (`HEVC`/`H.264`). Optional `ffmpeg` and built-in OpenH264 remain as automatic fallbacks.
 - **Cut-fast, grow-slow adaptive transport**: 500 ms client network reports steer bitrate (up to 60 Mbps by default) and dynamic XOR-FEC parity within `<= 1200`-byte mesh-safe UDP datagrams.
 - **Hidden in-stream overlay (`Ctrl+Alt+S`)**: Tweak bitrate ceiling, resolution, FPS, codec, latency/quality tuning, audio, monitor, pointer mode, or HUD live and save per-host defaults.
+- **One-command diagnostics (`usher --doctor`)**: Inspects native decoders, SSH resolution, Tailscale/ZeroTier Direct P2P vs. relay path, `ViGEmBus` gamepad driver status, and runs a live encrypted UDP ping probe.
 - **Zero-state teardown**: Closing the window or dropping SSH exits `usher-host`, destroys virtual devices, and closes the UDP port.
 
 ---
@@ -60,12 +62,18 @@ Host desktop
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-- **Windows hosts**: Enable OpenSSH Server (`sshd`), authorize your key (`C:\ProgramData\ssh\administrators_authorized_keys` for admin users or `%USERPROFILE%\.ssh\authorized_keys`), and select **Host** or **Client + Host** in the installer. `usher-host` automatically attaches to the active console session—capturing the Lock Screen (`Winlogon`) and UAC prompts as `NT AUTHORITY\SYSTEM` for Administrator SSH accounts and seamlessly following unlock transitions (`Session 2 -> Session 1`) without dropping the stream.
+- **Windows hosts**: Enable OpenSSH Server (`sshd`), authorize your key (`C:\ProgramData\ssh\administrators_authorized_keys` for admin users or `%USERPROFILE%\.ssh\authorized_keys`), and select **Host** or **Client + Host** in the installer. `usher-host` automatically attaches to the active console session—capturing the Lock Screen (`Winlogon`) and UAC prompts as `NT AUTHORITY\SYSTEM` for Administrator SSH accounts and seamlessly following unlock transitions (`Session 2 -> Session 1`) without dropping the stream. Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) on Windows hosts if you want virtual Xbox 360 gamepad pass-through.
 
-### 3. Connect
+### 3. Connect & Diagnose
 
 ```bash
 usher desktop
+```
+
+Check SSH reachability, native hardware codecs, Tailscale/ZeroTier Direct P2P vs. relay status, and encrypted UDP RTT in one shot:
+
+```bash
+usher --doctor desktop
 ```
 
 Single-machine loopback check without SSH:
@@ -103,7 +111,8 @@ stats_overlay = true
 | **`Ctrl+Alt+G`** | Toggle **Absolute** desktop pointer / **Locked Relative** raw mouse (3D games) |
 | **`Ctrl+Alt+F`** | Toggle borderless fullscreen |
 | **`Ctrl+Alt+Q`** | Disconnect and tear down the remote host session |
-| **Gamepads** | Polled via `gilrs` and mapped to a virtual Xbox 360 pad on Linux hosts |
+| **Gamepads** | Polled via `gilrs` and mapped to a virtual Xbox 360 pad (`ViGEmBus` on Windows hosts, `/dev/uinput` on Linux hosts) |
+| **Clipboard** | Bidirectional UTF-8 clipboard sync (disable with `--no-clipboard` or `clipboard = false`) |
 
 ---
 
@@ -130,6 +139,9 @@ stats_overlay = true
 | `--stats-overlay` | `false` | Show compact top-left live stats HUD by default |
 | `--capture` | `auto` | `auto`, `drm`, `pipewire`, `x11`, `dxgi`, `testsrc` |
 | `--encoder` | `auto` | `auto`, `vaapi`, `nvenc`, `amf`, `qsv`, `openh264` |
+| `--decoder` | `auto` | `auto`, `native` (Media Foundation / VideoToolbox), `openh264`, `ffmpeg` |
+| `--no-clipboard` | `false` | Disable bidirectional UTF-8 clipboard synchronization (`clipboard = false` in `config.toml`) |
+| `--doctor` | `false` | Diagnose SSH resolution, native codecs, `ViGEmBus`, Tailscale/ZeroTier relay status, and live UDP RTT |
 | `--mtu` / `--fec` | `1200` / `10` | Outer UDP packet cap (`<= 1200`) and initial XOR parity % (`0..=50`) |
 
 > Keep peer-to-peer UDP hole punching active (`tailscale status` showing a direct peer rather than `relay`); `usher` warns if RTT rises above `60 ms`.

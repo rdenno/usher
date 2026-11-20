@@ -173,6 +173,34 @@ pub struct DisplayInfo {
     pub height: u16,
 }
 
+/// Scales `(src_w, src_h)` to fit within `(max_w, max_h)` while preserving the host's
+/// aspect ratio and never upscaling beyond `(src_w, src_h)`. Outputs even dimensions `>= 64`.
+pub fn fit_preserving_aspect(src_w: u16, src_h: u16, max_w: u16, max_h: u16) -> (u16, u16) {
+    let sw = (src_w.max(64) as u32) & !1;
+    let sh = (src_h.max(64) as u32) & !1;
+    let mw = (max_w.max(64) as u32) & !1;
+    let mh = (max_h.max(64) as u32) & !1;
+
+    if sw <= mw && sh <= mh {
+        return (sw as u16, sh as u16);
+    }
+
+    let (w, h) = if (sw as u64) * (mh as u64) >= (mw as u64) * (sh as u64) {
+        let w = mw;
+        let h = ((sh as u64 * mw as u64 + sw as u64 / 2) / sw as u64).max(64) as u32;
+        (w, h)
+    } else {
+        let h = mh;
+        let w = ((sw as u64 * mh as u64 + sh as u64 / 2) / sh as u64).max(64) as u32;
+        (w, h)
+    };
+
+    (
+        ((w.clamp(64, mw)) as u16) & !1,
+        ((h.clamp(64, mh)) as u16) & !1,
+    )
+}
+
 impl fmt::Display for VideoCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -224,6 +252,12 @@ pub struct HelloMessage {
     pub prefer: QualityPreference,
     #[serde(default)]
     pub supported_codecs: Vec<VideoCodec>,
+    #[serde(default)]
+    pub host_version: String,
+    #[serde(default)]
+    pub video_backend: String,
+    #[serde(default)]
+    pub gamepad_backend: String,
 }
 
 impl HelloMessage {
@@ -400,6 +434,9 @@ mod tests {
             }],
             prefer: QualityPreference::Latency,
             supported_codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
+            host_version: "0.4.0".into(),
+            video_backend: "Win(NativeDxgiMf)".into(),
+            gamepad_backend: "ViGEmBus".into(),
         };
         let encoded = encode_hello_line(&msg).unwrap();
         assert!(parse_hello_line("Welcome to Ubuntu 24.04 LTS").is_none());
@@ -461,5 +498,14 @@ mod tests {
         assert!(!is_overlay_or_private_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_overlay_or_private_ip("1.1.1.1".parse().unwrap()));
         assert!(!is_overlay_or_private_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn fit_preserving_aspect_handles_mismatched_monitors() {
+        assert_eq!(fit_preserving_aspect(1920, 1080, 1920, 1200), (1920, 1080));
+        assert_eq!(fit_preserving_aspect(3840, 2160, 1920, 1200), (1920, 1080));
+        assert_eq!(fit_preserving_aspect(2560, 1600, 1920, 1080), (1728, 1080));
+        assert_eq!(fit_preserving_aspect(3440, 1440, 1920, 1080), (1920, 804));
+        assert_eq!(fit_preserving_aspect(1920, 1080, 1280, 720), (1280, 720));
     }
 }

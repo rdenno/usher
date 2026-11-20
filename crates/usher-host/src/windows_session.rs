@@ -166,6 +166,7 @@ pub fn run_system_launcher(
     ffmpeg_path: Option<&Path>,
     no_audio: bool,
     no_input: bool,
+    no_clipboard: bool,
 ) -> Result<()> {
     let exe_path = std::env::current_exe().context("resolving current usher-host.exe path")?;
     let mut worker_args = vec![
@@ -183,6 +184,9 @@ pub fn run_system_launcher(
     }
     if no_input {
         worker_args.push("--no-input".into());
+    }
+    if no_clipboard {
+        worker_args.push("--no-clipboard".into());
     }
 
     let mut cmd_parts = vec![quote_win_arg(&exe_path.to_string_lossy())];
@@ -348,6 +352,7 @@ pub async fn spawn_console_worker(
     ffmpeg_path: Option<&Path>,
     no_audio: bool,
     no_input: bool,
+    no_clipboard: bool,
 ) -> Result<(NamedPipeServer, WorkerHelloInfo, u32)> {
     let (pipe1, mut server1) = create_bridge_pipe_server()?;
     let mut launcher_args = vec![
@@ -366,6 +371,9 @@ pub async fn spawn_console_worker(
     }
     if no_input {
         launcher_args.push("--no-input".into());
+    }
+    if no_clipboard {
+        launcher_args.push("--no-clipboard".into());
     }
 
     let mut active_server = match try_launch_via_schtasks(&pipe1, &server1, &launcher_args, true).await {
@@ -390,6 +398,9 @@ pub async fn spawn_console_worker(
             }
             if no_input {
                 inter_args.push("--no-input".into());
+            }
+            if no_clipboard {
+                inter_args.push("--no-clipboard".into());
             }
             try_launch_via_schtasks(&pipe2, &server2, &inter_args, false).await?;
             server2

@@ -19,6 +19,7 @@ pub enum PacketKind {
     Control = 4,
     Ping = 5,
     Pong = 6,
+    Clipboard = 7,
 }
 
 impl PacketKind {
@@ -31,6 +32,7 @@ impl PacketKind {
             4 => Ok(Self::Control),
             5 => Ok(Self::Ping),
             6 => Ok(Self::Pong),
+            7 => Ok(Self::Clipboard),
             other => bail!("unknown packet kind: {other}"),
         }
     }

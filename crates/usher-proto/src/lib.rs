@@ -1,6 +1,7 @@
 pub mod adapt;
 pub mod annexb;
 pub mod audio;
+pub mod clipboard;
 pub mod crypto;
 pub mod fec;
 pub mod fragment;

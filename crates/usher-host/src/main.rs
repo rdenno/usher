@@ -1,4 +1,5 @@
 mod audio;
+mod clipboard;
 mod input;
 mod net;
 mod video;
@@ -120,6 +121,10 @@ struct Args {
     /// Disable /dev/uinput virtual input device creation
     #[arg(long)]
     no_input: bool,
+
+    /// Disable bidirectional clipboard synchronization
+    #[arg(long)]
+    no_clipboard: bool,
 
     /// Seconds of inactivity before tearing down automatically
     #[arg(long, default_value_t = 15)]
@@ -274,6 +279,7 @@ async fn main() -> Result<()> {
             args.ffmpeg_path.as_deref(),
             args.no_audio,
             args.no_input,
+            args.no_clipboard,
         );
     }
 
@@ -322,6 +328,7 @@ async fn main() -> Result<()> {
             host_ffmpeg_path.as_deref(),
             args.no_audio,
             args.no_input,
+            args.no_clipboard,
         )
         .await
         {
@@ -384,17 +391,24 @@ async fn main() -> Result<()> {
         args.display.min((displays.len() - 1) as u8)
     };
 
-    let (raw_w, raw_h) = if args.width > 0 && args.height > 0 {
-        (args.width, args.height)
-    } else if args.headless == HeadlessBackend::None && capture != CaptureSource::Testsrc {
+    let active_disp_res = if args.headless == HeadlessBackend::None
+        && capture != CaptureSource::Testsrc
+    {
         displays
             .iter()
             .find(|d| d.index == active_display)
             .or_else(|| displays.first())
             .map(|d| (d.width, d.height))
-            .unwrap_or((1280, 720))
     } else {
-        (1280, 720)
+        None
+    };
+    let (raw_w, raw_h) = match (args.width > 0 && args.height > 0, active_disp_res) {
+        (true, Some((dw, dh))) => {
+            usher_proto::handshake::fit_preserving_aspect(dw, dh, args.width, args.height)
+        }
+        (true, None) => (args.width, args.height),
+        (false, Some((dw, dh))) => (dw, dh),
+        (false, None) => (1280, 720),
     };
     let width = (raw_w.max(64)) & !1;
     let height = (raw_h.max(64)) & !1;
@@ -463,6 +477,31 @@ async fn main() -> Result<()> {
     );
     let local_port = socket.local_addr()?.port();
 
+    let gamepad_backend = if args.no_input {
+        "disabled (--no-input)".to_string()
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            if input::win32_input::vigem_available() {
+                "ViGEmBus (Xbox 360)".to_string()
+            } else {
+                "none (install ViGEmBus for Xbox 360 gamepad)".to_string()
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::path::Path::new("/dev/uinput").exists() {
+                "uinput (Xbox 360)".to_string()
+            } else {
+                "none (/dev/uinput unavailable)".to_string()
+            }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            "none".to_string()
+        }
+    };
+
     let hello = HelloMessage {
         version: PROTOCOL_VERSION,
         bind_ip,
@@ -483,6 +522,9 @@ async fn main() -> Result<()> {
         displays: displays.clone(),
         prefer: args.prefer,
         supported_codecs: host_codecs.clone(),
+        host_version: env!("CARGO_PKG_VERSION").to_string(),
+        video_backend: format!("{resolved_backend:?}"),
+        gamepad_backend,
     };
 
     let hello_line = encode_hello_line(&hello)?;
@@ -584,6 +626,8 @@ async fn main() -> Result<()> {
     let input_sink = create_input_sink(!args.no_input);
     let (video_tx, video_rx) = mpsc::channel(4);
     let (audio_tx, audio_rx) = mpsc::channel(16);
+    let (clip_in_tx, clip_in_rx) = mpsc::channel::<String>(16);
+    let (clip_out_tx, clip_out_rx) = mpsc::channel::<String>(16);
 
     let peer_ready = Arc::new(tokio::sync::Notify::new());
     let effective_codec_atomic = Arc::new(AtomicU8::new(effective_codec.to_u8()));
@@ -619,15 +663,24 @@ async fn main() -> Result<()> {
             client_codecs,
             host_codecs,
             displays,
+            clipboard_in_tx: if args.no_clipboard {
+                None
+            } else {
+                Some(clip_in_tx)
+            },
         },
         input_sink,
         video_rx,
         audio_rx,
+        clip_out_rx,
     );
 
     #[cfg(target_os = "windows")]
-    let (video_handle, audio_handle) = if let Some((initial_pipe, _info, worker_session)) =
-        console_worker
+    let (video_handle, audio_handle, clip_handle) = if let Some((
+        initial_pipe,
+        _info,
+        worker_session,
+    )) = console_worker
     {
         let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         let cmd_rx = bridge_cmd_rx.unwrap_or(dummy_rx);
@@ -637,6 +690,7 @@ async fn main() -> Result<()> {
             host_ffmpeg_path,
             !args.no_audio,
             args.no_input,
+            args.no_clipboard,
             video_cfg_rx,
             live_bitrate_kbps,
             in_place_bitrate,
@@ -648,9 +702,11 @@ async fn main() -> Result<()> {
             peer_ready,
             audio_enabled,
             cmd_rx,
+            clip_in_rx,
+            clip_out_tx,
             cancel.clone(),
         ));
-        (sup, tokio::spawn(async {}))
+        (sup, tokio::spawn(async {}), tokio::spawn(async {}))
     } else {
         let vh = spawn_video_task(
             video_cfg_rx,
@@ -673,11 +729,17 @@ async fn main() -> Result<()> {
             start,
             cancel.clone(),
         );
-        (vh, ah)
+        let ch = clipboard::spawn_clipboard_task(
+            !args.no_clipboard,
+            clip_out_tx,
+            clip_in_rx,
+            cancel.clone(),
+        );
+        (vh, ah, ch)
     };
 
     #[cfg(not(target_os = "windows"))]
-    let (video_handle, audio_handle) = {
+    let (video_handle, audio_handle, clip_handle) = {
         let vh = spawn_video_task(
             video_cfg_rx,
             live_bitrate_kbps,
@@ -701,7 +763,13 @@ async fn main() -> Result<()> {
             start,
             cancel.clone(),
         );
-        (vh, ah)
+        let ch = clipboard::spawn_clipboard_task(
+            !args.no_clipboard,
+            clip_out_tx,
+            clip_in_rx,
+            cancel.clone(),
+        );
+        (vh, ah, ch)
     };
 
     cancel.cancelled().await;
@@ -709,6 +777,7 @@ async fn main() -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         let _ = video_handle.await;
         let _ = audio_handle.await;
+        let _ = clip_handle.await;
         for h in net_handles {
             let _ = h.await;
         }
@@ -811,6 +880,32 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
     let worker_cancel = CancellationToken::new();
     let start = Instant::now();
     let mut input_sink = create_input_sink(!args.no_input);
+
+    let (clip_out_tx, mut clip_out_rx) = mpsc::channel::<String>(16);
+    let (clip_in_tx, clip_in_rx) = mpsc::channel::<String>(16);
+    let clip_fwd = {
+        let msg_tx = msg_tx.clone();
+        let cancel = worker_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    txt = clip_out_rx.recv() => match txt {
+                        Some(text) => {
+                            let _ = msg_tx.try_send(WorkerMsg::ClipboardText(text));
+                        }
+                        None => break,
+                    }
+                }
+            }
+        })
+    };
+    let clip_handle = clipboard::spawn_clipboard_task(
+        !args.no_clipboard,
+        clip_out_tx,
+        clip_in_rx,
+        worker_cancel.clone(),
+    );
 
     let audio_enabled = Arc::new(AtomicBool::new(!args.no_audio));
     let (a_tx, mut a_rx) = mpsc::channel::<usher_proto::audio::AudioPacket>(16);
@@ -1005,6 +1100,9 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
             Ok(HostCmd::AudioEnable(on)) => {
                 audio_enabled.store(on, Ordering::Release);
             }
+            Ok(HostCmd::SetClipboardText(text)) => {
+                let _ = clip_in_tx.try_send(text);
+            }
             Ok(HostCmd::Shutdown) | Err(_) => {
                 break;
             }
@@ -1019,6 +1117,8 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
         let _ = audio_fwd.await;
         let _ = video_fwd.await;
         let _ = status_fwd.await;
+        let _ = clip_handle.await;
+        let _ = clip_fwd.await;
     })
     .await;
 
@@ -1062,6 +1162,7 @@ async fn run_windows_session_supervisor(
     host_ffmpeg_path: Option<std::path::PathBuf>,
     audio_allowed: bool,
     no_input: bool,
+    no_clipboard: bool,
     mut video_cfg_rx: watch::Receiver<VideoPipelineConfig>,
     live_bitrate_kbps: Arc<AtomicU32>,
     in_place_bitrate: Arc<AtomicBool>,
@@ -1073,6 +1174,8 @@ async fn run_windows_session_supervisor(
     peer_ready: Arc<tokio::sync::Notify>,
     audio_enabled: Arc<AtomicBool>,
     mut cmd_rx: mpsc::Receiver<windows_ipc::HostCmd>,
+    mut clip_in_rx: mpsc::Receiver<String>,
+    clip_out_tx: mpsc::Sender<String>,
     cancel: CancellationToken,
 ) {
     use windows_ipc::{HostCmd, WorkerMsg, write_host_cmd};
@@ -1145,6 +1248,7 @@ async fn run_windows_session_supervisor(
                         host_ffmpeg_path.as_deref(),
                         !audio_allowed,
                         no_input,
+                        no_clipboard,
                     )
                     .await
                     {
@@ -1225,6 +1329,11 @@ async fn run_windows_session_supervisor(
                     effective_codec_atomic.store(codec.to_u8(), Ordering::Release);
                     status_notify.notify_one();
                 }
+                Some(Ok(WorkerMsg::ClipboardText(text))) => {
+                    if !no_clipboard {
+                        let _ = clip_out_tx.try_send(text);
+                    }
+                }
                 Some(Ok(WorkerMsg::HelloInfo(_))) => {}
                 Some(Err(err)) => {
                     if !cancel.is_cancelled() {
@@ -1251,6 +1360,15 @@ async fn run_windows_session_supervisor(
             },
             Some(cmd) = cmd_rx.recv() => {
                 if write_host_cmd(&mut pipe_tx, &cmd).await.is_err() {
+                    needs_respawn = true;
+                }
+            },
+            Some(text) = clip_in_rx.recv() => {
+                if !no_clipboard
+                    && write_host_cmd(&mut pipe_tx, &HostCmd::SetClipboardText(text))
+                        .await
+                        .is_err()
+                {
                     needs_respawn = true;
                 }
             },

@@ -15,8 +15,28 @@ use usher_proto::handshake::VideoCodec;
 #[serde(rename_all = "lowercase")]
 pub enum DecoderKind {
     Auto,
+    Native,
     Openh264,
     Ffmpeg,
+}
+
+fn native_codecs() -> Vec<VideoCodec> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::mf_decoder::probe_mf_decoders()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::vt_decoder::probe_vt_decoders()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
+pub fn has_native_decoder(codec: VideoCodec) -> bool {
+    native_codecs().contains(&codec)
 }
 
 pub fn find_working_ffmpeg() -> Option<PathBuf> {
@@ -61,55 +81,71 @@ pub fn probe_client_codecs(kind: DecoderKind) -> Vec<VideoCodec> {
     if kind == DecoderKind::Openh264 {
         return vec![VideoCodec::H264];
     }
-    let Some(ffmpeg) = find_working_ffmpeg() else {
-        return vec![VideoCodec::H264];
-    };
-
-    let hw_ok = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-hwaccels"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|o| {
-            let text = String::from_utf8_lossy(&o.stdout);
-            #[cfg(target_os = "windows")]
-            {
-                text.contains("d3d11va") || text.contains("cuda") || text.contains("dxva2")
-            }
-            #[cfg(target_os = "macos")]
-            {
-                text.contains("videotoolbox")
-            }
-            #[cfg(target_os = "linux")]
-            {
-                text.contains("vaapi") || text.contains("cuda") || text.contains("vulkan")
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-            {
-                let _ = text;
-                false
-            }
-        });
-
-    let decs_text = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-decoders"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
 
     let mut out = Vec::new();
-    if hw_ok || kind == DecoderKind::Ffmpeg {
-        if decs_text.contains(" hevc") {
-            out.push(VideoCodec::Hevc);
+    if matches!(kind, DecoderKind::Auto | DecoderKind::Native) {
+        for c in native_codecs() {
+            if !out.contains(&c) {
+                out.push(c);
+            }
         }
-        if decs_text.contains(" av1") || decs_text.contains("libdav1d") {
-            out.push(VideoCodec::Av1);
+        if kind == DecoderKind::Native {
+            if out.is_empty() {
+                out.push(VideoCodec::H264);
+            }
+            return out;
         }
     }
+
+    if let Some(ffmpeg) = find_working_ffmpeg() {
+        let hw_ok = Command::new(&ffmpeg)
+            .args(["-hide_banner", "-hwaccels"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                #[cfg(target_os = "windows")]
+                {
+                    text.contains("d3d11va") || text.contains("cuda") || text.contains("dxva2")
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    text.contains("videotoolbox")
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    text.contains("vaapi") || text.contains("cuda") || text.contains("vulkan")
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+                {
+                    let _ = text;
+                    false
+                }
+            });
+
+        let decs_text = Command::new(&ffmpeg)
+            .args(["-hide_banner", "-decoders"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+
+        if hw_ok || kind == DecoderKind::Ffmpeg {
+            if decs_text.contains(" hevc") && !out.contains(&VideoCodec::Hevc) {
+                out.push(VideoCodec::Hevc);
+            }
+            if (decs_text.contains(" av1") || decs_text.contains("libdav1d"))
+                && !out.contains(&VideoCodec::Av1)
+            {
+                out.push(VideoCodec::Av1);
+            }
+        }
+    }
+
     if !out.contains(&VideoCodec::H264) {
         out.push(VideoCodec::H264);
     }
@@ -142,12 +178,53 @@ pub fn create_decoder(
     use_hwaccel: bool,
     on_frame: FrameSink,
 ) -> Result<Box<dyn VideoDecoder>> {
+    if matches!(kind, DecoderKind::Auto | DecoderKind::Native) {
+        #[cfg(target_os = "windows")]
+        match crate::mf_decoder::MfVideoDecoder::new(
+            codec,
+            width,
+            height,
+            use_hwaccel,
+            on_frame.clone(),
+        ) {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(err) => {
+                if kind == DecoderKind::Native {
+                    return Err(err);
+                }
+                tracing::debug!("native MF decoder unavailable for {codec} ({err:#}); falling back");
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        match crate::vt_decoder::VideoToolboxDecoder::new(codec, width, height, on_frame.clone())
+        {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(err) => {
+                if kind == DecoderKind::Native {
+                    return Err(err);
+                }
+                tracing::debug!(
+                    "native VideoToolbox decoder unavailable for {codec} ({err:#}); falling back"
+                );
+            }
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        if kind == DecoderKind::Native {
+            bail!("native platform hardware decoder is not available on this OS (use auto or ffmpeg/openh264)");
+        }
+    }
+
     match (codec, kind) {
         (VideoCodec::H264, DecoderKind::Auto | DecoderKind::Openh264) => {
             Ok(Box::new(OpenH264Decoder::new(on_frame)?))
         }
         (_, DecoderKind::Openh264) => {
             bail!("OpenH264 decoder only supports H.264 streams (got {codec})")
+        }
+        (_, DecoderKind::Native) => {
+            bail!("no native platform decoder available for {codec}")
         }
         (codec, DecoderKind::Ffmpeg) | (codec, DecoderKind::Auto) => Ok(Box::new(
             FfmpegPipeDecoder::new_with_hwaccel(codec, width, height, use_hwaccel, on_frame)?,

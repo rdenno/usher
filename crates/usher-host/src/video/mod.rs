@@ -4,6 +4,8 @@ pub mod headless;
 pub mod hw_pipeline;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod ivf;
+#[cfg(target_os = "windows")]
+pub mod mf_encoder;
 pub mod software;
 #[cfg(target_os = "windows")]
 pub mod windows_capture;
@@ -172,7 +174,10 @@ pub fn is_in_place_bitrate_backend(backend: &ResolvedBackend) -> bool {
         #[cfg(target_os = "linux")]
         ResolvedBackend::Hw(_) => false,
         #[cfg(target_os = "windows")]
-        ResolvedBackend::Win(windows_capture::WinVideoBackend::NativeDxgiOpenH264) => true,
+        ResolvedBackend::Win(
+            windows_capture::WinVideoBackend::NativeDxgiMf { .. }
+            | windows_capture::WinVideoBackend::NativeDxgiOpenH264,
+        ) => true,
         #[cfg(target_os = "windows")]
         ResolvedBackend::Win(windows_capture::WinVideoBackend::DdagrabHw { .. }) => false,
     }
@@ -188,7 +193,10 @@ pub fn resolve_effective_codec(cfg: &VideoPipelineConfig) -> VideoCodec {
             VideoCodec::H264
         }
         #[cfg(target_os = "windows")]
-        ResolvedBackend::Win(windows_capture::WinVideoBackend::DdagrabHw { .. }) => cfg.codec,
+        ResolvedBackend::Win(
+            windows_capture::WinVideoBackend::NativeDxgiMf { .. }
+            | windows_capture::WinVideoBackend::DdagrabHw { .. },
+        ) => cfg.codec,
     }
 }
 
@@ -328,13 +336,19 @@ pub(crate) async fn run_one_backend(
         }
         #[cfg(target_os = "windows")]
         ResolvedBackend::Win(win_backend) => {
-            let was_hw = matches!(win_backend, windows_capture::WinVideoBackend::DdagrabHw { .. });
+            let was_mf = matches!(
+                win_backend,
+                windows_capture::WinVideoBackend::NativeDxgiMf { .. }
+            );
+            let was_hw = was_mf
+                || matches!(win_backend, windows_capture::WinVideoBackend::DdagrabHw { .. });
             let initial_codec = cfg.codec;
             let mut hw_failures = 0u32;
+            let mut active_backend = win_backend;
 
             while !child_cancel.is_cancelled() {
                 match windows_capture::run_windows_backend(
-                    win_backend.clone(),
+                    active_backend.clone(),
                     cfg.clone(),
                     live_bitrate_kbps.clone(),
                     tx.clone(),
@@ -367,6 +381,23 @@ pub(crate) async fn run_one_backend(
                                     _ = child_cancel.cancelled() => return,
                                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                                 }
+                                continue;
+                            }
+
+                            if matches!(
+                                active_backend,
+                                windows_capture::WinVideoBackend::NativeDxgiMf { .. }
+                            ) && let Some(ddagrab) =
+                                windows_capture::select_ddagrab_fallback(&cfg)
+                            {
+                                tracing::info!(
+                                    codec = %cfg.codec,
+                                    "Media Foundation hardware pipeline unavailable; trying optional ffmpeg ddagrab fallback"
+                                );
+                                in_place_bitrate.store(false, Ordering::Release);
+                                status_notify.notify_one();
+                                active_backend = ddagrab;
+                                hw_failures = 0;
                                 continue;
                             }
 
@@ -406,6 +437,19 @@ pub(crate) async fn run_one_backend(
                                         "built-in DXGI + OpenH264 fallback interrupted ({dxgi_err:#}); retrying desktop capture"
                                     );
                                     cfg.codec = initial_codec;
+                                    active_backend = windows_capture::select_windows_backend(&cfg)
+                                        .unwrap_or(
+                                            windows_capture::WinVideoBackend::NativeDxgiOpenH264,
+                                        );
+                                    in_place_bitrate.store(
+                                        is_in_place_bitrate_backend(&ResolvedBackend::Win(
+                                            active_backend.clone(),
+                                        )),
+                                        Ordering::Release,
+                                    );
+                                    effective_codec
+                                        .store(cfg.codec.to_u8(), Ordering::Release);
+                                    status_notify.notify_one();
                                     hw_failures = 0;
                                 }
                             }

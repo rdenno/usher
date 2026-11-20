@@ -188,6 +188,7 @@ pub struct HostSettings {
     pub codec: Option<CodecPreference>,
     pub prefer: Option<QualityPreference>,
     pub audio: Option<bool>,
+    pub clipboard: Option<bool>,
     pub display: Option<u8>,
     pub pointer_mode: Option<PointerMode>,
     pub stats_overlay: Option<bool>,
@@ -223,6 +224,7 @@ impl HostSettings {
         take_some!(pointer_mode);
         take_some!(stats_overlay);
         take_some!(fullscreen);
+        take_some!(clipboard);
         take_some!(capture);
         take_some!(encoder);
         take_some!(decoder);
@@ -258,6 +260,7 @@ pub struct EffectiveConfig {
     pub pointer_mode: PointerMode,
     pub stats_overlay: bool,
     pub fullscreen: bool,
+    pub clipboard: bool,
     pub capture: String,
     pub encoder: String,
     pub decoder: DecoderKind,
@@ -280,6 +283,7 @@ impl Default for EffectiveConfig {
             codec: CodecPreference::Auto,
             prefer: QualityPreference::Latency,
             audio: true,
+            clipboard: true,
             display: 0,
             pointer_mode: PointerMode::Absolute,
             stats_overlay: false,
@@ -322,6 +326,7 @@ impl EffectiveConfig {
             codec: merged.codec.unwrap_or(def.codec),
             prefer: merged.prefer.unwrap_or(def.prefer),
             audio: merged.audio.unwrap_or(def.audio),
+            clipboard: merged.clipboard.unwrap_or(def.clipboard),
             display: merged.display.unwrap_or(def.display),
             pointer_mode: merged.pointer_mode.unwrap_or(def.pointer_mode),
             stats_overlay: merged.stats_overlay.unwrap_or(def.stats_overlay),

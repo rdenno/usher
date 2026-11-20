@@ -1,7 +1,7 @@
 use super::InputSink;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use usher_proto::input::{InputEvent, MouseButton};
+use vigem_client::{Client as VigemClient, TargetId, XButtons, XGamepad, Xbox360Wired};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -11,7 +11,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
-static WARNED_GAMEPAD: AtomicBool = AtomicBool::new(false);
+pub fn vigem_available() -> bool {
+    VigemClient::connect().is_ok()
+}
 
 pub struct Win32InputSink {
     tx: Option<std::sync::mpsc::SyncSender<InputEvent>>,
@@ -32,15 +34,24 @@ impl Win32InputSink {
                 let orig_desk = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok();
                 let mut prev_desk: Option<HDESK> = None;
                 let mut last_attach = Instant::now() - Duration::from_secs(1);
+                let mut vigem_pad: Option<Xbox360Wired<VigemClient>> = None;
+                let mut vigem_tried = false;
 
                 while let Ok(event) = rx.recv() {
                     if last_attach.elapsed() >= Duration::from_millis(200) {
                         crate::windows_session::switch_thread_to_input_desktop(&mut prev_desk);
                         last_attach = Instant::now();
                     }
-                    dispatch_input_event(event, &mut prev_desk, &mut last_attach);
+                    dispatch_input_event(
+                        event,
+                        &mut prev_desk,
+                        &mut last_attach,
+                        &mut vigem_pad,
+                        &mut vigem_tried,
+                    );
                 }
 
+                drop(vigem_pad);
                 if let Some(old) = prev_desk.take() {
                     if let Some(orig) = orig_desk {
                         let _ = unsafe { SetThreadDesktop(orig) };
@@ -144,6 +155,8 @@ fn dispatch_input_event(
     event: InputEvent,
     prev_desk: &mut Option<windows::Win32::System::StationsAndDesktops::HDESK>,
     last_attach: &mut Instant,
+    vigem_pad: &mut Option<Xbox360Wired<VigemClient>>,
+    vigem_tried: &mut bool,
 ) {
     match event {
         InputEvent::Key {
@@ -286,11 +299,48 @@ fn dispatch_input_event(
                 );
             }
         }
-        InputEvent::GamepadState { .. } => {
-            if !WARNED_GAMEPAD.swap(true, Ordering::Relaxed) {
-                tracing::info!(
-                    "received gamepad input on Windows host (virtual Xbox controller on Windows requires ViGEmBus; keyboard & mouse work natively)"
-                );
+        InputEvent::GamepadState {
+            buttons,
+            lt,
+            rt,
+            lx,
+            ly,
+            rx,
+            ry,
+        } => {
+            if vigem_pad.is_none() && !*vigem_tried {
+                *vigem_tried = true;
+                match VigemClient::connect().and_then(|c| {
+                    let mut pad = Xbox360Wired::new(c, TargetId::XBOX360_WIRED);
+                    pad.plugin()?;
+                    pad.wait_ready()?;
+                    Ok(pad)
+                }) {
+                    Ok(pad) => {
+                        tracing::info!("attached virtual Xbox 360 gamepad via ViGEmBus");
+                        *vigem_pad = Some(pad);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "virtual Xbox 360 gamepad unavailable ({err}); install ViGEmBus driver for controller support"
+                        );
+                    }
+                }
+            }
+
+            if let Some(pad) = vigem_pad.as_mut() {
+                let state = XGamepad {
+                    buttons: XButtons { raw: buttons },
+                    left_trigger: lt,
+                    right_trigger: rt,
+                    thumb_lx: lx,
+                    thumb_ly: ly.saturating_neg(),
+                    thumb_rx: rx,
+                    thumb_ry: ry.saturating_neg(),
+                };
+                if let Err(err) = pad.update(&state) {
+                    tracing::debug!("ViGEmBus update error: {err}");
+                }
             }
         }
     }
@@ -310,5 +360,26 @@ mod tests {
         assert_eq!(evdev_to_win32_scancode(97), Some((0x1D, true))); // RightCtrl
         assert_eq!(evdev_to_win32_scancode(103), Some((0x48, true))); // ArrowUp
         assert_eq!(evdev_to_win32_scancode(125), Some((0x5B, true))); // LeftMeta
+    }
+
+    #[ignore]
+    #[test]
+    fn vigem_virtual_xbox360_attaches_and_updates() {
+        let client = VigemClient::connect().expect("ViGEmBus driver must be running");
+        let mut pad = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
+        pad.plugin().expect("ViGEmBus plugin");
+        pad.wait_ready().expect("ViGEmBus wait_ready");
+        pad.update(&XGamepad {
+            buttons: XButtons {
+                raw: XButtons::A | XButtons::START,
+            },
+            left_trigger: 128,
+            right_trigger: 255,
+            thumb_lx: 12_000,
+            thumb_ly: -8_000,
+            thumb_rx: -4_000,
+            thumb_ry: 16_000,
+        })
+        .expect("ViGEmBus update");
     }
 }

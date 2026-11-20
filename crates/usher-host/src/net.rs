@@ -9,14 +9,29 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use usher_proto::adapt::AdaptiveController;
 use usher_proto::audio::AudioPacket;
+use usher_proto::clipboard::{ClipboardReassembler, packetize_clipboard_text};
 use usher_proto::crypto::SessionCrypto;
 use usher_proto::fragment::{FRAME_FLAG_KEYFRAME, FramePacketizer};
-use usher_proto::handshake::{CodecPreference, DisplayInfo, QualityPreference, VideoCodec};
+use usher_proto::handshake::{
+    CodecPreference, DisplayInfo, QualityPreference, VideoCodec, fit_preserving_aspect,
+};
 use usher_proto::input::InputEvent;
 use usher_proto::packet::{
     ControlMessage, PacketKind, PingPayload, PongPayload, STREAM_STATUS_FLAG_STEPPED_DOWN,
     max_plaintext_len, open_packet, seal_packet,
 };
+
+fn fit_to_display(displays: &[DisplayInfo], display_idx: u8, req_w: u16, req_h: u16) -> (u16, u16) {
+    if let Some(d) = displays
+        .iter()
+        .find(|d| d.index == display_idx)
+        .or_else(|| displays.first())
+    {
+        fit_preserving_aspect(d.width, d.height, req_w, req_h)
+    } else {
+        (req_w.clamp(64, 3840) & !1, req_h.clamp(64, 2160) & !1)
+    }
+}
 
 pub struct NetConfig {
     pub socket: Arc<UdpSocket>,
@@ -39,6 +54,7 @@ pub struct NetConfig {
     pub client_codecs: Vec<VideoCodec>,
     pub host_codecs: Vec<VideoCodec>,
     pub displays: Vec<DisplayInfo>,
+    pub clipboard_in_tx: Option<mpsc::Sender<String>>,
 }
 
 pub fn spawn_network_tasks(
@@ -46,6 +62,7 @@ pub fn spawn_network_tasks(
     input_sink: Box<dyn InputSink>,
     video_rx: mpsc::Receiver<EncodedFrame>,
     audio_rx: mpsc::Receiver<AudioPacket>,
+    clipboard_out_rx: mpsc::Receiver<String>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let peer: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
     let last_rx_ms = Arc::new(AtomicU64::new(0));
@@ -63,6 +80,7 @@ pub fn spawn_network_tasks(
         cfg.peer_ready,
         cfg.cancel.clone(),
         input_sink,
+        cfg.clipboard_in_tx,
         RxAdaptCtx {
             fec_percent: cfg.fec_percent.clone(),
             audio_enabled: cfg.audio_enabled.clone(),
@@ -89,16 +107,25 @@ pub fn spawn_network_tasks(
     ));
 
     let audio_handle = tokio::spawn(run_audio_tx_loop(
+        cfg.socket.clone(),
+        cfg.crypto.clone(),
+        peer.clone(),
+        cfg.mtu,
+        cfg.audio_enabled,
+        cfg.cancel.clone(),
+        audio_rx,
+    ));
+
+    let clip_handle = tokio::spawn(run_clipboard_tx_loop(
         cfg.socket,
         cfg.crypto,
         peer,
         cfg.mtu,
-        cfg.audio_enabled,
         cfg.cancel,
-        audio_rx,
+        clipboard_out_rx,
     ));
 
-    vec![rx_handle, video_handle, audio_handle]
+    vec![rx_handle, video_handle, audio_handle, clip_handle]
 }
 
 struct RxAdaptCtx {
@@ -175,11 +202,13 @@ async fn run_rx_loop(
     peer_ready: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     mut input_sink: Box<dyn InputSink>,
+    clipboard_in_tx: Option<mpsc::Sender<String>>,
     ctx: RxAdaptCtx,
 ) {
     let mut buf = vec![0u8; 4096];
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_status_sent = Instant::now() - Duration::from_secs(5);
+    let mut clip_reasm = ClipboardReassembler::new();
 
     loop {
         tokio::select! {
@@ -291,10 +320,14 @@ async fn run_rx_loop(
                         }
                         Ok(ControlMessage::Resize { width, height }) => {
                             if width >= 64 && height >= 64 {
-                                let w = width.clamp(64, 3840) & !1;
-                                let h = height.clamp(64, 2160) & !1;
                                 let (next_cfg, changed, status) = {
                                     let cur = ctx.video_cfg_tx.borrow().clone();
+                                    let (w, h) = fit_to_display(
+                                        &ctx.displays,
+                                        cur.display_index,
+                                        width,
+                                        height,
+                                    );
                                     let mut next = cur.clone();
                                     next.width = w;
                                     next.height = h;
@@ -428,17 +461,6 @@ async fn run_rx_loop(
                                     }
                                 }
 
-                                if width >= 64 && height >= 64 {
-                                    let w = width.clamp(64, 3840) & !1;
-                                    let h = height.clamp(64, 2160) & !1;
-                                    if w != next.width || h != next.height {
-                                        next.width = w;
-                                        next.height = h;
-                                        adapt.reset_resolution_step_down();
-                                        video_changed = true;
-                                    }
-                                }
-
                                 if fps > 0 {
                                     let f = fps.clamp(1, 240);
                                     if f != next.fps {
@@ -447,7 +469,9 @@ async fn run_rx_loop(
                                     }
                                 }
 
-                                if let Ok(Some(pref_codec)) = CodecPreference::from_reconfigure_u8(codec) {
+                                if let Ok(Some(pref_codec)) =
+                                    CodecPreference::from_reconfigure_u8(codec)
+                                {
                                     let mut target_codec = negotiate_codec(
                                         pref_codec,
                                         &ctx.client_codecs,
@@ -480,6 +504,34 @@ async fn run_rx_loop(
                                             next.height = disp.height;
                                             adapt.reset_resolution_step_down();
                                         }
+                                        video_changed = true;
+                                    }
+                                }
+
+                                if width >= 64 && height >= 64 {
+                                    let (w, h) = fit_to_display(
+                                        &ctx.displays,
+                                        next.display_index,
+                                        width,
+                                        height,
+                                    );
+                                    if w != next.width || h != next.height {
+                                        next.width = w;
+                                        next.height = h;
+                                        adapt.reset_resolution_step_down();
+                                        video_changed = true;
+                                    }
+                                } else if display != u8::MAX && width == 0 && height == 0 {
+                                    let (w, h) = fit_to_display(
+                                        &ctx.displays,
+                                        next.display_index,
+                                        next.width,
+                                        next.height,
+                                    );
+                                    if w != next.width || h != next.height {
+                                        next.width = w;
+                                        next.height = h;
+                                        adapt.reset_resolution_step_down();
                                         video_changed = true;
                                     }
                                 }
@@ -540,6 +592,15 @@ async fn run_rx_loop(
                             }
                         }
                     }
+                    PacketKind::Clipboard => match clip_reasm.push_chunk(&plaintext) {
+                        Ok(Some(text)) => {
+                            if let Some(ref tx) = clipboard_in_tx {
+                                let _ = tx.try_send(text);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => tracing::debug!("clipboard reassembly error: {err}"),
+                    },
                     other => {
                         tracing::debug!(?other, "unexpected packet kind from client");
                     }
@@ -659,6 +720,49 @@ async fn run_audio_tx_loop(
         };
         if let Ok(dgram) = sealed {
             let _ = socket.send_to(&dgram, dst).await;
+        }
+    }
+}
+
+async fn run_clipboard_tx_loop(
+    socket: Arc<UdpSocket>,
+    crypto: Arc<Mutex<SessionCrypto>>,
+    peer: Arc<RwLock<Option<SocketAddr>>>,
+    mtu: usize,
+    cancel: CancellationToken,
+    mut clipboard_out_rx: mpsc::Receiver<String>,
+) {
+    let max_pt = max_plaintext_len(mtu);
+    let mut transfer_id = 1u32;
+
+    loop {
+        let text = tokio::select! {
+            _ = cancel.cancelled() => break,
+            c = clipboard_out_rx.recv() => match c {
+                Some(t) => t,
+                None => break,
+            }
+        };
+
+        let Some(dst) = *peer.read().await else {
+            continue;
+        };
+
+        let chunks = packetize_clipboard_text(transfer_id, &text, max_pt);
+        transfer_id = transfer_id.wrapping_add(1).max(1);
+        for chunk in chunks {
+            for pass in 0..2 {
+                let sealed = {
+                    let mut guard = crypto.lock().expect("crypto lock poisoned");
+                    seal_packet(&mut guard, PacketKind::Clipboard, &chunk, mtu)
+                };
+                if let Ok(dgram) = sealed {
+                    let _ = socket.send_to(&dgram, dst).await;
+                }
+                if pass == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
         }
     }
 }

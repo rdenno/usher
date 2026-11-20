@@ -41,6 +41,7 @@ pub enum WorkerMsg {
         codec: VideoCodec,
         in_place_bitrate: bool,
     },
+    ClipboardText(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +52,7 @@ pub enum HostCmd {
     Input(Vec<u8>),
     AudioEnable(bool),
     Shutdown,
+    SetClipboardText(String),
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, payload: &[u8]) -> Result<()> {
@@ -115,6 +117,7 @@ pub async fn write_worker_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &WorkerMsg)
             codec,
             in_place_bitrate,
         } => write_frame(w, 0x05, &[codec.to_u8(), u8::from(*in_place_bitrate)]).await,
+        WorkerMsg::ClipboardText(text) => write_frame(w, 0x06, text.as_bytes()).await,
     }
 }
 
@@ -153,6 +156,9 @@ pub async fn read_worker_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<WorkerMs
                 in_place_bitrate: payload[1] != 0,
             })
         }
+        0x06 => Ok(WorkerMsg::ClipboardText(
+            String::from_utf8_lossy(&payload).into_owned(),
+        )),
         other => bail!("unknown WorkerMsg tag 0x{other:02x}"),
     }
 }
@@ -168,6 +174,7 @@ pub async fn write_host_cmd<W: AsyncWrite + Unpin>(w: &mut W, cmd: &HostCmd) -> 
         HostCmd::Input(bytes) => write_frame(w, 0x13, bytes).await,
         HostCmd::AudioEnable(on) => write_frame(w, 0x14, &[u8::from(*on)]).await,
         HostCmd::Shutdown => write_frame(w, 0x15, &[]).await,
+        HostCmd::SetClipboardText(text) => write_frame(w, 0x16, text.as_bytes()).await,
     }
 }
 
@@ -196,6 +203,9 @@ pub async fn read_host_cmd<R: AsyncRead + Unpin>(r: &mut R) -> Result<HostCmd> {
             Ok(HostCmd::AudioEnable(payload[0] != 0))
         }
         0x15 => Ok(HostCmd::Shutdown),
+        0x16 => Ok(HostCmd::SetClipboardText(
+            String::from_utf8_lossy(&payload).into_owned(),
+        )),
         other => bail!("unknown HostCmd tag 0x{other:02x}"),
     }
 }
@@ -232,6 +242,7 @@ mod tests {
                 codec: VideoCodec::H264,
                 in_place_bitrate: true,
             },
+            WorkerMsg::ClipboardText("copied from host".into()),
         ];
 
         let h_cmds = vec![
@@ -251,6 +262,7 @@ mod tests {
             HostCmd::Input(vec![9, 8, 7]),
             HostCmd::AudioEnable(false),
             HostCmd::Shutdown,
+            HostCmd::SetClipboardText("copied from client".into()),
         ];
 
         for m in &w_msgs {
