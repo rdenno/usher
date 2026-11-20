@@ -1115,7 +1115,7 @@ async fn run_windows_session_supervisor(
 
     let mut fast_tick = tokio::time::interval(Duration::from_millis(50));
     fast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut sess_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut sess_tick = tokio::time::interval(Duration::from_millis(150));
     sess_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {

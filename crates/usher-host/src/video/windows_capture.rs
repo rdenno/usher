@@ -676,12 +676,16 @@ async fn run_ddagrab_hw(
                     }
                     let msg = line.trim_end().to_string();
                     if !msg.is_empty() {
-                        tracing::warn!("[ddagrab] {msg}");
-                        if let Ok(mut g) = stderr_tail_cb.lock() {
-                            if g.len() >= 8 {
-                                g.pop_front();
+                        if msg.contains("More than 1000 frames duplicated") {
+                            tracing::debug!("[ddagrab] {msg}");
+                        } else {
+                            tracing::warn!("[ddagrab] {msg}");
+                            if let Ok(mut g) = stderr_tail_cb.lock() {
+                                if g.len() >= 8 {
+                                    g.pop_front();
+                                }
+                                g.push_back(msg);
                             }
-                            g.push_back(msg);
                         }
                     }
                     line.clear();
@@ -736,6 +740,28 @@ async fn run_ddagrab_hw(
                     return Ok(());
                 }
                 _ = desk_tick.tick() => {
+                    let cur_sess = crate::windows_session::current_session_id();
+                    let active_sess = crate::windows_session::active_console_session_id();
+                    if cur_sess != 0
+                        && active_sess != 0
+                        && active_sess != u32::MAX
+                        && cur_sess != active_sess
+                    {
+                        tracing::info!(
+                            worker_session = cur_sess,
+                            active_console_session = active_sess,
+                            "console session moved; stopping ddagrab cleanly for migration"
+                        );
+                        proc_handle.kill();
+                        drop(chunk_rx);
+                        if let Some(h) = stdout_thread {
+                            let _ = h.join();
+                        }
+                        if let Some(h) = stderr_thread {
+                            let _ = h.join();
+                        }
+                        return Ok(());
+                    }
                     let cur_desk = crate::windows_session::current_input_desktop_name();
                     if cur_desk.is_some() && cur_desk != launched_desktop {
                         tracing::info!(

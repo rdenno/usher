@@ -288,7 +288,7 @@ impl FfmpegPipeDecoder {
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .context("failed to spawn ffmpeg decoder (ensure ffmpeg is in PATH)")?;
 
@@ -300,6 +300,25 @@ impl FfmpegPipeDecoder {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("ffmpeg missing stdout"))?;
+        if let Some(stderr) = child.stderr.take() {
+            let _ = std::thread::Builder::new()
+                .name("usher-ffmpeg-dec-err".into())
+                .spawn(move || {
+                    use std::io::{BufRead, BufReader};
+                    let mut reader = BufReader::new(stderr);
+                    let mut line = String::new();
+                    while let Ok(n) = reader.read_line(&mut line) {
+                        if n == 0 {
+                            break;
+                        }
+                        let msg = line.trim_end();
+                        if !msg.is_empty() {
+                            tracing::debug!("[ffmpeg-dec] {msg}");
+                        }
+                        line.clear();
+                    }
+                });
+        }
 
         let w = width as u32;
         let h = height as u32;

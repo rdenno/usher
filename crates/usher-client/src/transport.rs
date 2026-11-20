@@ -289,6 +289,10 @@ pub async fn start_transport(
                 }
             };
 
+            let mut last_frame_id: Option<u32> = None;
+            let mut awaiting_keyframe = false;
+            let mut last_dec_pli = Instant::now() - Duration::from_secs(1);
+
             while !cancel_dec.is_cancelled() {
                 let Some(au) = enc_slot.wait_take() else {
                     break;
@@ -334,6 +338,8 @@ pub async fn start_transport(
                             );
                             decoder = new_dec;
                             active_spec = target_spec;
+                            awaiting_keyframe = false;
+                            last_frame_id = None;
                         }
                         Err(err) => {
                             tracing::error!("failed to switch video decoder: {err:#}");
@@ -342,6 +348,25 @@ pub async fn start_transport(
                             return;
                         }
                     }
+                }
+
+                let is_key = (au.flags & FRAME_FLAG_KEYFRAME) != 0;
+                if let Some(prev) = last_frame_id
+                    && au.frame_id != prev.wrapping_add(1)
+                    && !is_key
+                {
+                    awaiting_keyframe = true;
+                    if last_dec_pli.elapsed() >= Duration::from_millis(250) {
+                        last_dec_pli = Instant::now();
+                        let _ = ctrl_tx_dec.try_send(ControlMessage::RequestKeyframe);
+                    }
+                }
+                last_frame_id = Some(au.frame_id);
+                if awaiting_keyframe {
+                    if !is_key {
+                        continue;
+                    }
+                    awaiting_keyframe = false;
                 }
 
                 if let Err(err) = decoder.decode(&au.data) {
@@ -363,6 +388,8 @@ pub async fn start_transport(
                     ) {
                         Ok(new_dec) => {
                             decoder = new_dec;
+                            awaiting_keyframe = true;
+                            last_frame_id = None;
                             let _ = ctrl_tx_dec.try_send(ControlMessage::RequestKeyframe);
                         }
                         Err(err2) => {

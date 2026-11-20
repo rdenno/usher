@@ -140,9 +140,13 @@ struct Args {
     #[arg(long)]
     no_input: bool,
 
-    /// Start in borderless fullscreen
+    /// Start in borderless fullscreen (default)
     #[arg(long)]
     fullscreen: bool,
+
+    /// Start in a normal desktop window instead of fullscreen
+    #[arg(long, conflicts_with = "fullscreen")]
+    windowed: bool,
 
     /// Start with locked relative mouse mode enabled (toggle anytime with Ctrl+Alt+G)
     #[arg(long)]
@@ -189,7 +193,13 @@ fn build_cli_overrides(args: &Args) -> HostSettings {
         display: args.display,
         pointer_mode,
         stats_overlay,
-        fullscreen: if args.fullscreen { Some(true) } else { None },
+        fullscreen: if args.fullscreen {
+            Some(true)
+        } else if args.windowed {
+            Some(false)
+        } else {
+            None
+        },
         capture: args.capture.clone(),
         encoder: args.encoder.clone(),
         decoder: args.decoder,

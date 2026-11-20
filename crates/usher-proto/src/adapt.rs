@@ -224,14 +224,16 @@ impl AdaptiveController {
             let big_drop = self.target_bitrate_kbps <= ((prev_applied as u64 * 80) / 100) as u32;
             let severe_drop =
                 self.target_bitrate_kbps <= ((prev_applied as u64 * 65) / 100) as u32;
-            let big_grow = self.target_bitrate_kbps >= ((prev_applied as u64 * 125) / 100) as u32
+            let big_grow = self.target_bitrate_kbps >= ((prev_applied as u64 * 150) / 100) as u32
                 || (self.target_bitrate_kbps == self.max_bitrate_kbps
                     && prev_applied < self.max_bitrate_kbps
-                    && self.target_bitrate_kbps.saturating_sub(prev_applied) >= prev_applied / 10);
+                    && self.target_bitrate_kbps.saturating_sub(prev_applied) >= prev_applied / 5);
             let cooldown = if severe_drop {
                 Duration::from_secs(2)
-            } else {
+            } else if big_drop {
                 Duration::from_secs(4)
+            } else {
+                Duration::from_secs(10)
             };
             let cooldown_ok = self
                 .last_restart_at

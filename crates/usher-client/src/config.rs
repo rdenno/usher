@@ -283,7 +283,7 @@ impl Default for EffectiveConfig {
             display: 0,
             pointer_mode: PointerMode::Absolute,
             stats_overlay: false,
-            fullscreen: false,
+            fullscreen: true,
             capture: "auto".to_string(),
             encoder: "auto".to_string(),
             decoder: DecoderKind::Auto,
@@ -432,6 +432,14 @@ display = 1
         assert_eq!(eff.pointer_mode, PointerMode::Relative);
         assert!(!eff.audio);
         assert_eq!(eff.display, 1);
+        assert!(eff.fullscreen);
+
+        let cli_windowed = HostSettings {
+            fullscreen: Some(false),
+            ..Default::default()
+        };
+        let eff_win = EffectiveConfig::resolve(&cfg, Some("desktop"), &cli_windowed, None);
+        assert!(!eff_win.fullscreen);
 
         let eff_other = EffectiveConfig::resolve(&cfg, Some("laptop"), &HostSettings::default(), None);
         assert_eq!(eff_other.max_bitrate_kbps, 45_000);

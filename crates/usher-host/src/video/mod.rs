@@ -329,55 +329,96 @@ pub(crate) async fn run_one_backend(
         #[cfg(target_os = "windows")]
         ResolvedBackend::Win(win_backend) => {
             let was_hw = matches!(win_backend, windows_capture::WinVideoBackend::DdagrabHw { .. });
-            match windows_capture::run_windows_backend(
-                win_backend,
-                cfg.clone(),
-                live_bitrate_kbps.clone(),
-                tx.clone(),
-                keyframe_req.clone(),
-                start,
-                child_cancel.clone(),
-            )
-            .await
-            {
-                Ok(()) => return,
-                Err(err) => {
-                    if child_cancel.is_cancelled() {
-                        return;
-                    }
-                    tracing::warn!("Windows capture pipeline failed ({err:#})");
-                    if was_hw {
-                        cfg.codec = VideoCodec::H264;
-                        in_place_bitrate.store(true, Ordering::Release);
-                        effective_codec.store(VideoCodec::H264.to_u8(), Ordering::Release);
-                        status_notify.notify_one();
-                        tracing::info!(
-                            "falling back to built-in DXGI + OpenH264 capture (stream codec: h264)"
-                        );
-                        match windows_capture::run_windows_backend(
-                            windows_capture::WinVideoBackend::NativeDxgiOpenH264,
-                            cfg.clone(),
-                            live_bitrate_kbps.clone(),
-                            tx.clone(),
-                            keyframe_req.clone(),
-                            start,
-                            child_cancel.clone(),
-                        )
-                        .await
+            let initial_codec = cfg.codec;
+            let mut hw_failures = 0u32;
+
+            while !child_cancel.is_cancelled() {
+                match windows_capture::run_windows_backend(
+                    win_backend.clone(),
+                    cfg.clone(),
+                    live_bitrate_kbps.clone(),
+                    tx.clone(),
+                    keyframe_req.clone(),
+                    start,
+                    child_cancel.clone(),
+                )
+                .await
+                {
+                    Ok(()) => return,
+                    Err(err) => {
+                        if child_cancel.is_cancelled() {
+                            return;
+                        }
+                        if crate::windows_session::current_session_id()
+                            != crate::windows_session::active_console_session_id()
                         {
-                            Ok(()) => return,
-                            Err(dxgi_err) => {
-                                if child_cancel.is_cancelled() {
-                                    return;
+                            tracing::info!(
+                                "Windows console session changed; pausing capture while supervisor migrates"
+                            );
+                            child_cancel.cancelled().await;
+                            return;
+                        }
+                        tracing::warn!("Windows capture pipeline interrupted ({err:#})");
+
+                        if was_hw {
+                            hw_failures += 1;
+                            if hw_failures < 2 {
+                                tokio::select! {
+                                    _ = child_cancel.cancelled() => return,
+                                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                                 }
-                                tracing::warn!(
-                                    "built-in DXGI + OpenH264 fallback failed ({dxgi_err:#})"
-                                );
+                                continue;
                             }
+
+                            cfg.codec = VideoCodec::H264;
+                            in_place_bitrate.store(true, Ordering::Release);
+                            effective_codec.store(VideoCodec::H264.to_u8(), Ordering::Release);
+                            status_notify.notify_one();
+                            tracing::info!(
+                                "falling back to built-in DXGI + OpenH264 capture (stream codec: h264)"
+                            );
+                            match windows_capture::run_windows_backend(
+                                windows_capture::WinVideoBackend::NativeDxgiOpenH264,
+                                cfg.clone(),
+                                live_bitrate_kbps.clone(),
+                                tx.clone(),
+                                keyframe_req.clone(),
+                                start,
+                                child_cancel.clone(),
+                            )
+                            .await
+                            {
+                                Ok(()) => return,
+                                Err(dxgi_err) => {
+                                    if child_cancel.is_cancelled() {
+                                        return;
+                                    }
+                                    if crate::windows_session::current_session_id()
+                                        != crate::windows_session::active_console_session_id()
+                                    {
+                                        tracing::info!(
+                                            "Windows console session changed; pausing capture while supervisor migrates"
+                                        );
+                                        child_cancel.cancelled().await;
+                                        return;
+                                    }
+                                    tracing::warn!(
+                                        "built-in DXGI + OpenH264 fallback interrupted ({dxgi_err:#}); retrying desktop capture"
+                                    );
+                                    cfg.codec = initial_codec;
+                                    hw_failures = 0;
+                                }
+                            }
+                        }
+
+                        tokio::select! {
+                            _ = child_cancel.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
                         }
                     }
                 }
             }
+            return;
         }
         ResolvedBackend::Software => {
             tracing::info!("starting built-in OpenH264 video stream");

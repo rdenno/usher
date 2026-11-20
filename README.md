@@ -15,7 +15,7 @@
 usher my-host
 ```
 
-With zero flags, `usher my-host` matches your monitor & refresh rate, picks the best mutual hardware codec (`HEVC`/`AV1` when both ends support it, otherwise `H.264`), and adapts bitrate & FEC automatically to link conditions.
+With zero flags, `usher my-host` launches fullscreen (`--windowed` for a desktop window), matches your monitor & refresh rate, picks the best mutual hardware codec (`HEVC`/`AV1` when both ends support it, otherwise `H.264`), and adapts bitrate & FEC automatically to link conditions.
 
 - **SSH key auth only**: Reuses `~/.ssh/config` aliases and public keys with no background server, PINs, or accounts.
 - **Cut-fast, grow-slow adaptive transport**: 500 ms client network reports steer bitrate (up to 60 Mbps by default) and dynamic XOR-FEC parity within `<= 1200`-byte mesh-safe UDP datagrams.
@@ -126,6 +126,7 @@ stats_overlay = true
 | `--codec` | `auto` | `auto` (negotiates `hevc`/`av1`/`h264`), `h264`, `hevc`, `av1` |
 | `--prefer` | `latency` | `latency` (lowest delay + higher min FEC) or `quality` |
 | `--display` | `0` | Multi-monitor host display index |
+| `--windowed` | `false` | Start in a normal window instead of borderless fullscreen (`fullscreen = false` in `config.toml`; toggle with `Ctrl+Alt+F`) |
 | `--stats-overlay` | `false` | Show compact top-left live stats HUD by default |
 | `--capture` | `auto` | `auto`, `drm`, `pipewire`, `x11`, `dxgi`, `testsrc` |
 | `--encoder` | `auto` | `auto`, `vaapi`, `nvenc`, `amf`, `qsv`, `openh264` |

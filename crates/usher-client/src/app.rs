@@ -50,6 +50,7 @@ pub struct UsherApp {
     rel_accum_x: f64,
     rel_accum_y: f64,
     cursor_pos: (f64, f64),
+    cursor_inside: bool,
     last_title_update: Instant,
     pending_resize: Option<(u16, u16, Instant)>,
 }
@@ -69,6 +70,7 @@ impl UsherApp {
             rel_accum_x: 0.0,
             rel_accum_y: 0.0,
             cursor_pos: (0.0, 0.0),
+            cursor_inside: false,
             last_title_update: Instant::now(),
             pending_resize: None,
         }
@@ -82,14 +84,15 @@ impl UsherApp {
             return;
         };
         let lock_cursor = !sess.overlay.open && sess.relative_mouse && self.focused;
+        let hide_cursor =
+            !sess.overlay.open && self.focused && sess.input_enabled && (lock_cursor || self.cursor_inside);
+        win.set_cursor_visible(!hide_cursor);
         if lock_cursor {
-            win.set_cursor_visible(false);
             if win.set_cursor_grab(CursorGrabMode::Locked).is_err() {
                 let _ = win.set_cursor_grab(CursorGrabMode::Confined);
             }
         } else {
             let _ = win.set_cursor_grab(CursorGrabMode::None);
-            win.set_cursor_visible(true);
         }
         let _ = sess.control_tx.try_send(ControlMessage::SetPointerMode {
             relative: lock_cursor,
@@ -227,9 +230,17 @@ impl ApplicationHandler<AppEvent> for UsherApp {
             return;
         };
         let win_icon = crate::icon::build_window_icon();
+        let (init_w, init_h) = if sess.initial_fullscreen {
+            (
+                ((sess.video_w as u32 * 4) / 5).max(640),
+                ((sess.video_h as u32 * 4) / 5).max(360),
+            )
+        } else {
+            (sess.video_w as u32, sess.video_h as u32)
+        };
         let mut attrs = Window::default_attributes()
             .with_title(format!("Usher — {} ({}x{})", sess.host_label, sess.video_w, sess.video_h))
-            .with_inner_size(PhysicalSize::new(sess.video_w as u32, sess.video_h as u32))
+            .with_inner_size(PhysicalSize::new(init_w, init_h))
             .with_window_icon(win_icon.clone());
         #[cfg(target_os = "windows")]
         {
@@ -250,8 +261,12 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                             (phys.width.clamp(64, 3840) as u16) & !1,
                             (phys.height.clamp(64, 2160) as u16) & !1,
                         );
+                        let start_fullscreen = sess.initial_fullscreen;
                         self.window = Some(win.clone());
                         self.renderer = Some(renderer);
+                        if start_fullscreen {
+                            self.cursor_inside = true;
+                        }
                         self.apply_mouse_mode();
                         win.request_redraw();
                     }
@@ -442,8 +457,20 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                     }
                 }
             }
+            WindowEvent::CursorEntered { .. } => {
+                self.cursor_inside = true;
+                self.apply_mouse_mode();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_inside = false;
+                self.apply_mouse_mode();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                if !self.cursor_inside {
+                    self.cursor_inside = true;
+                    self.apply_mouse_mode();
+                }
                 let Some(sess) = &self.session else {
                     return;
                 };
