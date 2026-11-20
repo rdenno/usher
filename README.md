@@ -15,9 +15,9 @@
 usher my-host
 ```
 
-With zero flags, `usher my-host` launches fullscreen (`--windowed` for a desktop window), preserves the host's native aspect ratio inside your monitor bounds, picks the best mutual hardware codec (`HEVC`/`AV1`/`H.264` via native Media Foundation / VideoToolbox without requiring `ffmpeg`, falling back to `ffmpeg` or OpenH264 when needed), syncs clipboard text bidirectionally, forwards Xbox 360 gamepads, and adapts bitrate & FEC automatically to link conditions.
+In one command, `usher my-host` launches a fullscreen remote desktop session, preserves the host's native aspect ratio inside your monitor bounds, picks the best mutual hardware codec (`HEVC`/`AV1`/`H.264`, falling back to `ffmpeg` or OpenH264 when needed), syncs clipboard text bidirectionally, forwards Xbox 360 gamepads, and adapts bitrate & FEC automatically to link conditions.
 
-- **SSH key auth only**: Reuses `~/.ssh/config` aliases and public keys with no background server, PINs, or accounts.
+- **SSH key auth only**: Uses `~/.ssh/config` aliases and public keys with no background server, PINs, or accounts required.
 - **Zero-dependency native hardware video**: Windows uses DXGI Desktop Duplication + Media Foundation (`NVENC`/`AMF`/`QSV`/`DX12` encode & DXVA/D3D11 decode with zero-hitch in-place bitrate scaling); macOS uses VideoToolbox hardware decode (`HEVC`/`H.264`). Optional `ffmpeg` and built-in OpenH264 remain as automatic fallbacks.
 - **Cut-fast, grow-slow adaptive transport**: 500 ms client network reports steer bitrate (up to 60 Mbps by default) and dynamic XOR-FEC parity within `<= 1200`-byte mesh-safe UDP datagrams.
 - **Hidden in-stream overlay (`Ctrl+Alt+S`)**: Tweak bitrate ceiling, resolution, FPS, codec, latency/quality tuning, audio, monitor, pointer mode, or HUD live and save per-host defaults.
@@ -28,12 +28,12 @@ With zero flags, `usher my-host` launches fullscreen (`--windowed` for a desktop
 
 ## How Usher Compares
 
-| Parameter | Usher | Moonlight + Sunshine | Windows RDP | Parsec / RustDesk |
+| Parameter | Usher | Moonlight + Sunshine | Windows RDP | Parsec |
 | :--- | :--- | :--- | :--- | :--- |
-| **Background daemon & open ports** | **None.** Spawns per SSH session and closes everything on exit | Always-on Sunshine service listening on HTTPS/RTSP/UDP ports | Always-on TermService listening on TCP/UDP 3389 | Always-on background daemon + relay / broker agents |
-| **Latency & gaming** | **Low** (hardware HEVC/AV1/H.264, `ull` CBR, adaptive FEC, gamepad + relative mouse) | **Very low** (hardware stream, mature frame pacing & HDR) | **Medium** (office UI focused; no raw relative mouse or gamepads) | **Low–medium** (good gaming on Parsec; RustDesk tuned for support) |
+| **Background daemon & open ports** | **None.** Spawns per SSH session and closes everything on exit | Always-on Sunshine service listening on HTTPS/RTSP/UDP ports | Always-on TermService listening on TCP/UDP 3389 | Always-on background daemon |
+| **Latency & gaming** | **Low** (hardware HEVC/AV1/H.264, `ull` CBR, adaptive FEC, gamepad + relative mouse) | **Very low** (hardware stream, mature frame pacing & HDR) | **Medium** (office UI focused; no raw relative mouse or gamepads) | **Low–medium** (subject to relay servers) |
 | **Auth & security model** | **OpenSSH public-key only** (`BatchMode=yes`) + per-session ChaCha20-Poly1305 | TLS pairing with 4-digit PIN + Sunshine web login | Windows account / NLA / Kerberos | Vendor account/cloud auth (or custom self-hosted ID server) |
-| **Network & mesh VPNs** | **Mesh-first** (binds strictly to `SSH_CONNECTION` overlay/private IP, `<= 1200` B MTU) | LAN by default; remote requires UPnP/port-forwarding or manual VPN setup | LAN/VPN; exposing 3389 publicly is unsafe | Built-in WAN hole-punching & vendor relays |
+| **Network & mesh VPNs** | **Mesh-first** (binds strictly to `SSH_CONNECTION` overlay/private IP, `<= 1200` B MTU) | LAN by default; remote requires UPnP/port-forwarding or manual VPN setup | LAN/VPN | Built-in WAN hole-punching & vendor relays |
 | **Setup & portability** | **Single static binary** (`usher` / `usher-host`), reuses `~/.ssh/config` | Host installer + web UI pairing + virtual display/gamepad drivers | Built into Windows Pro (none on Linux/Home hosts) | Full app installer + account or server config |
 | **Best fit** | Ad-hoc, SSH-first remote desktop & gaming over Tailscale / ZeroTier | Dedicated living-room / high-FPS game streaming rigs | Multi-monitor Windows office administration | Team screen sharing, third-party support, zero-SSH access |
 
@@ -45,7 +45,7 @@ With zero flags, `usher my-host` launches fullscreen (`--windowed` for a desktop
 
 | Platform | Install / Update |
 | :--- | :--- |
-| **Windows (One-liner)** | Client (default):<br>`irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>Host / Both (also works for updates):<br>`$env:USHER_ROLE='host'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>`$env:USHER_ROLE='both'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex` |
+| **Windows (Powershell)** | Client (default):<br>`irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>Host / Both (also works for updates):<br>`$env:USHER_ROLE='host'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>`$env:USHER_ROLE='both'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex` |
 | **Windows (Installer)** | Run **`usher-setup-windows-x86_64.exe`** from **Releases** (installs Client/Host to `%LOCALAPPDATA%\Programs\Usher` and updates User `PATH`; re-run newer releases to upgrade in place while keeping settings). |
 | **Linux** | Extract `usher-linux-x86_64.tar.gz` (`usher` + `usher-host`) and run [`./contrib/install-host.sh`](contrib/install-host.sh) once on the host for `/dev/uinput` permissions. |
 | **macOS** | Extract `usher-macos-aarch64.tar.gz` (`usher` client). |
@@ -86,7 +86,7 @@ usher --local --capture testsrc
 
 ## Configuration (`config.toml`)
 
-Optional defaults live at `~/.config/usher/config.toml` (Linux/macOS) or `%APPDATA%\usher\config.toml` (Windows), using the same option names as CLI flags (CLI flags always win). Press `Ctrl+Alt+S` → **Save for `<host>`** mid-stream to write a host section automatically:
+Optional defaults live at `~/.config/usher/config.toml` (Linux/macOS) or `%APPDATA%\usher\config.toml` (Windows), using the same option names as CLI flags (CLI flags take priority). Press `Ctrl+Alt+S` → **Save for `<host>`** mid-stream to write a host section automatically:
 
 ```toml
 max_bitrate_kbps = 60000
