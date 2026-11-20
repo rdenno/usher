@@ -196,7 +196,7 @@ unsafe extern "C" fn vt_output_callback(
         let mut v = Vec::with_capacity(cw * ch);
         for row in 0..ch {
             let uv_line = unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uv_pitch), cw * 2) };
-            for pair in uv_line.chunks_exact(2) {
+            for pair in uv_line.as_chunks::<2>().0 {
                 u.push(pair[0]);
                 v.push(pair[1]);
             }
