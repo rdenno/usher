@@ -3,6 +3,7 @@ mod audio;
 mod config;
 mod decoder;
 mod gamepad;
+mod icon;
 mod keymap;
 mod overlay;
 mod renderer;

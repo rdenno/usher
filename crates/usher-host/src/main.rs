@@ -3,6 +3,8 @@ mod input;
 mod net;
 mod video;
 #[cfg(target_os = "windows")]
+mod windows_ipc;
+#[cfg(target_os = "windows")]
 mod windows_session;
 
 use anyhow::{Context, Result, bail};
@@ -10,11 +12,11 @@ use clap::Parser;
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-#[cfg(target_os = "windows")]
-use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -138,6 +140,22 @@ struct Args {
     /// Internal flag: preserve SSH_CONNECTION peer IP across Windows Session 0 -> Session 1 bridge
     #[arg(long, hide = true)]
     expected_client_ip: Option<IpAddr>,
+
+    /// Internal flag: SYSTEM launcher inside Session 0 spawning console worker into target session
+    #[arg(long, hide = true)]
+    windows_system_launcher: bool,
+
+    /// Internal flag: target Windows console session ID for SYSTEM launcher
+    #[arg(long, hide = true)]
+    target_session: Option<u32>,
+
+    /// Internal flag: console worker is running as NT AUTHORITY\SYSTEM
+    #[arg(long, hide = true)]
+    is_system: bool,
+
+    /// Internal flag: explicit absolute ffmpeg path forwarded from SSH Session 0
+    #[arg(long, hide = true)]
+    ffmpeg_path: Option<std::path::PathBuf>,
 }
 
 fn resolve_bind_ip(explicit: Option<IpAddr>, allow_public: bool) -> Result<(IpAddr, Option<IpAddr>)> {
@@ -169,18 +187,18 @@ fn resolve_bind_ip(explicit: Option<IpAddr>, allow_public: bool) -> Result<(IpAd
 
 #[cfg(target_os = "windows")]
 #[derive(Clone)]
-struct PipeMakeWriter {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+struct PipeLogMakeWriter {
+    tx: mpsc::UnboundedSender<String>,
 }
 
 #[cfg(target_os = "windows")]
-struct PipeWriter {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+struct PipeLogWriter {
+    tx: mpsc::UnboundedSender<String>,
     buf: Vec<u8>,
 }
 
 #[cfg(target_os = "windows")]
-impl std::io::Write for PipeWriter {
+impl std::io::Write for PipeLogWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(data);
         Ok(data.len())
@@ -188,30 +206,47 @@ impl std::io::Write for PipeWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if !self.buf.is_empty() {
-            let _ = self.tx.send(std::mem::take(&mut self.buf));
+            let line = String::from_utf8_lossy(&std::mem::take(&mut self.buf))
+                .trim_end_matches(&['\r', '\n'][..])
+                .to_string();
+            if !line.is_empty() {
+                let _ = self.tx.send(line);
+            }
         }
         Ok(())
     }
 }
 
 #[cfg(target_os = "windows")]
-impl Drop for PipeWriter {
+impl Drop for PipeLogWriter {
     fn drop(&mut self) {
-        if !self.buf.is_empty() {
-            let _ = self.tx.send(std::mem::take(&mut self.buf));
+        let _ = std::io::Write::flush(self);
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PipeLogMakeWriter {
+    type Writer = PipeLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        PipeLogWriter {
+            tx: self.tx.clone(),
+            buf: Vec::with_capacity(256),
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PipeMakeWriter {
-    type Writer = PipeWriter;
+struct PipeInputSink {
+    cmd_tx: mpsc::Sender<windows_ipc::HostCmd>,
+}
 
-    fn make_writer(&'a self) -> Self::Writer {
-        PipeWriter {
-            tx: self.tx.clone(),
-            buf: Vec::with_capacity(256),
-        }
+#[cfg(target_os = "windows")]
+impl crate::input::InputSink for PipeInputSink {
+    fn handle(&mut self, event: usher_proto::input::InputEvent) {
+        let _ = self
+            .cmd_tx
+            .try_send(windows_ipc::HostCmd::Input(event.encode()));
     }
 }
 
@@ -225,46 +260,30 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(target_os = "windows")]
-    let (mut worker_pipe_rx, pipe_out_tx, pipe_writer_task) =
-        if let Some(ref pipe_name) = args.bridge_pipe {
-            let pipe = windows_session::connect_worker_pipe(pipe_name).await?;
-            let (rx, mut tx) = tokio::io::split(pipe);
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            let writer_task = tokio::spawn(async move {
-                while let Some(chunk) = out_rx.recv().await {
-                    if tx.write_all(&chunk).await.is_err() {
-                        break;
-                    }
-                    if out_rx.is_empty() {
-                        let _ = tx.flush().await;
-                    }
-                }
-            });
-            (Some(rx), Some(out_tx), Some(writer_task))
-        } else {
-            (None, None, None)
-        };
-
-    // All logs MUST go to stderr (or bridge pipe in Session 1 worker) with ANSI disabled so stdout
-    // remains clean for the single-line JSON handshake.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    #[cfg(target_os = "windows")]
-    if let Some(ref tx) = pipe_out_tx {
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(PipeMakeWriter { tx: tx.clone() })
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
+    if args.windows_system_launcher {
+        let target_session = args
+            .target_session
+            .unwrap_or_else(windows_session::active_console_session_id);
+        let pipe_name = args
+            .bridge_pipe
+            .as_deref()
+            .context("--windows-system-launcher requires --bridge-pipe")?;
+        return windows_session::run_system_launcher(
+            target_session,
+            pipe_name,
+            args.ffmpeg_path.as_deref(),
+            args.no_audio,
+            args.no_input,
+        );
     }
-    #[cfg(not(target_os = "windows"))]
+
+    #[cfg(target_os = "windows")]
+    if args.windows_worker {
+        return run_windows_console_worker(args).await;
+    }
+
+    // All logs MUST go to stderr with ANSI disabled so stdout remains clean for the single-line JSON handshake.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(std::io::stderr)
@@ -278,19 +297,51 @@ async fn main() -> Result<()> {
     let mut capture = args.capture;
 
     #[cfg(target_os = "windows")]
-    if windows_session::needs_session_bridge(args.windows_worker, capture) {
+    let mut console_worker = None;
+    #[cfg(target_os = "windows")]
+    let mut host_ffmpeg_path: Option<std::path::PathBuf> = None;
+
+    #[cfg(target_os = "windows")]
+    if windows_session::needs_session_bridge(
+        args.windows_worker,
+        args.windows_system_launcher,
+        capture,
+    ) {
+        let resolved_ff = video::windows_capture::find_working_ffmpeg_absolute();
+        if let Some(ref p) = resolved_ff {
+            video::windows_capture::set_explicit_ffmpeg_path(p.clone());
+        }
+        host_ffmpeg_path = resolved_ff;
+        let target_sess = windows_session::active_console_session_id();
         tracing::info!(
-            "running inside Windows Session 0; launching Session 1 interactive worker for DXGI/WASAPI/SendInput"
+            target_session = target_sess,
+            "running inside Windows Session 0; launching console worker for active desktop capture/input"
         );
-        let worker_args = build_worker_args(&args, bind_ip, expected_client_ip);
-        match windows_session::run_session_bridge(&worker_args).await {
-            Ok(()) => return Ok(()),
+        match windows_session::spawn_console_worker(
+            target_sess,
+            host_ffmpeg_path.as_deref(),
+            args.no_audio,
+            args.no_input,
+        )
+        .await
+        {
+            Ok((pipe, hello_info, worker_session)) => {
+                tracing::info!(
+                    worker_session,
+                    is_system = hello_info.is_system,
+                    desktop = ?hello_info.desktop_name,
+                    displays = hello_info.displays.len(),
+                    codecs = ?hello_info.host_codecs,
+                    "Windows console worker ready"
+                );
+                console_worker = Some((pipe, hello_info, worker_session));
+            }
             Err(err) => {
                 if capture == CaptureSource::Dxgi {
                     return Err(err);
                 }
                 tracing::warn!(
-                    "Session 0 -> Session 1 bridge failed ({err:#}); falling back to in-process OpenH264 testsrc"
+                    "Windows console worker spawn failed ({err:#}); falling back to in-process OpenH264 testsrc"
                 );
                 capture = CaptureSource::Testsrc;
             }
@@ -300,25 +351,28 @@ async fn main() -> Result<()> {
     let probe = probe_drm();
 
     #[cfg(target_os = "windows")]
-    let displays: Vec<DisplayInfo> = if capture == CaptureSource::Testsrc {
-        Vec::new()
-    } else {
-        let cur_session = windows_session::current_session_id();
-        let active_session = windows_session::active_console_session_id();
-        if cur_session != active_session {
-            tracing::warn!(
-                worker_session = cur_session,
-                active_console_session = active_session,
-                "Windows session is not the active console (host PC is likely locked, disconnected, or switched user); unlock the host desktop to capture the real screen"
-            );
-        }
-        if !video::windows_capture::has_attached_dxgi_output() {
-            tracing::warn!(
-                "DXGI reported no attached desktop outputs in this session (host desktop may be locked or display asleep)"
-            );
-        }
-        video::windows_capture::enumerate_displays()
-    };
+    let (displays, bridge_host_codecs): (Vec<DisplayInfo>, Option<Vec<VideoCodec>>) =
+        if capture == CaptureSource::Testsrc {
+            (Vec::new(), None)
+        } else if let Some((_, ref info, _)) = console_worker {
+            (info.displays.clone(), Some(info.host_codecs.clone()))
+        } else {
+            let cur_session = windows_session::current_session_id();
+            let active_session = windows_session::active_console_session_id();
+            if cur_session != active_session {
+                tracing::warn!(
+                    worker_session = cur_session,
+                    active_console_session = active_session,
+                    "Windows session is not the active console; unlock the host desktop to capture the real screen"
+                );
+            }
+            if !video::windows_capture::has_attached_dxgi_output() {
+                tracing::warn!(
+                    "DXGI reported no attached desktop outputs in this session"
+                );
+            }
+            (video::windows_capture::enumerate_displays(), None)
+        };
     #[cfg(target_os = "linux")]
     let displays: Vec<DisplayInfo> = probe.displays.clone();
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -369,6 +423,10 @@ async fn main() -> Result<()> {
         .split(',')
         .filter_map(|s| s.trim().parse::<VideoCodec>().ok())
         .collect();
+    #[cfg(target_os = "windows")]
+    let host_codecs = bridge_host_codecs
+        .unwrap_or_else(|| probe_host_codecs(capture, args.encoder, &probe));
+    #[cfg(not(target_os = "windows"))]
     let host_codecs = probe_host_codecs(capture, args.encoder, &probe);
     let negotiated_codec = negotiate_codec(args.codec, &client_codecs, &host_codecs);
 
@@ -428,21 +486,6 @@ async fn main() -> Result<()> {
     };
 
     let hello_line = encode_hello_line(&hello)?;
-    #[cfg(target_os = "windows")]
-    if let Some(ref tx) = pipe_out_tx {
-        tx.send(format!("{hello_line}\n").into_bytes())
-            .map_err(|_| anyhow::anyhow!("bridge pipe writer closed before USHER_HELLO"))?;
-        let info = format!(
-            "backend={resolved_backend:?} codec={effective_codec} audio={}\n",
-            !args.no_audio
-        );
-        let _ = tx.send(info.into_bytes());
-    } else {
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "{hello_line}")?;
-        stdout.flush()?;
-    }
-    #[cfg(not(target_os = "windows"))]
     {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{hello_line}")?;
@@ -465,41 +508,7 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let keyframe_req = Arc::new(AtomicBool::new(true));
 
-    // Watchdog 1: SSH stdin EOF (or bridge pipe EOF when running as Windows Session 1 worker)
-    #[cfg(target_os = "windows")]
-    if let Some(mut pipe_rx) = worker_pipe_rx.take() {
-        let cancel_pipe = cancel.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 64];
-            loop {
-                match pipe_rx.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
-                        tracing::info!("Session 0 bridge pipe closed; tearing down Session 1 worker");
-                        cancel_pipe.cancel();
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-            }
-        });
-    } else {
-        let cancel_stdin = cancel.clone();
-        tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let mut buf = [0u8; 64];
-            loop {
-                match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
-                        tracing::info!("SSH stdin closed (EOF); tearing down session");
-                        cancel_stdin.cancel();
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-            }
-        });
-    }
-    #[cfg(not(target_os = "windows"))]
+    // Watchdog 1: SSH stdin EOF
     {
         let cancel_stdin = cancel.clone();
         tokio::spawn(async move {
@@ -561,6 +570,17 @@ async fn main() -> Result<()> {
     }
 
     let crypto = Arc::new(Mutex::new(SessionCrypto::new(&session_key, Role::Host)));
+    #[cfg(target_os = "windows")]
+    let (input_sink, bridge_cmd_rx): (
+        Box<dyn crate::input::InputSink>,
+        Option<mpsc::Receiver<windows_ipc::HostCmd>>,
+    ) = if console_worker.is_some() && !args.no_input {
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        (Box::new(PipeInputSink { cmd_tx }), Some(cmd_rx))
+    } else {
+        (create_input_sink(!args.no_input), None)
+    };
+    #[cfg(not(target_os = "windows"))]
     let input_sink = create_input_sink(!args.no_input);
     let (video_tx, video_rx) = mpsc::channel(4);
     let (audio_tx, audio_rx) = mpsc::channel(16);
@@ -584,7 +604,7 @@ async fn main() -> Result<()> {
             expected_client_ip,
             mtu: mtu as usize,
             fec_percent,
-            audio_enabled,
+            audio_enabled: audio_enabled.clone(),
             idle_timeout: Duration::from_secs(args.idle_timeout_secs),
             start,
             keyframe_req: keyframe_req.clone(),
@@ -605,30 +625,84 @@ async fn main() -> Result<()> {
         audio_rx,
     );
 
-    let video_handle = spawn_video_task(
-        video_cfg_rx,
-        live_bitrate_kbps,
-        in_place_bitrate,
-        effective_codec_atomic,
-        status_notify,
-        video_tx,
-        keyframe_req,
-        peer_ready,
-        start,
-        cancel.clone(),
-    );
+    #[cfg(target_os = "windows")]
+    let (video_handle, audio_handle) = if let Some((initial_pipe, _info, worker_session)) =
+        console_worker
+    {
+        let (_dummy_tx, dummy_rx) = mpsc::channel(1);
+        let cmd_rx = bridge_cmd_rx.unwrap_or(dummy_rx);
+        let sup = tokio::spawn(run_windows_session_supervisor(
+            initial_pipe,
+            worker_session,
+            host_ffmpeg_path,
+            !args.no_audio,
+            args.no_input,
+            video_cfg_rx,
+            live_bitrate_kbps,
+            in_place_bitrate,
+            effective_codec_atomic,
+            status_notify,
+            video_tx,
+            audio_tx,
+            keyframe_req,
+            peer_ready,
+            audio_enabled,
+            cmd_rx,
+            cancel.clone(),
+        ));
+        (sup, tokio::spawn(async {}))
+    } else {
+        let vh = spawn_video_task(
+            video_cfg_rx,
+            live_bitrate_kbps,
+            in_place_bitrate,
+            effective_codec_atomic,
+            status_notify,
+            video_tx,
+            keyframe_req,
+            peer_ready,
+            start,
+            cancel.clone(),
+        );
+        let ah = spawn_audio_task(
+            AudioStreamConfig {
+                enabled: !args.no_audio,
+                test_tone: capture == CaptureSource::Testsrc,
+            },
+            audio_tx,
+            start,
+            cancel.clone(),
+        );
+        (vh, ah)
+    };
 
-    let use_test_audio = capture == CaptureSource::Testsrc
-        || (!cfg!(target_os = "linux") && !cfg!(target_os = "windows"));
-    let audio_handle = spawn_audio_task(
-        AudioStreamConfig {
-            enabled: !args.no_audio,
-            test_tone: use_test_audio,
-        },
-        audio_tx,
-        start,
-        cancel.clone(),
-    );
+    #[cfg(not(target_os = "windows"))]
+    let (video_handle, audio_handle) = {
+        let vh = spawn_video_task(
+            video_cfg_rx,
+            live_bitrate_kbps,
+            in_place_bitrate,
+            effective_codec_atomic,
+            status_notify,
+            video_tx,
+            keyframe_req,
+            peer_ready,
+            start,
+            cancel.clone(),
+        );
+        let use_test_audio = capture == CaptureSource::Testsrc
+            || (!cfg!(target_os = "linux") && !cfg!(target_os = "windows"));
+        let ah = spawn_audio_task(
+            AudioStreamConfig {
+                enabled: !args.no_audio,
+                test_tone: use_test_audio,
+            },
+            audio_tx,
+            start,
+            cancel.clone(),
+        );
+        (vh, ah)
+    };
 
     cancel.cancelled().await;
 
@@ -643,89 +717,584 @@ async fn main() -> Result<()> {
 
     drop(headless_session);
     tracing::info!("usher-host exited cleanly");
-    #[cfg(target_os = "windows")]
-    {
-        drop(pipe_out_tx);
-        if let Some(task) = pipe_writer_task {
-            let _ = tokio::time::timeout(Duration::from_millis(200), task).await;
-        }
-    }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn build_worker_args(
-    args: &Args,
-    bind_ip: IpAddr,
-    expected_client_ip: Option<IpAddr>,
-) -> Vec<String> {
-    let capture_str = match args.capture {
-        CaptureSource::Auto => "auto",
-        CaptureSource::Drm => "drm",
-        CaptureSource::Pipewire => "pipewire",
-        CaptureSource::X11 => "x11",
-        CaptureSource::Dxgi => "dxgi",
-        CaptureSource::Testsrc => "testsrc",
+fn to_worker_video_cfg(cfg: &VideoPipelineConfig) -> windows_ipc::WorkerVideoConfig {
+    windows_ipc::WorkerVideoConfig {
+        width: cfg.width,
+        height: cfg.height,
+        fps: cfg.fps,
+        bitrate_kbps: cfg.bitrate_kbps,
+        codec: cfg.codec,
+        capture: cfg.capture.as_str().to_string(),
+        encoder: cfg.encoder.as_str().to_string(),
+        prefer: cfg.prefer,
+        display_index: cfg.display_index,
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn run_windows_console_worker(args: Args) -> Result<()> {
+    use windows_ipc::{HostCmd, WorkerHelloInfo, WorkerMsg, read_host_cmd, write_worker_msg};
+
+    if let Some(ref ff) = args.ffmpeg_path {
+        video::windows_capture::set_explicit_ffmpeg_path(ff.clone());
+    }
+
+    let pipe_name = args
+        .bridge_pipe
+        .as_deref()
+        .context("--windows-worker requires --bridge-pipe")?;
+    let pipe = windows_session::connect_worker_pipe(pipe_name).await?;
+    let (mut pipe_rx, mut pipe_tx) = tokio::io::split(pipe);
+
+    let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMsg>(64);
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel::<String>();
+
+    let writer_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                maybe_msg = msg_rx.recv() => match maybe_msg {
+                    Some(msg) => {
+                        if write_worker_msg(&mut pipe_tx, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                maybe_log = log_rx.recv() => if let Some(line) = maybe_log
+                    && write_worker_msg(&mut pipe_tx, &WorkerMsg::LogLine(line)).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+        while let Ok(line) = log_rx.try_recv() {
+            let _ = write_worker_msg(&mut pipe_tx, &WorkerMsg::LogLine(line)).await;
+        }
+    });
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(PipeLogMakeWriter { tx: log_tx.clone() })
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
+    let (desktop_name, displays, host_codecs) = windows_session::with_input_desktop(|name| {
+        let displays = video::windows_capture::enumerate_displays();
+        let probe = probe_drm();
+        let codecs = probe_host_codecs(args.capture, args.encoder, &probe);
+        (name, displays, codecs)
+    });
+    let worker_session = windows_session::current_session_id();
+    if !args.is_system && !video::windows_capture::has_attached_dxgi_output() {
+        tracing::warn!(
+            "DXGI reported no attached desktop outputs in interactive worker (host desktop may be locked and SYSTEM elevation was unavailable)"
+        );
+    }
+
+    msg_tx
+        .send(WorkerMsg::HelloInfo(WorkerHelloInfo {
+            displays,
+            host_codecs,
+            worker_session,
+            is_system: args.is_system,
+            desktop_name,
+        }))
+        .await
+        .context("sending console worker HelloInfo")?;
+
+    let worker_cancel = CancellationToken::new();
+    let start = Instant::now();
+    let mut input_sink = create_input_sink(!args.no_input);
+
+    let audio_enabled = Arc::new(AtomicBool::new(!args.no_audio));
+    let (a_tx, mut a_rx) = mpsc::channel::<usher_proto::audio::AudioPacket>(16);
+    let audio_fwd = {
+        let msg_tx = msg_tx.clone();
+        let audio_enabled = audio_enabled.clone();
+        let cancel = worker_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    pkt = a_rx.recv() => match pkt {
+                        Some(p) => {
+                            if audio_enabled.load(Ordering::Acquire) {
+                                let _ = msg_tx.try_send(WorkerMsg::AudioPacket(p.encode()));
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        })
     };
-    let encoder_str = match args.encoder {
-        EncoderKind::Auto => "auto",
-        EncoderKind::Vaapi => "vaapi",
-        EncoderKind::Nvenc => "nvenc",
-        EncoderKind::Amf => "amf",
-        EncoderKind::Qsv => "qsv",
-        EncoderKind::Openh264 => "openh264",
+    let audio_handle = spawn_audio_task(
+        AudioStreamConfig {
+            enabled: !args.no_audio,
+            test_tone: false,
+        },
+        a_tx,
+        start,
+        worker_cancel.clone(),
+    );
+
+    let (vcfg_tx, mut vcfg_rx) = watch::channel::<Option<VideoPipelineConfig>>(None);
+    let live_bitrate_kbps = Arc::new(AtomicU32::new(25_000));
+    let in_place_bitrate = Arc::new(AtomicBool::new(false));
+    let effective_codec = Arc::new(AtomicU8::new(VideoCodec::H264.to_u8()));
+    let status_notify = Arc::new(tokio::sync::Notify::new());
+    let keyframe_req = Arc::new(AtomicBool::new(true));
+
+    let (v_tx, mut v_rx) = mpsc::channel::<crate::video::EncodedFrame>(8);
+    let video_fwd = {
+        let msg_tx = msg_tx.clone();
+        let cancel = worker_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    f = v_rx.recv() => match f {
+                        Some(frame) => {
+                            let _ = msg_tx.try_send(WorkerMsg::VideoFrame {
+                                keyframe: frame.keyframe,
+                                timestamp_us: frame.timestamp_us,
+                                data: frame.data,
+                            });
+                        }
+                        None => break,
+                    }
+                }
+            }
+        })
     };
-    let mut out = vec![
-        "--bind-ip".into(),
-        bind_ip.to_string(),
-        "--width".into(),
-        args.width.to_string(),
-        "--height".into(),
-        args.height.to_string(),
-        "--fps".into(),
-        args.fps.to_string(),
-        "--max-bitrate-kbps".into(),
-        args.max_bitrate_kbps.to_string(),
-        "--codec".into(),
-        args.codec.to_string(),
-        "--client-codecs".into(),
-        args.client_codecs.clone(),
-        "--prefer".into(),
-        args.prefer.to_string(),
-        "--display".into(),
-        args.display.to_string(),
-        "--capture".into(),
-        capture_str.into(),
-        "--encoder".into(),
-        encoder_str.into(),
-        "--mtu".into(),
-        args.mtu.to_string(),
-        "--fec".into(),
-        args.fec.to_string(),
-        "--idle-timeout-secs".into(),
-        args.idle_timeout_secs.to_string(),
-    ];
-    if let Some(br) = args.bitrate_kbps {
-        out.push("--bitrate-kbps".into());
-        out.push(br.to_string());
+
+    let status_fwd = {
+        let msg_tx = msg_tx.clone();
+        let status_notify = status_notify.clone();
+        let effective_codec = effective_codec.clone();
+        let in_place_bitrate = in_place_bitrate.clone();
+        let cancel = worker_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = status_notify.notified() => {
+                        if let Ok(codec) = VideoCodec::from_u8(effective_codec.load(Ordering::Acquire)) {
+                            let _ = msg_tx.try_send(WorkerMsg::CodecChanged {
+                                codec,
+                                in_place_bitrate: in_place_bitrate.load(Ordering::Acquire),
+                            });
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let video_sup = {
+        let cancel = worker_cancel.clone();
+        let live_br = live_bitrate_kbps.clone();
+        let in_place = in_place_bitrate.clone();
+        let eff_codec = effective_codec.clone();
+        let st_notify = status_notify.clone();
+        let msg_tx = msg_tx.clone();
+        let kf_req = keyframe_req.clone();
+        tokio::spawn(async move {
+            while vcfg_rx.borrow_and_update().is_none() {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    res = vcfg_rx.changed() => {
+                        if res.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let Some(cfg) = vcfg_rx.borrow_and_update().clone() else {
+                    break;
+                };
+                live_br.store(cfg.bitrate_kbps, Ordering::Release);
+                let backend = resolve_video_backend(&cfg);
+                let ip = is_in_place_bitrate_backend(&backend);
+                in_place.store(ip, Ordering::Release);
+                eff_codec.store(cfg.codec.to_u8(), Ordering::Release);
+                let _ = msg_tx.try_send(WorkerMsg::CodecChanged {
+                    codec: cfg.codec,
+                    in_place_bitrate: ip,
+                });
+                let child_cancel = cancel.child_token();
+                let runner = video::run_one_backend(
+                    cfg,
+                    backend,
+                    live_br.clone(),
+                    in_place.clone(),
+                    eff_codec.clone(),
+                    st_notify.clone(),
+                    v_tx.clone(),
+                    kf_req.clone(),
+                    start,
+                    child_cancel.clone(),
+                );
+                tokio::pin!(runner);
+
+                let mut restart_for_change = false;
+                tokio::select! {
+                    _ = &mut runner => {}
+                    res = vcfg_rx.changed() => {
+                        if res.is_ok() {
+                            restart_for_change = true;
+                            kf_req.store(true, Ordering::Release);
+                            child_cancel.cancel();
+                            let _ = tokio::time::timeout(Duration::from_millis(800), &mut runner).await;
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        child_cancel.cancel();
+                        let _ = tokio::time::timeout(Duration::from_millis(500), &mut runner).await;
+                        break;
+                    }
+                }
+                if !restart_for_change {
+                    break;
+                }
+            }
+        })
+    };
+
+    loop {
+        match read_host_cmd(&mut pipe_rx).await {
+            Ok(HostCmd::StartVideo(wcfg)) => {
+                let vcfg = VideoPipelineConfig {
+                    width: wcfg.width,
+                    height: wcfg.height,
+                    fps: wcfg.fps,
+                    bitrate_kbps: wcfg.bitrate_kbps,
+                    codec: wcfg.codec,
+                    capture: CaptureSource::from_str_name(&wcfg.capture),
+                    encoder: EncoderKind::from_str_name(&wcfg.encoder),
+                    prefer: wcfg.prefer,
+                    display_index: wcfg.display_index,
+                    render_node: None,
+                    wayland_runtime_dir: None,
+                    wayland_display: None,
+                };
+                live_bitrate_kbps.store(vcfg.bitrate_kbps, Ordering::Release);
+                let _ = vcfg_tx.send(Some(vcfg));
+            }
+            Ok(HostCmd::UpdateBitrate(kbps)) => {
+                live_bitrate_kbps.store(kbps, Ordering::Release);
+            }
+            Ok(HostCmd::RequestKeyframe) => {
+                keyframe_req.store(true, Ordering::Release);
+            }
+            Ok(HostCmd::Input(bytes)) => {
+                if let Ok(ev) = usher_proto::input::InputEvent::decode(&bytes) {
+                    input_sink.handle(ev);
+                }
+            }
+            Ok(HostCmd::AudioEnable(on)) => {
+                audio_enabled.store(on, Ordering::Release);
+            }
+            Ok(HostCmd::Shutdown) | Err(_) => {
+                break;
+            }
+        }
     }
-    if args.no_adaptive {
-        out.push("--no-adaptive".into());
+
+    worker_cancel.cancel();
+    drop(input_sink);
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = video_sup.await;
+        let _ = audio_handle.await;
+        let _ = audio_fwd.await;
+        let _ = video_fwd.await;
+        let _ = status_fwd.await;
+    })
+    .await;
+
+    drop(msg_tx);
+    drop(log_tx);
+    let _ = tokio::time::timeout(Duration::from_millis(200), writer_task).await;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_pipe_reader(
+    mut pipe_rx: tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
+) -> (
+    mpsc::Receiver<Result<windows_ipc::WorkerMsg, String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::channel(64);
+    let handle = tokio::spawn(async move {
+        loop {
+            match windows_ipc::read_worker_msg(&mut pipe_rx).await {
+                Ok(msg) => {
+                    if tx.send(Ok(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(format!("{err:#}"))).await;
+                    break;
+                }
+            }
+        }
+    });
+    (rx, handle)
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+async fn run_windows_session_supervisor(
+    initial_pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut current_session: u32,
+    host_ffmpeg_path: Option<std::path::PathBuf>,
+    audio_allowed: bool,
+    no_input: bool,
+    mut video_cfg_rx: watch::Receiver<VideoPipelineConfig>,
+    live_bitrate_kbps: Arc<AtomicU32>,
+    in_place_bitrate: Arc<AtomicBool>,
+    effective_codec_atomic: Arc<AtomicU8>,
+    status_notify: Arc<tokio::sync::Notify>,
+    video_tx: mpsc::Sender<crate::video::EncodedFrame>,
+    audio_tx: mpsc::Sender<usher_proto::audio::AudioPacket>,
+    keyframe_req: Arc<AtomicBool>,
+    peer_ready: Arc<tokio::sync::Notify>,
+    audio_enabled: Arc<AtomicBool>,
+    mut cmd_rx: mpsc::Receiver<windows_ipc::HostCmd>,
+    cancel: CancellationToken,
+) {
+    use windows_ipc::{HostCmd, WorkerMsg, write_host_cmd};
+
+    let (pipe_rx, mut pipe_tx) = tokio::io::split(initial_pipe);
+    let (mut msg_rx, mut reader_task) = spawn_pipe_reader(pipe_rx);
+
+    // Wait for first authenticated client packet while still logging pre-stream worker output.
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                reader_task.abort();
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    write_host_cmd(&mut pipe_tx, &HostCmd::Shutdown),
+                )
+                .await;
+                return;
+            }
+            _ = peer_ready.notified() => break,
+            maybe_msg = msg_rx.recv() => match maybe_msg {
+                Some(Ok(WorkerMsg::LogLine(line))) => tracing::info!("[console-worker] {line}"),
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
     }
-    if let Some(ip) = expected_client_ip {
-        out.push("--expected-client-ip".into());
-        out.push(ip.to_string());
+
+    let mut cur_cfg = video_cfg_rx.borrow_and_update().clone();
+    let mut last_bitrate = live_bitrate_kbps.load(Ordering::Acquire);
+    let mut last_audio = audio_enabled.load(Ordering::Acquire);
+    cur_cfg.bitrate_kbps = last_bitrate;
+
+    let mut needs_respawn = write_host_cmd(&mut pipe_tx, &HostCmd::StartVideo(to_worker_video_cfg(&cur_cfg)))
+        .await
+        .is_err();
+    if !needs_respawn {
+        let _ = write_host_cmd(&mut pipe_tx, &HostCmd::AudioEnable(last_audio)).await;
     }
-    if args.allow_public {
-        out.push("--allow-public".into());
+
+    let mut fast_tick = tokio::time::interval(Duration::from_millis(50));
+    fast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sess_tick = tokio::time::interval(Duration::from_millis(250));
+    sess_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        if needs_respawn {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(100),
+                write_host_cmd(&mut pipe_tx, &HostCmd::Shutdown),
+            )
+            .await;
+            reader_task.abort();
+            drop(msg_rx);
+            drop(pipe_tx);
+
+            let mut spawned = None;
+            for attempt in 0..8 {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let target = windows_session::active_console_session_id();
+                if target != 0 && target != u32::MAX {
+                    match windows_session::spawn_console_worker(
+                        target,
+                        host_ffmpeg_path.as_deref(),
+                        !audio_allowed,
+                        no_input,
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            spawned = Some(res);
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                target_session = target,
+                                "failed to attach console worker ({err:#}); retrying"
+                            );
+                        }
+                    }
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+                }
+            }
+
+            let Some((new_pipe, hello_info, new_sess)) = spawned else {
+                tracing::error!("exhausted console worker respawns; stopping video supervisor");
+                return;
+            };
+
+            current_session = new_sess;
+            tracing::info!(
+                worker_session = new_sess,
+                is_system = hello_info.is_system,
+                desktop = ?hello_info.desktop_name,
+                "Windows console worker migrated"
+            );
+            let (rx, tx) = tokio::io::split(new_pipe);
+            let (new_msg_rx, new_reader) = spawn_pipe_reader(rx);
+            msg_rx = new_msg_rx;
+            reader_task = new_reader;
+            pipe_tx = tx;
+
+            cur_cfg = video_cfg_rx.borrow_and_update().clone();
+            last_bitrate = live_bitrate_kbps.load(Ordering::Acquire);
+            last_audio = audio_enabled.load(Ordering::Acquire);
+            cur_cfg.bitrate_kbps = last_bitrate;
+            keyframe_req.store(true, Ordering::Release);
+
+            if write_host_cmd(&mut pipe_tx, &HostCmd::StartVideo(to_worker_video_cfg(&cur_cfg)))
+                .await
+                .is_err()
+            {
+                needs_respawn = true;
+                continue;
+            }
+            let _ = write_host_cmd(&mut pipe_tx, &HostCmd::AudioEnable(last_audio)).await;
+            needs_respawn = false;
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            maybe_msg = msg_rx.recv() => match maybe_msg {
+                Some(Ok(WorkerMsg::VideoFrame { keyframe, timestamp_us, data })) => {
+                    let _ = video_tx.try_send(crate::video::EncodedFrame {
+                        data,
+                        keyframe,
+                        timestamp_us,
+                    });
+                }
+                Some(Ok(WorkerMsg::AudioPacket(bytes))) => {
+                    if let Ok(pkt) = usher_proto::audio::AudioPacket::decode(&bytes) {
+                        let _ = audio_tx.try_send(pkt);
+                    }
+                }
+                Some(Ok(WorkerMsg::LogLine(line))) => {
+                    tracing::info!("[console-worker] {line}");
+                }
+                Some(Ok(WorkerMsg::CodecChanged { codec, in_place_bitrate: ip })) => {
+                    in_place_bitrate.store(ip, Ordering::Release);
+                    effective_codec_atomic.store(codec.to_u8(), Ordering::Release);
+                    status_notify.notify_one();
+                }
+                Some(Ok(WorkerMsg::HelloInfo(_))) => {}
+                Some(Err(err)) => {
+                    if !cancel.is_cancelled() {
+                        tracing::warn!("console worker pipe closed ({err}); respawning worker");
+                        needs_respawn = true;
+                    }
+                }
+                None => {
+                    if !cancel.is_cancelled() {
+                        tracing::warn!("console worker pipe reader ended; respawning worker");
+                        needs_respawn = true;
+                    }
+                }
+            },
+            res = video_cfg_rx.changed() => {
+                if res.is_ok() {
+                    cur_cfg = video_cfg_rx.borrow_and_update().clone();
+                    last_bitrate = cur_cfg.bitrate_kbps;
+                    live_bitrate_kbps.store(last_bitrate, Ordering::Release);
+                    if write_host_cmd(&mut pipe_tx, &HostCmd::StartVideo(to_worker_video_cfg(&cur_cfg))).await.is_err() {
+                        needs_respawn = true;
+                    }
+                }
+            },
+            Some(cmd) = cmd_rx.recv() => {
+                if write_host_cmd(&mut pipe_tx, &cmd).await.is_err() {
+                    needs_respawn = true;
+                }
+            },
+            _ = fast_tick.tick() => {
+                let br = live_bitrate_kbps.load(Ordering::Acquire);
+                if br != last_bitrate {
+                    last_bitrate = br;
+                    if write_host_cmd(&mut pipe_tx, &HostCmd::UpdateBitrate(br)).await.is_err() {
+                        needs_respawn = true;
+                    }
+                }
+                if keyframe_req.swap(false, Ordering::AcqRel)
+                    && write_host_cmd(&mut pipe_tx, &HostCmd::RequestKeyframe).await.is_err()
+                {
+                    needs_respawn = true;
+                }
+                let aud = audio_enabled.load(Ordering::Acquire);
+                if aud != last_audio {
+                    last_audio = aud;
+                    if write_host_cmd(&mut pipe_tx, &HostCmd::AudioEnable(aud)).await.is_err() {
+                        needs_respawn = true;
+                    }
+                }
+            },
+            _ = sess_tick.tick() => {
+                let live_sess = windows_session::active_console_session_id();
+                if live_sess != 0 && live_sess != u32::MAX && live_sess != current_session {
+                    tracing::info!(
+                        old_session = current_session,
+                        new_session = live_sess,
+                        "active Windows console session changed; migrating worker"
+                    );
+                    needs_respawn = true;
+                }
+            }
+        }
     }
-    if args.no_audio {
-        out.push("--no-audio".into());
-    }
-    if args.no_input {
-        out.push("--no-input".into());
-    }
-    out
+
+    reader_task.abort();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(120),
+        write_host_cmd(&mut pipe_tx, &HostCmd::Shutdown),
+    )
+    .await;
 }
 
 #[cfg(test)]

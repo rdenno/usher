@@ -1,5 +1,6 @@
 use super::InputSink;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use usher_proto::input::{InputEvent, MouseButton};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -12,11 +13,55 @@ use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
 static WARNED_GAMEPAD: AtomicBool = AtomicBool::new(false);
 
-pub struct Win32InputSink;
+pub struct Win32InputSink {
+    tx: Option<std::sync::mpsc::SyncSender<InputEvent>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Win32InputSink {
     pub fn new() -> Self {
-        Self
+        let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent>(256);
+        let handle = std::thread::Builder::new()
+            .name("usher-win32-input".into())
+            .spawn(move || {
+                use windows::Win32::System::StationsAndDesktops::{
+                    CloseDesktop, GetThreadDesktop, HDESK, SetThreadDesktop,
+                };
+                use windows::Win32::System::Threading::GetCurrentThreadId;
+
+                let orig_desk = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok();
+                let mut prev_desk: Option<HDESK> = None;
+                let mut last_attach = Instant::now() - Duration::from_secs(1);
+
+                while let Ok(event) = rx.recv() {
+                    if last_attach.elapsed() >= Duration::from_millis(200) {
+                        crate::windows_session::switch_thread_to_input_desktop(&mut prev_desk);
+                        last_attach = Instant::now();
+                    }
+                    dispatch_input_event(event, &mut prev_desk, &mut last_attach);
+                }
+
+                if let Some(old) = prev_desk.take() {
+                    if let Some(orig) = orig_desk {
+                        let _ = unsafe { SetThreadDesktop(orig) };
+                    }
+                    let _ = unsafe { CloseDesktop(old) };
+                }
+            })
+            .ok();
+        Self {
+            tx: handle.as_ref().map(|_| tx),
+            handle,
+        }
+    }
+}
+
+impl Drop for Win32InputSink {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -71,31 +116,52 @@ pub fn evdev_to_win32_scancode(evdev_code: u16) -> Option<(u16, bool)> {
     Some(pair)
 }
 
-fn send_single(input: INPUT) {
+fn send_single(
+    input: INPUT,
+    prev_desk: &mut Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+    last_attach: &mut Instant,
+) {
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
-        tracing::debug!("Win32 SendInput returned 0 (desktop may be UAC/lock-screen protected)");
+        crate::windows_session::switch_thread_to_input_desktop(prev_desk);
+        *last_attach = Instant::now();
+        let retry = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if retry == 0 {
+            tracing::debug!("Win32 SendInput returned 0 after desktop reattach");
+        }
     }
 }
 
 impl InputSink for Win32InputSink {
     fn handle(&mut self, event: InputEvent) {
-        match event {
-            InputEvent::Key {
-                evdev_code,
-                pressed,
-            } => {
-                let Some((scan, extended)) = evdev_to_win32_scancode(evdev_code) else {
-                    return;
-                };
-                let mut flags = KEYEVENTF_SCANCODE;
-                if extended {
-                    flags |= KEYEVENTF_EXTENDEDKEY;
-                }
-                if !pressed {
-                    flags |= KEYEVENTF_KEYUP;
-                }
-                send_single(INPUT {
+        if let Some(ref tx) = self.tx {
+            let _ = tx.try_send(event);
+        }
+    }
+}
+
+fn dispatch_input_event(
+    event: InputEvent,
+    prev_desk: &mut Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+    last_attach: &mut Instant,
+) {
+    match event {
+        InputEvent::Key {
+            evdev_code,
+            pressed,
+        } => {
+            let Some((scan, extended)) = evdev_to_win32_scancode(evdev_code) else {
+                return;
+            };
+            let mut flags = KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            if !pressed {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            send_single(
+                INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 {
                         ki: KEYBDINPUT {
@@ -106,10 +172,14 @@ impl InputSink for Win32InputSink {
                             dwExtraInfo: 0,
                         },
                     },
-                });
-            }
-            InputEvent::MouseMoveRel { dx, dy } => {
-                send_single(INPUT {
+                },
+                prev_desk,
+                last_attach,
+            );
+        }
+        InputEvent::MouseMoveRel { dx, dy } => {
+            send_single(
+                INPUT {
                     r#type: INPUT_MOUSE,
                     Anonymous: INPUT_0 {
                         mi: MOUSEINPUT {
@@ -121,10 +191,14 @@ impl InputSink for Win32InputSink {
                             dwExtraInfo: 0,
                         },
                     },
-                });
-            }
-            InputEvent::MouseMoveAbs { x, y } => {
-                send_single(INPUT {
+                },
+                prev_desk,
+                last_attach,
+            );
+        }
+        InputEvent::MouseMoveAbs { x, y } => {
+            send_single(
+                INPUT {
                     r#type: INPUT_MOUSE,
                     Anonymous: INPUT_0 {
                         mi: MOUSEINPUT {
@@ -136,22 +210,26 @@ impl InputSink for Win32InputSink {
                             dwExtraInfo: 0,
                         },
                     },
-                });
-            }
-            InputEvent::MouseButton { button, pressed } => {
-                let (flags, data) = match (button, pressed) {
-                    (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
-                    (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
-                    (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
-                    (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
-                    (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
-                    (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
-                    (MouseButton::Side, true) => (MOUSEEVENTF_XDOWN, 1),
-                    (MouseButton::Side, false) => (MOUSEEVENTF_XUP, 1),
-                    (MouseButton::Extra, true) => (MOUSEEVENTF_XDOWN, 2),
-                    (MouseButton::Extra, false) => (MOUSEEVENTF_XUP, 2),
-                };
-                send_single(INPUT {
+                },
+                prev_desk,
+                last_attach,
+            );
+        }
+        InputEvent::MouseButton { button, pressed } => {
+            let (flags, data) = match (button, pressed) {
+                (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+                (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
+                (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+                (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
+                (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+                (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+                (MouseButton::Side, true) => (MOUSEEVENTF_XDOWN, 1),
+                (MouseButton::Side, false) => (MOUSEEVENTF_XUP, 1),
+                (MouseButton::Extra, true) => (MOUSEEVENTF_XDOWN, 2),
+                (MouseButton::Extra, false) => (MOUSEEVENTF_XUP, 2),
+            };
+            send_single(
+                INPUT {
                     r#type: INPUT_MOUSE,
                     Anonymous: INPUT_0 {
                         mi: MOUSEINPUT {
@@ -163,11 +241,15 @@ impl InputSink for Win32InputSink {
                             dwExtraInfo: 0,
                         },
                     },
-                });
-            }
-            InputEvent::MouseWheel { dx, dy } => {
-                if dy != 0 {
-                    send_single(INPUT {
+                },
+                prev_desk,
+                last_attach,
+            );
+        }
+        InputEvent::MouseWheel { dx, dy } => {
+            if dy != 0 {
+                send_single(
+                    INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
@@ -179,10 +261,14 @@ impl InputSink for Win32InputSink {
                                 dwExtraInfo: 0,
                             },
                         },
-                    });
-                }
-                if dx != 0 {
-                    send_single(INPUT {
+                    },
+                    prev_desk,
+                    last_attach,
+                );
+            }
+            if dx != 0 {
+                send_single(
+                    INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
@@ -194,15 +280,17 @@ impl InputSink for Win32InputSink {
                                 dwExtraInfo: 0,
                             },
                         },
-                    });
-                }
+                    },
+                    prev_desk,
+                    last_attach,
+                );
             }
-            InputEvent::GamepadState { .. } => {
-                if !WARNED_GAMEPAD.swap(true, Ordering::Relaxed) {
-                    tracing::info!(
-                        "received gamepad input on Windows host (virtual Xbox controller on Windows requires ViGEmBus; keyboard & mouse work natively)"
-                    );
-                }
+        }
+        InputEvent::GamepadState { .. } => {
+            if !WARNED_GAMEPAD.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "received gamepad input on Windows host (virtual Xbox controller on Windows requires ViGEmBus; keyboard & mouse work natively)"
+                );
             }
         }
     }

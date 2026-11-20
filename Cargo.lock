@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "usher-client"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "usher-host"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2694,6 +2694,8 @@ dependencies = [
  "openh264",
  "openh264-sys2",
  "rusty-opus",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2704,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "usher-proto"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",

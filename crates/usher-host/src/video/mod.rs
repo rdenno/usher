@@ -27,6 +27,32 @@ pub enum CaptureSource {
     Testsrc,
 }
 
+impl CaptureSource {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Drm => "drm",
+            Self::Pipewire => "pipewire",
+            Self::X11 => "x11",
+            Self::Dxgi => "dxgi",
+            Self::Testsrc => "testsrc",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_str_name(s: &str) -> Self {
+        match s {
+            "drm" => Self::Drm,
+            "pipewire" => Self::Pipewire,
+            "x11" => Self::X11,
+            "dxgi" => Self::Dxgi,
+            "testsrc" => Self::Testsrc,
+            _ => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EncoderKind {
     Auto,
@@ -35,6 +61,32 @@ pub enum EncoderKind {
     Amf,
     Qsv,
     Openh264,
+}
+
+impl EncoderKind {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Vaapi => "vaapi",
+            Self::Nvenc => "nvenc",
+            Self::Amf => "amf",
+            Self::Qsv => "qsv",
+            Self::Openh264 => "openh264",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_str_name(s: &str) -> Self {
+        match s {
+            "vaapi" => Self::Vaapi,
+            "nvenc" => Self::Nvenc,
+            "amf" => Self::Amf,
+            "qsv" => Self::Qsv,
+            "openh264" => Self::Openh264,
+            _ => Self::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +282,7 @@ pub fn spawn_video_task(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_one_backend(
+pub(crate) async fn run_one_backend(
     mut cfg: VideoPipelineConfig,
     backend: ResolvedBackend,
     live_bitrate_kbps: Arc<AtomicU32>,

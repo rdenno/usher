@@ -60,7 +60,7 @@ Host desktop
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-- **Windows hosts**: Enable OpenSSH Server (`sshd`), authorize your key (`C:\ProgramData\ssh\administrators_authorized_keys` for admin users or `%USERPROFILE%\.ssh\authorized_keys`), and select **Host** or **Client + Host** in the installer. `usher-host` automatically bridges Session 0 SSH shells into your active desktop session (`InteractiveToken`).
+- **Windows hosts**: Enable OpenSSH Server (`sshd`), authorize your key (`C:\ProgramData\ssh\administrators_authorized_keys` for admin users or `%USERPROFILE%\.ssh\authorized_keys`), and select **Host** or **Client + Host** in the installer. `usher-host` automatically attaches to the active console session—capturing the Lock Screen (`Winlogon`) and UAC prompts as `NT AUTHORITY\SYSTEM` for Administrator SSH accounts and seamlessly following unlock transitions (`Session 2 -> Session 1`) without dropping the stream.
 
 ### 3. Connect
 

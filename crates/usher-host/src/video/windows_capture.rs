@@ -10,16 +10,14 @@ use openh264::encoder::{
 use openh264::formats::YUVSource;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use usher_proto::annexb::{AnnexBSplitter, is_keyframe_annexb};
 use usher_proto::handshake::{DisplayInfo, QualityPreference, VideoCodec};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HMODULE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
@@ -74,6 +72,8 @@ pub fn primary_monitor_resolution() -> Option<(u16, u16)> {
 struct EnumeratedDisplay {
     info: DisplayInfo,
     adapter: IDXGIAdapter1,
+    adapter_idx: u32,
+    adapter_vendor: Option<WinHwVendor>,
     output_idx: u32,
 }
 
@@ -86,7 +86,9 @@ fn enumerate_windows_adapters_and_outputs() -> (Vec<WinHwVendor>, Vec<Enumerated
         };
         let mut adapter_idx = 0u32;
         while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
+            let cur_adapter_idx = adapter_idx;
             adapter_idx += 1;
+            let mut cur_vendor = None;
             if let Ok(desc) = adapter.GetDesc1() {
                 let vendor = match desc.VendorId {
                     0x10DE => Some(WinHwVendor::Nvenc),
@@ -94,6 +96,7 @@ fn enumerate_windows_adapters_and_outputs() -> (Vec<WinHwVendor>, Vec<Enumerated
                     0x8086 => Some(WinHwVendor::Qsv),
                     _ => None,
                 };
+                cur_vendor = vendor;
                 if let Some(v) = vendor
                     && !vendors.contains(&v)
                 {
@@ -132,6 +135,8 @@ fn enumerate_windows_adapters_and_outputs() -> (Vec<WinHwVendor>, Vec<Enumerated
                                     height: (h as u16) & !1,
                                 },
                                 adapter: adapter.clone(),
+                                adapter_idx: cur_adapter_idx,
+                                adapter_vendor: cur_vendor,
                                 output_idx,
                             });
                         }
@@ -164,22 +169,107 @@ pub fn has_attached_dxgi_output() -> bool {
     !enumerate_windows_adapters_and_outputs().1.is_empty()
 }
 
-#[allow(dead_code)]
-pub fn display_resolution(display_index: u8) -> Option<(u16, u16)> {
-    let displays = enumerate_displays();
-    displays
-        .iter()
-        .find(|d| d.index == display_index)
-        .or_else(|| displays.first())
-        .map(|d| (d.width, d.height))
+struct DisplayTarget {
+    adapter_idx: u32,
+    adapter_vendor: Option<WinHwVendor>,
+    output_idx: u32,
+    width: u16,
+    height: u16,
+}
+
+fn resolve_display_target(display_index: u8) -> DisplayTarget {
+    crate::windows_session::with_input_desktop(|_| {
+        let (_, displays) = enumerate_windows_adapters_and_outputs();
+        if let Some(d) = displays
+            .iter()
+            .find(|d| d.info.index == display_index)
+            .or_else(|| displays.first())
+        {
+            DisplayTarget {
+                adapter_idx: d.adapter_idx,
+                adapter_vendor: d.adapter_vendor,
+                output_idx: d.output_idx,
+                width: d.info.width,
+                height: d.info.height,
+            }
+        } else {
+            let (w, h) = primary_monitor_resolution().unwrap_or((1920, 1080));
+            DisplayTarget {
+                adapter_idx: 0,
+                adapter_vendor: None,
+                output_idx: display_index as u32,
+                width: w,
+                height: h,
+            }
+        }
+    })
+}
+
+fn wake_console_display() {
+    use windows::Win32::System::Power::{
+        ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput,
+    };
+    unsafe {
+        let _ = SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    }
+    crate::windows_session::with_input_desktop(|_| unsafe {
+        let nudge = [
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 1,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: -1,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+        ];
+        let _ = SendInput(&nudge, std::mem::size_of::<INPUT>() as i32);
+    });
+}
+
+static EXPLICIT_FFMPEG: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_explicit_ffmpeg_path(path: PathBuf) {
+    let _ = EXPLICIT_FFMPEG.set(path);
 }
 
 fn find_working_ffmpeg() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = EXPLICIT_FFMPEG.get() {
+        candidates.push(p.clone());
+    }
     if let Some(p) = std::env::var_os("USHER_FFMPEG") {
         candidates.push(PathBuf::from(p));
     }
-    candidates.push(PathBuf::from("ffmpeg"));
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let bin = dir.join("ffmpeg.exe");
+            if bin.exists() {
+                candidates.push(bin);
+            }
+        }
+    }
 
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         let scoop_ffmpeg = PathBuf::from(profile).join("scoop").join("apps").join("ffmpeg");
@@ -196,6 +286,8 @@ fn find_working_ffmpeg() -> Option<PathBuf> {
         }
     }
 
+    candidates.push(PathBuf::from("ffmpeg"));
+
     for cand in candidates {
         if let Ok(out) = std::process::Command::new(&cand)
             .args(["-hide_banner", "-version"])
@@ -211,6 +303,15 @@ fn find_working_ffmpeg() -> Option<PathBuf> {
     None
 }
 
+pub fn find_working_ffmpeg_absolute() -> Option<PathBuf> {
+    let p = find_working_ffmpeg()?;
+    if p.is_absolute() {
+        Some(p)
+    } else {
+        std::fs::canonicalize(&p).ok().or(Some(p))
+    }
+}
+
 fn query_ffmpeg_caps(ffmpeg: &Path) -> Option<(bool, String)> {
     let filters = std::process::Command::new(ffmpeg)
         .args(["-hide_banner", "-filters"])
@@ -220,7 +321,7 @@ fn query_ffmpeg_caps(ffmpeg: &Path) -> Option<(bool, String)> {
         .output()
         .ok()?;
     let f_text = String::from_utf8_lossy(&filters.stdout);
-    let has_ddagrab = f_text.contains("ddagrab") && f_text.contains("scale_d3d11");
+    let has_ddagrab = f_text.contains("ddagrab");
     if !has_ddagrab {
         return Some((false, String::new()));
     }
@@ -393,238 +494,561 @@ async fn run_ddagrab_hw(
         VideoCodec::Av1 => "ivf",
     };
 
-    let filter = format!(
-        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1,scale_d3d11=width={}:height={}:format=nv12",
-        cfg.display_index, cfg.fps, cfg.width, cfg.height
-    );
+    wake_console_display();
+    let target = resolve_display_target(cfg.display_index);
+    let native_matches = target.width == cfg.width && target.height == cfg.height;
+    let same_gpu = target.adapter_vendor == Some(vendor);
+    let need_cuda_device = vendor == WinHwVendor::Nvenc && !same_gpu;
+    let filter_candidates: Vec<String> = if native_matches && same_gpu {
+        vec![
+            format!(
+                "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1",
+                target.output_idx, cfg.fps
+            ),
+            format!(
+                "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1,hwdownload,format=bgra,format=nv12",
+                target.output_idx, cfg.fps
+            ),
+        ]
+    } else if native_matches {
+        vec![format!(
+            "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1,hwdownload,format=bgra,format=nv12",
+            target.output_idx, cfg.fps
+        )]
+    } else {
+        vec![format!(
+            "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1,hwdownload,format=bgra,scale={}:{}:flags=fast_bilinear,format=nv12",
+            target.output_idx, cfg.fps, cfg.width, cfg.height
+        )]
+    };
 
-    let mut args = vec![
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "warning".to_string(),
-        "-fflags".to_string(),
-        "nobuffer".to_string(),
-        "-init_hw_device".to_string(),
-        "d3d11va".to_string(),
-        "-filter_hw_device".to_string(),
-        "d3d11va".to_string(),
-        "-filter_complex".to_string(),
-        filter,
-        "-c:v".to_string(),
-        encoder_name.to_string(),
-    ];
-
-    match vendor {
-        WinHwVendor::Nvenc => {
-            let preset = match cfg.prefer {
-                QualityPreference::Latency => "p1",
-                QualityPreference::Quality => "p4",
-            };
-            let tune = match cfg.prefer {
-                QualityPreference::Latency => "ull",
-                QualityPreference::Quality => "ll",
-            };
-            args.extend([
-                "-preset".into(),
-                preset.into(),
-                "-tune".into(),
-                tune.into(),
-                "-zerolatency".into(),
-                "1".into(),
-                "-bf".into(),
-                "0".into(),
-                "-forced-idr".into(),
-                "1".into(),
-                "-rc".into(),
-                "cbr".into(),
-                "-b:v".into(),
-                br.clone(),
-                "-maxrate".into(),
-                br,
-                "-bufsize".into(),
-                bufsize,
-                "-g".into(),
-                gop,
-            ]);
-            if matches!(cfg.codec, VideoCodec::H264 | VideoCodec::Hevc) {
-                args.extend(["-aud".into(), "1".into()]);
-            }
+    let build_args = |filter: &str| -> Vec<String> {
+        let mut args = vec![
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "warning".to_string(),
+            "-fflags".to_string(),
+            "nobuffer".to_string(),
+            "-init_hw_device".to_string(),
+            format!("d3d11va=dx:{}", target.adapter_idx),
+        ];
+        if need_cuda_device {
+            args.extend(["-init_hw_device".into(), "cuda=cu".into()]);
         }
-        WinHwVendor::Amf => {
-            let (usage, quality) = match cfg.prefer {
-                QualityPreference::Latency => ("ultralowlatency", "speed"),
-                QualityPreference::Quality => ("lowlatency", "balanced"),
-            };
-            args.extend([
-                "-usage".into(),
-                usage.into(),
-                "-quality".into(),
-                quality.into(),
-                "-rc".into(),
-                "cbr".into(),
-                "-b:v".into(),
-                br.clone(),
-                "-maxrate".into(),
-                br,
-                "-bufsize".into(),
-                bufsize,
-                "-bf".into(),
-                "0".into(),
-                "-g".into(),
-                gop,
-            ]);
-        }
-        WinHwVendor::Qsv => {
-            let preset = match cfg.prefer {
-                QualityPreference::Latency => "veryfast",
-                QualityPreference::Quality => "balanced",
-            };
-            args.extend([
-                "-preset".into(),
-                preset.into(),
-                "-low_power".into(),
-                "1".into(),
-                "-bf".into(),
-                "0".into(),
-                "-b:v".into(),
-                br.clone(),
-                "-maxrate".into(),
-                br,
-                "-bufsize".into(),
-                bufsize,
-                "-g".into(),
-                gop,
-            ]);
-        }
-    }
+        args.extend([
+            "-filter_hw_device".to_string(),
+            "dx".to_string(),
+            "-filter_complex".to_string(),
+            filter.to_string(),
+            "-c:v".to_string(),
+            encoder_name.to_string(),
+        ]);
 
-    args.extend(["-f".into(), out_fmt.into(), "pipe:1".into()]);
-
-    let mut child = Command::new(&ffmpeg_path)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to spawn Windows ddagrab ffmpeg pipeline")?;
-
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("ffmpeg missing stdout"))?;
-
-    let stderr_tail = Arc::new(std::sync::Mutex::new(
-        std::collections::VecDeque::<String>::with_capacity(8),
-    ));
-    let stderr_task = child.stderr.take().map(|stderr| {
-        let tail = stderr_tail.clone();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::warn!("[ddagrab] {line}");
-                if let Ok(mut g) = tail.lock() {
-                    if g.len() >= 8 {
-                        g.pop_front();
-                    }
-                    g.push_back(line);
-                }
-            }
-        })
-    });
-
-    let mut buf = vec![0u8; 64 * 1024];
-    match cfg.codec {
-        VideoCodec::H264 | VideoCodec::Hevc => {
-            let mut splitter = AnnexBSplitter::new(cfg.codec);
-            loop {
-                let n = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        let _ = child.kill().await;
-                        return Ok(());
-                    }
-                    res = stdout.read(&mut buf) => res.context("reading ddagrab stdout")?
+        match vendor {
+            WinHwVendor::Nvenc => {
+                let preset = match cfg.prefer {
+                    QualityPreference::Latency => "p1",
+                    QualityPreference::Quality => "p4",
                 };
-                if n == 0 {
-                    for au in splitter.flush() {
-                        let ts_us = start.elapsed().as_micros() as u32;
-                        let key = au.keyframe || is_keyframe_annexb(cfg.codec, &au.data);
-                        let _ = tx.try_send(EncodedFrame {
-                            data: au.data,
-                            keyframe: key,
-                            timestamp_us: ts_us,
-                        });
-                    }
-                    return Err(
-                        ddagrab_exit_error(child, stderr_task, &stderr_tail, "ddagrab pipeline exited")
-                            .await,
-                    );
-                }
-                for au in splitter.push_bytes(&buf[..n]) {
-                    let _ = keyframe_req.swap(false, Ordering::AcqRel);
-                    let ts_us = start.elapsed().as_micros() as u32;
-                    let key = au.keyframe || is_keyframe_annexb(cfg.codec, &au.data);
-                    let _ = tx.try_send(EncodedFrame {
-                        data: au.data,
-                        keyframe: key,
-                        timestamp_us: ts_us,
-                    });
+                let tune = match cfg.prefer {
+                    QualityPreference::Latency => "ull",
+                    QualityPreference::Quality => "ll",
+                };
+                args.extend([
+                    "-preset".into(),
+                    preset.into(),
+                    "-tune".into(),
+                    tune.into(),
+                    "-zerolatency".into(),
+                    "1".into(),
+                    "-bf".into(),
+                    "0".into(),
+                    "-forced-idr".into(),
+                    "1".into(),
+                    "-rc".into(),
+                    "cbr".into(),
+                    "-b:v".into(),
+                    br.clone(),
+                    "-maxrate".into(),
+                    br.clone(),
+                    "-bufsize".into(),
+                    bufsize.clone(),
+                    "-g".into(),
+                    gop.clone(),
+                ]);
+                if matches!(cfg.codec, VideoCodec::H264 | VideoCodec::Hevc) {
+                    args.extend(["-aud".into(), "1".into()]);
                 }
             }
-        }
-        VideoCodec::Av1 => {
-            let mut ivf = IvfReader::default();
-            loop {
-                let n = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        let _ = child.kill().await;
-                        return Ok(());
-                    }
-                    res = stdout.read(&mut buf) => res.context("reading ddagrab AV1 stdout")?
+            WinHwVendor::Amf => {
+                let (usage, quality) = match cfg.prefer {
+                    QualityPreference::Latency => ("ultralowlatency", "speed"),
+                    QualityPreference::Quality => ("lowlatency", "balanced"),
                 };
-                if n == 0 {
-                    return Err(ddagrab_exit_error(
-                        child,
-                        stderr_task,
-                        &stderr_tail,
-                        "ddagrab AV1 pipeline exited",
-                    )
-                    .await);
+                args.extend([
+                    "-usage".into(),
+                    usage.into(),
+                    "-quality".into(),
+                    quality.into(),
+                    "-rc".into(),
+                    "cbr".into(),
+                    "-b:v".into(),
+                    br.clone(),
+                    "-maxrate".into(),
+                    br.clone(),
+                    "-bufsize".into(),
+                    bufsize.clone(),
+                    "-bf".into(),
+                    "0".into(),
+                    "-g".into(),
+                    gop.clone(),
+                ]);
+            }
+            WinHwVendor::Qsv => {
+                let preset = match cfg.prefer {
+                    QualityPreference::Latency => "veryfast",
+                    QualityPreference::Quality => "balanced",
+                };
+                args.extend([
+                    "-preset".into(),
+                    preset.into(),
+                    "-low_power".into(),
+                    "1".into(),
+                    "-bf".into(),
+                    "0".into(),
+                    "-b:v".into(),
+                    br.clone(),
+                    "-maxrate".into(),
+                    br.clone(),
+                    "-bufsize".into(),
+                    bufsize.clone(),
+                    "-g".into(),
+                    gop.clone(),
+                ]);
+            }
+        }
+
+        args.extend([
+            "-flush_packets".into(),
+            "1".into(),
+            "-f".into(),
+            out_fmt.into(),
+            "pipe:1".into(),
+        ]);
+        args
+    };
+
+    let mut desktop_switches = 0u32;
+    let mut filter_idx = 0usize;
+    'restart: loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let args = build_args(&filter_candidates[filter_idx]);
+        let launched_desktop = crate::windows_session::current_input_desktop_name();
+        let desk_label = launched_desktop.as_deref().unwrap_or("Default");
+        tracing::info!(
+            adapter_idx = target.adapter_idx,
+            output_idx = target.output_idx,
+            desktop = desk_label,
+            filter = %filter_candidates[filter_idx],
+            "spawning ddagrab ffmpeg"
+        );
+        let (mut proc_handle, mut stdout_file, stderr_file) =
+            WinDesktopChild::spawn(&ffmpeg_path, &args, desk_label)
+                .context("failed to spawn Windows ddagrab ffmpeg pipeline")?;
+
+        let stderr_tail = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::with_capacity(8),
+        ));
+        let stderr_tail_cb = stderr_tail.clone();
+        let stderr_thread = std::thread::Builder::new()
+            .name("usher-ddagrab-err".into())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let mut reader = BufReader::new(stderr_file);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line) {
+                    if n == 0 {
+                        break;
+                    }
+                    let msg = line.trim_end().to_string();
+                    if !msg.is_empty() {
+                        tracing::warn!("[ddagrab] {msg}");
+                        if let Ok(mut g) = stderr_tail_cb.lock() {
+                            if g.len() >= 8 {
+                                g.pop_front();
+                            }
+                            g.push_back(msg);
+                        }
+                    }
+                    line.clear();
                 }
-                for frame in ivf.push_bytes(&buf[..n])? {
-                    let _ = keyframe_req.swap(false, Ordering::AcqRel);
-                    let ts_us = start.elapsed().as_micros() as u32;
-                    let _ = tx.try_send(EncodedFrame {
-                        data: frame,
-                        keyframe: false,
-                        timestamp_us: ts_us,
-                    });
+            })
+            .ok();
+
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(8);
+        let stdout_thread = std::thread::Builder::new()
+            .name("usher-ddagrab-out".into())
+            .spawn(move || {
+                use std::io::Read;
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match stdout_file.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if chunk_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        let mut desk_tick = tokio::time::interval(Duration::from_millis(300));
+        desk_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut splitter = match cfg.codec {
+            VideoCodec::H264 | VideoCodec::Hevc => Some(AnnexBSplitter::new(cfg.codec)),
+            VideoCodec::Av1 => None,
+        };
+        let mut ivf = match cfg.codec {
+            VideoCodec::Av1 => Some(IvfReader::default()),
+            VideoCodec::H264 | VideoCodec::Hevc => None,
+        };
+        let mut emitted_any_frame = false;
+        let mut stdout_bytes = 0usize;
+        let mut no_frame_ticks = 0u32;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    proc_handle.kill();
+                    drop(chunk_rx);
+                    if let Some(h) = stdout_thread {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = stderr_thread {
+                        let _ = h.join();
+                    }
+                    return Ok(());
+                }
+                _ = desk_tick.tick() => {
+                    let cur_desk = crate::windows_session::current_input_desktop_name();
+                    if cur_desk.is_some() && cur_desk != launched_desktop {
+                        tracing::info!(
+                            old = ?launched_desktop,
+                            new = ?cur_desk,
+                            "Windows desktop switched; restarting ddagrab on new desktop"
+                        );
+                        proc_handle.kill();
+                        drop(chunk_rx);
+                        if let Some(h) = stdout_thread {
+                            let _ = h.join();
+                        }
+                        if let Some(h) = stderr_thread {
+                            let _ = h.join();
+                        }
+                        desktop_switches += 1;
+                        continue 'restart;
+                    }
+                    if !emitted_any_frame {
+                        no_frame_ticks += 1;
+                        if no_frame_ticks <= 4 {
+                            wake_console_display();
+                        }
+                        if no_frame_ticks >= 12 {
+                            proc_handle.kill();
+                            drop(chunk_rx);
+                            if let Some(h) = stdout_thread {
+                                let _ = h.join();
+                            }
+                            if let Some(h) = stderr_thread {
+                                let _ = h.join();
+                            }
+                            tracing::warn!(
+                                stdout_bytes,
+                                filter = %filter_candidates[filter_idx],
+                                desktop = desk_label,
+                                "ddagrab produced 0 frames within startup window"
+                            );
+                            if filter_idx + 1 < filter_candidates.len() {
+                                filter_idx += 1;
+                                continue 'restart;
+                            }
+                            return Err(ddagrab_exit_error(
+                                None,
+                                &stderr_tail,
+                                "ddagrab timed out waiting for first frame",
+                            ));
+                        }
+                    }
+                }
+                maybe_chunk = chunk_rx.recv() => {
+                    let Some(chunk) = maybe_chunk else {
+                        if let Some(ref mut sp) = splitter {
+                            for au in sp.flush() {
+                                let ts_us = start.elapsed().as_micros() as u32;
+                                let key = au.keyframe || is_keyframe_annexb(cfg.codec, &au.data);
+                                let _ = tx.try_send(EncodedFrame {
+                                    data: au.data,
+                                    keyframe: key,
+                                    timestamp_us: ts_us,
+                                });
+                            }
+                        }
+                        let exit_code = proc_handle.wait_exit_code(500);
+                        if let Some(h) = stdout_thread {
+                            let _ = h.join();
+                        }
+                        if let Some(h) = stderr_thread {
+                            let _ = h.join();
+                        }
+
+                        let cur_desk = crate::windows_session::current_input_desktop_name();
+                        if cur_desk != launched_desktop && desktop_switches < 3 {
+                            tracing::info!(
+                                old = ?launched_desktop,
+                                new = ?cur_desk,
+                                "ddagrab exited during desktop switch; restarting on new desktop"
+                            );
+                            desktop_switches += 1;
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            continue 'restart;
+                        }
+
+                        if !emitted_any_frame && filter_idx + 1 < filter_candidates.len() {
+                            let err_summary = ddagrab_exit_error(exit_code, &stderr_tail, "ddagrab filter failed");
+                            tracing::warn!(
+                                failed_filter = %filter_candidates[filter_idx],
+                                next_filter = %filter_candidates[filter_idx + 1],
+                                error = %err_summary,
+                                "retrying ddagrab with fallback filter while keeping hardware encoder"
+                            );
+                            filter_idx += 1;
+                            continue 'restart;
+                        }
+
+                        let label = if cfg.codec == VideoCodec::Av1 {
+                            "ddagrab AV1 pipeline exited"
+                        } else {
+                            "ddagrab pipeline exited"
+                        };
+                        return Err(ddagrab_exit_error(exit_code, &stderr_tail, label));
+                    };
+
+                    stdout_bytes += chunk.len();
+                    if let Some(ref mut sp) = splitter {
+                        for au in sp.push_bytes(&chunk) {
+                            desktop_switches = 0;
+                            if !emitted_any_frame {
+                                emitted_any_frame = true;
+                                tracing::info!(
+                                    codec = %cfg.codec,
+                                    first_frame_bytes = au.data.len(),
+                                    "ddagrab hardware pipeline streaming"
+                                );
+                            }
+                            let _ = keyframe_req.swap(false, Ordering::AcqRel);
+                            let ts_us = start.elapsed().as_micros() as u32;
+                            let key = au.keyframe || is_keyframe_annexb(cfg.codec, &au.data);
+                            let _ = tx.try_send(EncodedFrame {
+                                data: au.data,
+                                keyframe: key,
+                                timestamp_us: ts_us,
+                            });
+                        }
+                    } else if let Some(ref mut ivf_reader) = ivf {
+                        for frame in ivf_reader.push_bytes(&chunk)? {
+                            desktop_switches = 0;
+                            if !emitted_any_frame {
+                                emitted_any_frame = true;
+                                tracing::info!(
+                                    codec = %cfg.codec,
+                                    first_frame_bytes = frame.len(),
+                                    "ddagrab hardware pipeline streaming"
+                                );
+                            }
+                            let _ = keyframe_req.swap(false, Ordering::AcqRel);
+                            let ts_us = start.elapsed().as_micros() as u32;
+                            let _ = tx.try_send(EncodedFrame {
+                                data: frame,
+                                keyframe: false,
+                                timestamp_us: ts_us,
+                            });
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-async fn ddagrab_exit_error(
-    mut child: tokio::process::Child,
-    stderr_task: Option<tokio::task::JoinHandle<()>>,
+struct ProcessHandle(isize);
+
+impl ProcessHandle {
+    fn raw(&self) -> HANDLE {
+        HANDLE(self.0 as *mut core::ffi::c_void)
+    }
+
+    fn kill(&mut self) {
+        if self.0 != 0 {
+            unsafe {
+                let _ = windows::Win32::System::Threading::TerminateProcess(self.raw(), 1);
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(self.raw(), 500);
+            }
+        }
+    }
+
+    fn wait_exit_code(&mut self, timeout_ms: u32) -> Option<u32> {
+        if self.0 == 0 {
+            return None;
+        }
+        unsafe {
+            let _ = windows::Win32::System::Threading::WaitForSingleObject(self.raw(), timeout_ms);
+            let mut code = 0u32;
+            if windows::Win32::System::Threading::GetExitCodeProcess(self.raw(), &mut code).is_ok()
+            {
+                Some(code)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe {
+                let _ = windows::Win32::System::Threading::TerminateProcess(self.raw(), 1);
+                let _ = CloseHandle(self.raw());
+            }
+            self.0 = 0;
+        }
+    }
+}
+
+struct WinDesktopChild;
+
+impl WinDesktopChild {
+    fn spawn(
+        exe: &Path,
+        args: &[String],
+        desktop_name: &str,
+    ) -> Result<(ProcessHandle, std::fs::File, std::fs::File)> {
+        use std::os::windows::io::FromRawHandle;
+        use windows::Win32::Foundation::SetHandleInformation;
+        use windows::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows::Win32::System::Pipes::CreatePipe;
+        use windows::Win32::System::Threading::{
+            CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOW,
+        };
+        use windows::core::{PCWSTR, PWSTR};
+
+        unsafe {
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: std::ptr::null_mut(),
+                bInheritHandle: true.into(),
+            };
+
+            let mut in_r = HANDLE::default();
+            let mut in_w = HANDLE::default();
+            CreatePipe(&mut in_r, &mut in_w, Some(&sa), 0)
+                .context("CreatePipe stdin for ddagrab failed")?;
+
+            let mut out_r = HANDLE::default();
+            let mut out_w = HANDLE::default();
+            if let Err(e) = CreatePipe(&mut out_r, &mut out_w, Some(&sa), 0) {
+                let _ = CloseHandle(in_r);
+                let _ = CloseHandle(in_w);
+                return Err(e).context("CreatePipe stdout for ddagrab failed");
+            }
+
+            let mut err_r = HANDLE::default();
+            let mut err_w = HANDLE::default();
+            if let Err(e) = CreatePipe(&mut err_r, &mut err_w, Some(&sa), 0) {
+                let _ = CloseHandle(in_r);
+                let _ = CloseHandle(in_w);
+                let _ = CloseHandle(out_r);
+                let _ = CloseHandle(out_w);
+                return Err(e).context("CreatePipe stderr for ddagrab failed");
+            }
+
+            let _ = SetHandleInformation(in_w, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+            let _ = SetHandleInformation(out_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+            let _ = SetHandleInformation(err_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+
+            let mut parts = vec![crate::windows_session::quote_win_arg(&exe.to_string_lossy())];
+            parts.extend(args.iter().map(|a| crate::windows_session::quote_win_arg(a)));
+            let cmd_str = parts.join(" ");
+            let mut cmd_wide: Vec<u16> = cmd_str.encode_utf16().chain(Some(0)).collect();
+            let mut desktop_wide: Vec<u16> = format!("WinSta0\\{desktop_name}\0")
+                .encode_utf16()
+                .collect();
+
+            let mut si: STARTUPINFOW = std::mem::zeroed();
+            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.lpDesktop = PWSTR(desktop_wide.as_mut_ptr());
+            si.hStdInput = in_r;
+            si.hStdOutput = out_w;
+            si.hStdError = err_w;
+            let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+
+            let create_res = CreateProcessW(
+                PCWSTR::null(),
+                Some(PWSTR(cmd_wide.as_mut_ptr())),
+                None,
+                None,
+                true,
+                CREATE_NO_WINDOW,
+                None,
+                PCWSTR::null(),
+                &si,
+                &mut pi,
+            );
+
+            let _ = CloseHandle(in_r);
+            let _ = CloseHandle(in_w);
+            let _ = CloseHandle(out_w);
+            let _ = CloseHandle(err_w);
+
+            if let Err(err) = create_res {
+                let _ = CloseHandle(out_r);
+                let _ = CloseHandle(err_r);
+                return Err(anyhow!(
+                    "CreateProcessW for '{}' on WinSta0\\{desktop_name} failed: {err}",
+                    exe.display()
+                ));
+            }
+
+            let _ = CloseHandle(pi.hThread);
+            let stdout_file = std::fs::File::from_raw_handle(out_r.0);
+            let stderr_file = std::fs::File::from_raw_handle(err_r.0);
+            Ok((ProcessHandle(pi.hProcess.0 as isize), stdout_file, stderr_file))
+        }
+    }
+}
+
+fn ddagrab_exit_error(
+    exit_code: Option<u32>,
     stderr_tail: &std::sync::Mutex<std::collections::VecDeque<String>>,
     label: &str,
 ) -> anyhow::Error {
-    let status = child.wait().await;
-    if let Some(task) = stderr_task {
-        let _ = tokio::time::timeout(Duration::from_millis(200), task).await;
-    }
     let detail = stderr_tail
         .lock()
         .map(|g| g.iter().cloned().collect::<Vec<_>>().join(" | "))
         .unwrap_or_default();
-    match status {
-        Ok(st) if !detail.is_empty() => anyhow!("{label} ({st}): {detail}"),
-        Ok(st) => anyhow!("{label} ({st})"),
-        Err(err) if !detail.is_empty() => anyhow!("{label} ({err}): {detail}"),
-        Err(err) => anyhow!("{label} ({err})"),
+    match (exit_code, detail.is_empty()) {
+        (Some(code), false) => anyhow!("{label} (exit code {code}): {detail}"),
+        (Some(code), true) => anyhow!("{label} (exit code {code})"),
+        (None, false) => anyhow!("{label}: {detail}"),
+        (None, true) => anyhow!("{label}"),
     }
 }
 
@@ -724,11 +1148,40 @@ struct DxgiSession {
     src_w: usize,
     src_h: usize,
     display_index: u8,
+    orig_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+    prev_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
 }
 
 impl DxgiSession {
     fn new(display_index: u8) -> Result<Self> {
         ensure_dpi_aware();
+        let orig_desk = unsafe {
+            windows::Win32::System::StationsAndDesktops::GetThreadDesktop(
+                windows::Win32::System::Threading::GetCurrentThreadId(),
+            )
+        }
+        .ok();
+        let mut prev_desk = None;
+        crate::windows_session::switch_thread_to_input_desktop(&mut prev_desk);
+
+        let res = unsafe { Self::open_on_current_desktop(display_index, orig_desk, prev_desk) };
+        if res.is_ok() {
+            return res;
+        }
+        if let Some(old) = prev_desk.take() {
+            if let Some(orig) = orig_desk {
+                let _ = unsafe { windows::Win32::System::StationsAndDesktops::SetThreadDesktop(orig) };
+            }
+            let _ = unsafe { windows::Win32::System::StationsAndDesktops::CloseDesktop(old) };
+        }
+        res
+    }
+
+    unsafe fn open_on_current_desktop(
+        display_index: u8,
+        orig_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+        prev_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+    ) -> Result<Self> {
         unsafe {
             let (_, displays) = enumerate_windows_adapters_and_outputs();
             let chosen = displays
@@ -788,6 +1241,8 @@ impl DxgiSession {
                 src_w,
                 src_h,
                 display_index,
+                orig_desk,
+                prev_desk,
             })
         }
     }
@@ -835,6 +1290,7 @@ impl DxgiSession {
     }
 
     fn recreate(&mut self) -> Result<()> {
+        crate::windows_session::switch_thread_to_input_desktop(&mut self.prev_desk);
         unsafe {
             let (_, displays) = enumerate_windows_adapters_and_outputs();
             let out_idx = displays
@@ -887,6 +1343,19 @@ impl DxgiSession {
             let _ = self.dupl.ReleaseFrame();
             copy_res?;
             Ok(true)
+        }
+    }
+}
+
+impl Drop for DxgiSession {
+    fn drop(&mut self) {
+        if let Some(old) = self.prev_desk.take() {
+            if let Some(orig) = self.orig_desk {
+                let _ = unsafe {
+                    windows::Win32::System::StationsAndDesktops::SetThreadDesktop(orig)
+                };
+            }
+            let _ = unsafe { windows::Win32::System::StationsAndDesktops::CloseDesktop(old) };
         }
     }
 }

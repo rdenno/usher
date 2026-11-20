@@ -226,9 +226,16 @@ impl ApplicationHandler<AppEvent> for UsherApp {
         let Some(sess) = &mut self.session else {
             return;
         };
+        let win_icon = crate::icon::build_window_icon();
         let mut attrs = Window::default_attributes()
             .with_title(format!("Usher — {} ({}x{})", sess.host_label, sess.video_w, sess.video_h))
-            .with_inner_size(PhysicalSize::new(sess.video_w as u32, sess.video_h as u32));
+            .with_inner_size(PhysicalSize::new(sess.video_w as u32, sess.video_h as u32))
+            .with_window_icon(win_icon.clone());
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(win_icon);
+        }
         if sess.initial_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }

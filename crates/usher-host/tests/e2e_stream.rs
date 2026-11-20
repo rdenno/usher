@@ -378,3 +378,140 @@ fn host_adapts_bitrate_and_fec_on_feedback_and_applies_reconfigure() {
 
     wait_clean_exit(guard, stdin);
 }
+
+#[cfg(target_os = "windows")]
+#[ignore]
+#[test]
+fn windows_live_capture_from_session0_streams_real_frames() {
+    let bin = env!("CARGO_BIN_EXE_usher-host");
+    let mut child = Command::new(bin)
+        .args([
+            "--bind-ip",
+            "127.0.0.1",
+            "--capture",
+            "auto",
+            "--width",
+            "1280",
+            "--height",
+            "720",
+            "--fps",
+            "30",
+            "--codec",
+            "auto",
+            "--client-codecs",
+            "hevc,h264",
+            "--no-input",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn usher-host binary");
+
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let guard = ChildGuard(Some(child));
+
+    let err_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let err_sink = err_lines.clone();
+    let err_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("[live-host] {line}");
+            err_sink.lock().unwrap().push(line);
+        }
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut hello = None;
+    let mut line = String::new();
+    for _ in 0..32 {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read stdout line");
+        assert!(n > 0, "usher-host closed stdout before USHER_HELLO");
+        if let Some(res) = parse_hello_line(&line) {
+            hello = Some(res.expect("valid USHER_HELLO"));
+            break;
+        }
+    }
+    let hello = hello.expect("expected USHER_HELLO line");
+    eprintln!(
+        "[live-test] hello codec={} displays={:?}",
+        hello.codec, hello.displays
+    );
+
+    let key = hello.decode_session_key().expect("valid session key");
+    let mut crypto = SessionCrypto::new(&key, Role::Client);
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind client UDP");
+    sock.connect(SocketAddr::new(hello.bind_ip, hello.port))
+        .expect("connect client UDP");
+    sock.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set timeout");
+
+    send_ctrl(
+        &sock,
+        &mut crypto,
+        hello.mtu,
+        &ControlMessage::ClientHello {
+            client_version: 2,
+            capabilities: 0x03,
+        },
+    );
+    let ping = seal_packet(
+        &mut crypto,
+        PacketKind::Ping,
+        &PingPayload { sent_us: 42_424 }.encode(),
+        hello.mtu as usize,
+    )
+    .unwrap();
+    sock.send(&ping).unwrap();
+
+    let mut reassembler = FrameReassembler::new(8);
+    let mut got_pong = false;
+    let mut completed_frames = 0usize;
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if got_pong && completed_frames >= 5 {
+            break;
+        }
+        let Ok(n) = sock.recv(&mut buf) else {
+            continue;
+        };
+        let (kind, _seq, pt) = open_packet(&mut crypto, &buf[..n]).expect("valid AEAD packet");
+        match kind {
+            PacketKind::Pong => {
+                let pong = PongPayload::decode(&pt).expect("valid Pong");
+                assert_eq!(pong.sent_us, 42_424);
+                got_pong = true;
+            }
+            PacketKind::VideoData | PacketKind::VideoFec => {
+                if let Some(frame) = reassembler
+                    .push_packet(kind, &pt)
+                    .expect("valid video shard")
+                    .completed
+                {
+                    assert!(!frame.data.is_empty());
+                    completed_frames += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_pong, "did not receive Pong reply");
+    assert!(
+        completed_frames >= 5,
+        "expected >= 5 real video frames, got {completed_frames}"
+    );
+
+    wait_clean_exit(guard, stdin);
+    let _ = err_thread.join();
+
+    let logs = err_lines.lock().unwrap();
+    assert!(
+        !logs.iter().any(|l| l.contains("OpenH264 testsrc")),
+        "expected real desktop/lock-screen capture, but fell back to OpenH264 testsrc: {logs:?}"
+    );
+}
