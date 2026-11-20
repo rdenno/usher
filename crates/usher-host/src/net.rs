@@ -29,6 +29,8 @@ pub struct NetConfig {
     pub start: Instant,
     pub keyframe_req: Arc<AtomicBool>,
     pub peer_ready: Arc<tokio::sync::Notify>,
+    pub effective_codec: Arc<AtomicU8>,
+    pub status_notify: Arc<tokio::sync::Notify>,
     pub cancel: CancellationToken,
     pub adaptive: Arc<Mutex<AdaptiveController>>,
     pub live_bitrate_kbps: Arc<AtomicU32>,
@@ -67,6 +69,8 @@ pub fn spawn_network_tasks(
             adaptive: cfg.adaptive,
             live_bitrate_kbps: cfg.live_bitrate_kbps,
             in_place_bitrate: cfg.in_place_bitrate,
+            effective_codec: cfg.effective_codec,
+            status_notify: cfg.status_notify,
             video_cfg_tx: cfg.video_cfg_tx,
             client_codecs: cfg.client_codecs,
             host_codecs: cfg.host_codecs,
@@ -103,14 +107,21 @@ struct RxAdaptCtx {
     adaptive: Arc<Mutex<AdaptiveController>>,
     live_bitrate_kbps: Arc<AtomicU32>,
     in_place_bitrate: Arc<AtomicBool>,
+    effective_codec: Arc<AtomicU8>,
+    status_notify: Arc<tokio::sync::Notify>,
     video_cfg_tx: watch::Sender<VideoPipelineConfig>,
     client_codecs: Vec<VideoCodec>,
     host_codecs: Vec<VideoCodec>,
     displays: Vec<DisplayInfo>,
 }
 
+fn current_effective_codec(ctx: &RxAdaptCtx, fallback: VideoCodec) -> VideoCodec {
+    VideoCodec::from_u8(ctx.effective_codec.load(Ordering::Acquire)).unwrap_or(fallback)
+}
+
 fn build_stream_status(
     cfg: &VideoPipelineConfig,
+    codec: VideoCodec,
     adapt: &AdaptiveController,
     audio_enabled: bool,
 ) -> ControlMessage {
@@ -123,7 +134,7 @@ fn build_stream_status(
         width: cfg.width,
         height: cfg.height,
         fps: cfg.fps,
-        codec: cfg.codec,
+        codec,
         target_bitrate_kbps: adapt.applied_bitrate_kbps,
         max_bitrate_kbps: adapt.max_bitrate_kbps,
         fec_percent: adapt.fec_percent,
@@ -173,6 +184,23 @@ async fn run_rx_loop(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = ctx.status_notify.notified() => {
+                if let Some(dst) = *peer.read().await {
+                    let status = {
+                        let cfg = ctx.video_cfg_tx.borrow();
+                        let adapt = ctx.adaptive.lock().expect("adaptive lock poisoned");
+                        let codec = current_effective_codec(&ctx, cfg.codec);
+                        build_stream_status(
+                            &cfg,
+                            codec,
+                            &adapt,
+                            ctx.audio_enabled.load(Ordering::Acquire),
+                        )
+                    };
+                    send_control_to_peer(&socket, &crypto, dst, mtu, &status).await;
+                    last_status_sent = Instant::now();
+                }
+            }
             _ = tick.tick() => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 let last_ms = last_rx_ms.load(Ordering::Acquire);
@@ -242,8 +270,10 @@ async fn run_rx_loop(
                             let status = {
                                 let cfg = ctx.video_cfg_tx.borrow();
                                 let adapt = ctx.adaptive.lock().expect("adaptive lock poisoned");
+                                let codec = current_effective_codec(&ctx, cfg.codec);
                                 build_stream_status(
                                     &cfg,
+                                    codec,
                                     &adapt,
                                     ctx.audio_enabled.load(Ordering::Acquire),
                                 )
@@ -273,8 +303,10 @@ async fn run_rx_loop(
                                     if changed {
                                         adapt.reset_resolution_step_down();
                                     }
+                                    let codec = current_effective_codec(&ctx, next.codec);
                                     let status = build_stream_status(
                                         &next,
+                                        codec,
                                         &adapt,
                                         ctx.audio_enabled.load(Ordering::Acquire),
                                     );
@@ -312,8 +344,10 @@ async fn run_rx_loop(
                                     preview_cfg.width = nw;
                                     preview_cfg.height = nh;
                                 }
+                                let codec = current_effective_codec(&ctx, preview_cfg.codec);
                                 let status = build_stream_status(
                                     &preview_cfg,
+                                    codec,
                                     &adapt,
                                     ctx.audio_enabled.load(Ordering::Acquire),
                                 );
@@ -424,6 +458,8 @@ async fn run_rx_loop(
                                     target_codec = resolve_effective_codec(&probe_cfg);
                                     if target_codec != next.codec {
                                         next.codec = target_codec;
+                                        ctx.effective_codec
+                                            .store(target_codec.to_u8(), Ordering::Release);
                                         video_changed = true;
                                     }
                                 }
@@ -460,6 +496,7 @@ async fn run_rx_loop(
 
                                 let status = build_stream_status(
                                     &next,
+                                    next.codec,
                                     &adapt,
                                     ctx.audio_enabled.load(Ordering::Acquire),
                                 );

@@ -202,6 +202,7 @@ pub async fn start_transport(
 
     let encoded_slot = EncodedQueue::new(8);
     let decoded_frame_slot = LatestSlot::<Yuv420Frame>::new();
+    let decoded_frames = Arc::new(AtomicU64::new(0));
     let connected = Arc::new(AtomicBool::new(false));
     let late_frames_win = Arc::new(AtomicU32::new(0));
     let initial_spec = DecoderSpec {
@@ -215,6 +216,7 @@ pub async fn start_transport(
     {
         let enc_slot = encoded_slot.clone();
         let dec_slot = decoded_frame_slot.clone();
+        let dec_count = decoded_frames.clone();
         let telem = telemetry.clone();
         let ctrl_tx_dec = control_tx.clone();
         let proxy_dec = proxy.clone();
@@ -225,10 +227,19 @@ pub async fn start_transport(
             let fps_win = Arc::new(Mutex::new((0u32, Instant::now())));
             let on_frame: FrameSink = {
                 let dec_slot = dec_slot.clone();
+                let dec_count = dec_count.clone();
                 let telem = telem.clone();
                 let proxy_dec = proxy_dec.clone();
                 let fps_win = fps_win.clone();
                 Arc::new(move |yuv| {
+                    let prev = dec_count.fetch_add(1, Ordering::AcqRel);
+                    if prev == 0 {
+                        tracing::info!(
+                            width = yuv.width,
+                            height = yuv.height,
+                            "first video frame decoded"
+                        );
+                    }
                     let _ = dec_slot.push(yuv);
                     let _ = proxy_dec.send_event(AppEvent::NewFrame);
                     let mut st = fps_win.lock().expect("fps window lock poisoned");
@@ -371,6 +382,7 @@ pub async fn start_transport(
         let sock = socket.clone();
         let cry = crypto.clone();
         let enc_slot = encoded_slot.clone();
+        let decoded_rx = decoded_frames;
         let telem = telemetry.clone();
         let ctrl_tx_fb = control_tx.clone();
         let connected_rx = connected.clone();
@@ -390,12 +402,29 @@ pub async fn start_transport(
             let mut bw_window_start = Instant::now();
             let mut last_pli = Instant::now() - Duration::from_secs(1);
             let mut derp_warned = false;
+            let mut video_pkts_rx = 0u64;
+            let mut completed_frames_rx = 0u64;
+            let mut connected_at: Option<Instant> = None;
+            let mut stalled_warned = false;
             let mut fb_tick = tokio::time::interval(Duration::from_millis(500));
 
             loop {
                 tokio::select! {
                     _ = cancel_rx.cancelled() => break,
                     _ = fb_tick.tick() => {
+                        if !stalled_warned
+                            && let Some(t) = connected_at
+                            && t.elapsed() >= Duration::from_secs(4)
+                            && decoded_rx.load(Ordering::Acquire) == 0
+                        {
+                            stalled_warned = true;
+                            tracing::warn!(
+                                video_pkts_rx,
+                                completed_frames_rx,
+                                active_codec = telem.active_codec.load(Ordering::Acquire),
+                                "no video frames decoded after 4s; check [host] logs above (on Windows hosts, ensure the desktop is unlocked)"
+                            );
+                        }
                         let bw_elapsed = bw_window_start.elapsed();
                         let secs = bw_elapsed.as_secs_f64().max(0.05);
                         let kbps = ((bytes_in_window as f64 * 8.0 / secs) / 1000.0) as u32;
@@ -450,6 +479,9 @@ pub async fn start_transport(
                         let (kind, _seq, plaintext) = match opened {
                             Ok(v) => {
                                 connected_rx.store(true, Ordering::Release);
+                                if connected_at.is_none() {
+                                    connected_at = Some(Instant::now());
+                                }
                                 v
                             }
                             Err(err) => {
@@ -461,6 +493,7 @@ pub async fn start_transport(
                         match kind {
                             PacketKind::VideoData | PacketKind::VideoFec => {
                                 pkts_ok_in_win += 1;
+                                video_pkts_rx += 1;
                                 match reassembler.push_packet(kind, &plaintext) {
                                     Ok(outcome) => {
                                         if outcome.packets_lost_unrecovered > 0 {
@@ -474,6 +507,15 @@ pub async fn start_transport(
                                                 .try_send(ControlMessage::RequestKeyframe);
                                         }
                                         if let Some(frame) = outcome.completed {
+                                            completed_frames_rx += 1;
+                                            if completed_frames_rx == 1 {
+                                                tracing::info!(
+                                                    frame_id = frame.frame_id,
+                                                    bytes = frame.data.len(),
+                                                    keyframe = (frame.flags & FRAME_FLAG_KEYFRAME) != 0,
+                                                    "first video frame received"
+                                                );
+                                            }
                                             if frame.fec_recovered > 0 {
                                                 fec_rec_in_win += frame.fec_recovered as u64;
                                                 telem.fec_recovered.fetch_add(
@@ -573,6 +615,15 @@ pub async fn start_transport(
                                                 && (guard.width != width
                                                     || guard.height != height))
                                         {
+                                            tracing::info!(
+                                                old_codec = %guard.codec,
+                                                new_codec = %codec,
+                                                old_w = guard.width,
+                                                old_h = guard.height,
+                                                new_w = width,
+                                                new_h = height,
+                                                "host stream status changed; switching decoder"
+                                            );
                                             need_keyframe = true;
                                             *guard = DecoderSpec {
                                                 codec,

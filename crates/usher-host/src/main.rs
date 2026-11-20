@@ -167,6 +167,54 @@ fn resolve_bind_ip(explicit: Option<IpAddr>, allow_public: bool) -> Result<(IpAd
     Ok((bind_ip, expected_client_ip))
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct PipeMakeWriter {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+#[cfg(target_os = "windows")]
+struct PipeWriter {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    buf: Vec<u8>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::io::Write for PipeWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let _ = self.tx.send(std::mem::take(&mut self.buf));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PipeWriter {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            let _ = self.tx.send(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PipeMakeWriter {
+    type Writer = PipeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        PipeWriter {
+            tx: self.tx.clone(),
+            buf: Vec::with_capacity(256),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -176,9 +224,49 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // All logs MUST go to stderr so stdout remains clean for the single-line JSON handshake.
+    #[cfg(target_os = "windows")]
+    let (mut worker_pipe_rx, pipe_out_tx, pipe_writer_task) =
+        if let Some(ref pipe_name) = args.bridge_pipe {
+            let pipe = windows_session::connect_worker_pipe(pipe_name).await?;
+            let (rx, mut tx) = tokio::io::split(pipe);
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let writer_task = tokio::spawn(async move {
+                while let Some(chunk) = out_rx.recv().await {
+                    if tx.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                    if out_rx.is_empty() {
+                        let _ = tx.flush().await;
+                    }
+                }
+            });
+            (Some(rx), Some(out_tx), Some(writer_task))
+        } else {
+            (None, None, None)
+        };
+
+    // All logs MUST go to stderr (or bridge pipe in Session 1 worker) with ANSI disabled so stdout
+    // remains clean for the single-line JSON handshake.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    #[cfg(target_os = "windows")]
+    if let Some(ref tx) = pipe_out_tx {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(PipeMakeWriter { tx: tx.clone() })
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
+    #[cfg(not(target_os = "windows"))]
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
@@ -209,19 +297,26 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    let mut worker_pipe = if let Some(ref pipe_name) = args.bridge_pipe {
-        Some(windows_session::connect_worker_pipe(pipe_name).await?)
-    } else {
-        None
-    };
-
     let probe = probe_drm();
 
     #[cfg(target_os = "windows")]
     let displays: Vec<DisplayInfo> = if capture == CaptureSource::Testsrc {
         Vec::new()
     } else {
+        let cur_session = windows_session::current_session_id();
+        let active_session = windows_session::active_console_session_id();
+        if cur_session != active_session {
+            tracing::warn!(
+                worker_session = cur_session,
+                active_console_session = active_session,
+                "Windows session is not the active console (host PC is likely locked, disconnected, or switched user); unlock the host desktop to capture the real screen"
+            );
+        }
+        if !video::windows_capture::has_attached_dxgi_output() {
+            tracing::warn!(
+                "DXGI reported no attached desktop outputs in this session (host desktop may be locked or display asleep)"
+            );
+        }
         video::windows_capture::enumerate_displays()
     };
     #[cfg(target_os = "linux")]
@@ -334,15 +429,14 @@ async fn main() -> Result<()> {
 
     let hello_line = encode_hello_line(&hello)?;
     #[cfg(target_os = "windows")]
-    if let Some(ref mut pipe) = worker_pipe {
-        pipe.write_all(hello_line.as_bytes()).await?;
-        pipe.write_all(b"\n").await?;
+    if let Some(ref tx) = pipe_out_tx {
+        tx.send(format!("{hello_line}\n").into_bytes())
+            .map_err(|_| anyhow::anyhow!("bridge pipe writer closed before USHER_HELLO"))?;
         let info = format!(
             "backend={resolved_backend:?} codec={effective_codec} audio={}\n",
             !args.no_audio
         );
-        let _ = pipe.write_all(info.as_bytes()).await;
-        pipe.flush().await?;
+        let _ = tx.send(info.into_bytes());
     } else {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{hello_line}")?;
@@ -373,10 +467,9 @@ async fn main() -> Result<()> {
 
     // Watchdog 1: SSH stdin EOF (or bridge pipe EOF when running as Windows Session 1 worker)
     #[cfg(target_os = "windows")]
-    if let Some(pipe) = worker_pipe.take() {
+    if let Some(mut pipe_rx) = worker_pipe_rx.take() {
         let cancel_pipe = cancel.clone();
         tokio::spawn(async move {
-            let (mut pipe_rx, _pipe_tx) = tokio::io::split(pipe);
             let mut buf = [0u8; 64];
             loop {
                 match pipe_rx.read(&mut buf).await {
@@ -473,6 +566,8 @@ async fn main() -> Result<()> {
     let (audio_tx, audio_rx) = mpsc::channel(16);
 
     let peer_ready = Arc::new(tokio::sync::Notify::new());
+    let effective_codec_atomic = Arc::new(AtomicU8::new(effective_codec.to_u8()));
+    let status_notify = Arc::new(tokio::sync::Notify::new());
     let (video_cfg_tx, video_cfg_rx) = watch::channel(video_cfg);
     let live_bitrate_kbps = Arc::new(AtomicU32::new(initial_bitrate_kbps));
     let in_place_bitrate = Arc::new(AtomicBool::new(is_in_place_bitrate_backend(
@@ -494,6 +589,8 @@ async fn main() -> Result<()> {
             start,
             keyframe_req: keyframe_req.clone(),
             peer_ready: peer_ready.clone(),
+            effective_codec: effective_codec_atomic.clone(),
+            status_notify: status_notify.clone(),
             cancel: cancel.clone(),
             adaptive,
             live_bitrate_kbps: live_bitrate_kbps.clone(),
@@ -512,6 +609,8 @@ async fn main() -> Result<()> {
         video_cfg_rx,
         live_bitrate_kbps,
         in_place_bitrate,
+        effective_codec_atomic,
+        status_notify,
         video_tx,
         keyframe_req,
         peer_ready,
@@ -544,6 +643,13 @@ async fn main() -> Result<()> {
 
     drop(headless_session);
     tracing::info!("usher-host exited cleanly");
+    #[cfg(target_os = "windows")]
+    {
+        drop(pipe_out_tx);
+        if let Some(task) = pipe_writer_task {
+            let _ = tokio::time::timeout(Duration::from_millis(200), task).await;
+        }
+    }
     Ok(())
 }
 

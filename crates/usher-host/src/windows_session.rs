@@ -168,7 +168,7 @@ pub async fn run_session_bridge(worker_args: &[String]) -> Result<()> {
 
     let mut stdin = tokio::io::stdin();
     let mut stdin_buf = [0u8; 64];
-    let mut worker_buf = [0u8; 256];
+    let mut worker_line = String::new();
 
     loop {
         tokio::select! {
@@ -181,18 +181,23 @@ pub async fn run_session_bridge(worker_args: &[String]) -> Result<()> {
                     Ok(_) => {}
                 }
             }
-            res = reader.read(&mut worker_buf) => {
+            res = reader.read_line(&mut worker_line) => {
                 match res {
                     Ok(0) | Err(_) => {
+                        let tail = worker_line.trim_end();
+                        if !tail.is_empty() {
+                            tracing::info!("[session1-worker] {tail}");
+                        }
                         tracing::info!("Session 1 worker exited; closing SSH bridge");
                         break;
                     }
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&worker_buf[..n]);
-                        for l in text.lines() {
-                            if !l.trim().is_empty() {
-                                tracing::info!("[session1-worker] {l}");
+                    Ok(_) => {
+                        if worker_line.ends_with('\n') || worker_line.len() >= 4096 {
+                            let msg = worker_line.trim_end();
+                            if !msg.is_empty() {
+                                tracing::info!("[session1-worker] {msg}");
                             }
+                            worker_line.clear();
                         }
                     }
                 }

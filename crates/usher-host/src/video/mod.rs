@@ -11,7 +11,7 @@ pub mod windows_capture;
 use clap::ValueEnum;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -165,6 +165,8 @@ pub fn spawn_video_task(
     mut config_rx: watch::Receiver<VideoPipelineConfig>,
     live_bitrate_kbps: Arc<AtomicU32>,
     in_place_bitrate: Arc<AtomicBool>,
+    effective_codec: Arc<AtomicU8>,
+    status_notify: Arc<tokio::sync::Notify>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     peer_ready: Arc<tokio::sync::Notify>,
@@ -194,6 +196,8 @@ pub fn spawn_video_task(
                 backend,
                 live_bitrate_kbps.clone(),
                 in_place_bitrate.clone(),
+                effective_codec.clone(),
+                status_notify.clone(),
                 tx.clone(),
                 keyframe_req.clone(),
                 start,
@@ -227,15 +231,19 @@ pub fn spawn_video_task(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_one_backend(
-    cfg: VideoPipelineConfig,
+    mut cfg: VideoPipelineConfig,
     backend: ResolvedBackend,
     live_bitrate_kbps: Arc<AtomicU32>,
     in_place_bitrate: Arc<AtomicBool>,
+    effective_codec: Arc<AtomicU8>,
+    status_notify: Arc<tokio::sync::Notify>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     child_cancel: CancellationToken,
 ) {
+    effective_codec.store(cfg.codec.to_u8(), Ordering::Release);
+
     match backend {
         #[cfg(target_os = "linux")]
         ResolvedBackend::Hw(hw_kind) => {
@@ -261,7 +269,7 @@ async fn run_one_backend(
                         return;
                     }
                     tracing::warn!(
-                        "hardware video pipeline failed ({err:#}); falling back to OpenH264 testsrc"
+                        "hardware video pipeline failed ({err:#}); falling back to OpenH264 testsrc (switching stream codec to h264)"
                     );
                 }
             }
@@ -286,10 +294,15 @@ async fn run_one_backend(
                         return;
                     }
                     tracing::warn!("Windows capture pipeline failed ({err:#})");
-                    if was_hw && cfg.codec == VideoCodec::H264 {
-                        tracing::info!("falling back to built-in DXGI + OpenH264 capture");
+                    if was_hw {
+                        cfg.codec = VideoCodec::H264;
                         in_place_bitrate.store(true, Ordering::Release);
-                        if windows_capture::run_windows_backend(
+                        effective_codec.store(VideoCodec::H264.to_u8(), Ordering::Release);
+                        status_notify.notify_one();
+                        tracing::info!(
+                            "falling back to built-in DXGI + OpenH264 capture (stream codec: h264)"
+                        );
+                        match windows_capture::run_windows_backend(
                             windows_capture::WinVideoBackend::NativeDxgiOpenH264,
                             cfg.clone(),
                             live_bitrate_kbps.clone(),
@@ -299,9 +312,16 @@ async fn run_one_backend(
                             child_cancel.clone(),
                         )
                         .await
-                        .is_ok()
                         {
-                            return;
+                            Ok(()) => return,
+                            Err(dxgi_err) => {
+                                if child_cancel.is_cancelled() {
+                                    return;
+                                }
+                                tracing::warn!(
+                                    "built-in DXGI + OpenH264 fallback failed ({dxgi_err:#})"
+                                );
+                            }
                         }
                     }
                 }
@@ -313,7 +333,17 @@ async fn run_one_backend(
     }
 
     if !child_cancel.is_cancelled() {
+        if cfg.codec != VideoCodec::H264 {
+            cfg.codec = VideoCodec::H264;
+            tracing::warn!(
+                "falling back to built-in OpenH264 testsrc (switching stream codec to h264)"
+            );
+        } else {
+            tracing::warn!("falling back to built-in OpenH264 testsrc");
+        }
         in_place_bitrate.store(true, Ordering::Release);
+        effective_codec.store(VideoCodec::H264.to_u8(), Ordering::Release);
+        status_notify.notify_one();
         if let Err(err) = software::run_software_testsrc(
             cfg,
             live_bitrate_kbps,

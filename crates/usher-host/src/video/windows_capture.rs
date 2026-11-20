@@ -1,7 +1,7 @@
 use super::ivf::IvfReader;
 use super::software::apply_openh264_bitrate;
 use super::{CaptureSource, EncodedFrame, EncoderKind, VideoPipelineConfig};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
@@ -158,6 +158,10 @@ pub fn enumerate_displays() -> Vec<DisplayInfo> {
         });
     }
     out
+}
+
+pub fn has_attached_dxgi_output() -> bool {
+    !enumerate_windows_adapters_and_outputs().1.is_empty()
 }
 
 #[allow(dead_code)]
@@ -510,15 +514,25 @@ async fn run_ddagrab_hw(
         .take()
         .ok_or_else(|| anyhow!("ffmpeg missing stdout"))?;
 
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_tail = Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::<String>::with_capacity(8),
+    ));
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let tail = stderr_tail.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!("[ddagrab] {line}");
+                tracing::warn!("[ddagrab] {line}");
+                if let Ok(mut g) = tail.lock() {
+                    if g.len() >= 8 {
+                        g.pop_front();
+                    }
+                    g.push_back(line);
+                }
             }
-        });
-    }
+        })
+    });
 
     let mut buf = vec![0u8; 64 * 1024];
     match cfg.codec {
@@ -542,8 +556,10 @@ async fn run_ddagrab_hw(
                             timestamp_us: ts_us,
                         });
                     }
-                    let status = child.wait().await?;
-                    bail!("ddagrab pipeline exited ({status})");
+                    return Err(
+                        ddagrab_exit_error(child, stderr_task, &stderr_tail, "ddagrab pipeline exited")
+                            .await,
+                    );
                 }
                 for au in splitter.push_bytes(&buf[..n]) {
                     let _ = keyframe_req.swap(false, Ordering::AcqRel);
@@ -568,8 +584,13 @@ async fn run_ddagrab_hw(
                     res = stdout.read(&mut buf) => res.context("reading ddagrab AV1 stdout")?
                 };
                 if n == 0 {
-                    let status = child.wait().await?;
-                    bail!("ddagrab AV1 pipeline exited ({status})");
+                    return Err(ddagrab_exit_error(
+                        child,
+                        stderr_task,
+                        &stderr_tail,
+                        "ddagrab AV1 pipeline exited",
+                    )
+                    .await);
                 }
                 for frame in ivf.push_bytes(&buf[..n])? {
                     let _ = keyframe_req.swap(false, Ordering::AcqRel);
@@ -582,6 +603,28 @@ async fn run_ddagrab_hw(
                 }
             }
         }
+    }
+}
+
+async fn ddagrab_exit_error(
+    mut child: tokio::process::Child,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_tail: &std::sync::Mutex<std::collections::VecDeque<String>>,
+    label: &str,
+) -> anyhow::Error {
+    let status = child.wait().await;
+    if let Some(task) = stderr_task {
+        let _ = tokio::time::timeout(Duration::from_millis(200), task).await;
+    }
+    let detail = stderr_tail
+        .lock()
+        .map(|g| g.iter().cloned().collect::<Vec<_>>().join(" | "))
+        .unwrap_or_default();
+    match status {
+        Ok(st) if !detail.is_empty() => anyhow!("{label} ({st}): {detail}"),
+        Ok(st) => anyhow!("{label} ({st})"),
+        Err(err) if !detail.is_empty() => anyhow!("{label} ({err}): {detail}"),
+        Err(err) => anyhow!("{label} ({err})"),
     }
 }
 
