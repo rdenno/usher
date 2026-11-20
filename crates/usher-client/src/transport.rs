@@ -1,5 +1,6 @@
-use crate::decoder::{DecoderKind, Yuv420Frame, create_decoder};
+use crate::decoder::{DecoderKind, FrameSink, Yuv420Frame, create_decoder};
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use usher_proto::audio::AudioPacket;
 use usher_proto::crypto::{Role, SessionCrypto};
-use usher_proto::fragment::{CompletedFrame, FrameReassembler};
+use usher_proto::fragment::{CompletedFrame, FRAME_FLAG_KEYFRAME, FrameReassembler};
 use usher_proto::handshake::{HelloMessage, VideoCodec};
 use usher_proto::input::InputEvent;
 use usher_proto::packet::{
@@ -55,45 +56,79 @@ struct DecoderSpec {
 
 pub struct LatestSlot<T> {
     inner: Mutex<Option<T>>,
-    cv: Condvar,
-    closed: AtomicBool,
 }
 
 impl<T> LatestSlot<T> {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(None),
-            cv: Condvar::new(),
-            closed: AtomicBool::new(false),
         })
     }
 
     /// Stores `val`, returning `true` if a previous unconsumed item was overwritten.
     pub fn push(&self, val: T) -> bool {
         let mut guard = self.inner.lock().expect("slot lock poisoned");
-        let replaced = guard.replace(val).is_some();
-        self.cv.notify_one();
-        replaced
+        guard.replace(val).is_some()
     }
 
     pub fn try_take(&self) -> Option<T> {
         self.inner.lock().expect("slot lock poisoned").take()
     }
 
-    pub fn wait_take(&self) -> Option<T> {
-        let mut guard = self.inner.lock().expect("slot lock poisoned");
+    pub fn close(&self) {
+        *self.inner.lock().expect("slot lock poisoned") = None;
+    }
+}
+
+struct EncodedQueue {
+    inner: Mutex<VecDeque<CompletedFrame>>,
+    cv: Condvar,
+    closed: AtomicBool,
+    max_cap: usize,
+}
+
+impl EncodedQueue {
+    fn new(max_cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(VecDeque::with_capacity(max_cap)),
+            cv: Condvar::new(),
+            closed: AtomicBool::new(false),
+            max_cap: max_cap.max(1),
+        })
+    }
+
+    /// Enqueues an encoded frame, evicting the oldest non-keyframe if full.
+    /// Returns `true` if a queued frame had to be dropped.
+    fn push(&self, val: CompletedFrame) -> bool {
+        let mut guard = self.inner.lock().expect("encoded queue lock poisoned");
+        let mut evicted = false;
+        while guard.len() >= self.max_cap {
+            let idx = guard
+                .iter()
+                .position(|f| (f.flags & FRAME_FLAG_KEYFRAME) == 0)
+                .unwrap_or(0);
+            guard.remove(idx);
+            evicted = true;
+        }
+        guard.push_back(val);
+        self.cv.notify_one();
+        evicted
+    }
+
+    fn wait_take(&self) -> Option<CompletedFrame> {
+        let mut guard = self.inner.lock().expect("encoded queue lock poisoned");
         loop {
-            if let Some(v) = guard.take() {
+            if let Some(v) = guard.pop_front() {
                 return Some(v);
             }
             if self.closed.load(Ordering::Acquire) {
                 return None;
             }
-            guard = self.cv.wait(guard).expect("slot condvar poisoned");
+            guard = self.cv.wait(guard).expect("encoded queue condvar poisoned");
         }
     }
 
-    pub fn close(&self) {
+    fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.cv.notify_all();
     }
@@ -165,7 +200,7 @@ pub async fn start_transport(
     let (input_tx, mut input_rx) = mpsc::channel::<InputEvent>(256);
     let (control_tx, mut control_rx) = mpsc::channel::<ControlMessage>(32);
 
-    let encoded_slot = LatestSlot::<CompletedFrame>::new();
+    let encoded_slot = EncodedQueue::new(8);
     let decoded_frame_slot = LatestSlot::<Yuv420Frame>::new();
     let connected = Arc::new(AtomicBool::new(false));
     let late_frames_win = Arc::new(AtomicU32::new(0));
@@ -181,29 +216,67 @@ pub async fn start_transport(
         let enc_slot = encoded_slot.clone();
         let dec_slot = decoded_frame_slot.clone();
         let telem = telemetry.clone();
+        let ctrl_tx_dec = control_tx.clone();
         let proxy_dec = proxy.clone();
         let cancel_dec = cancel.clone();
         let desired_dec = desired_decoder.clone();
 
         std::thread::spawn(move || {
+            let fps_win = Arc::new(Mutex::new((0u32, Instant::now())));
+            let on_frame: FrameSink = {
+                let dec_slot = dec_slot.clone();
+                let telem = telem.clone();
+                let proxy_dec = proxy_dec.clone();
+                let fps_win = fps_win.clone();
+                Arc::new(move |yuv| {
+                    let _ = dec_slot.push(yuv);
+                    let _ = proxy_dec.send_event(AppEvent::NewFrame);
+                    let mut st = fps_win.lock().expect("fps window lock poisoned");
+                    st.0 += 1;
+                    let dt = st.1.elapsed();
+                    if dt >= Duration::from_millis(500) {
+                        let fps_x10 = ((st.0 as f64 / dt.as_secs_f64()) * 10.0).round() as u32;
+                        telem.fps_x10.store(fps_x10, Ordering::Release);
+                        st.0 = 0;
+                        st.1 = Instant::now();
+                    }
+                })
+            };
+
             let mut active_spec = initial_spec;
+            let mut hwaccel_enabled = true;
             let mut decoder = match create_decoder(
                 active_spec.codec,
                 decoder_kind,
                 active_spec.width,
                 active_spec.height,
+                hwaccel_enabled,
+                on_frame.clone(),
             ) {
                 Ok(d) => d,
                 Err(err) => {
-                    tracing::error!("failed to initialize video decoder: {err:#}");
-                    cancel_dec.cancel();
-                    let _ = proxy_dec.send_event(AppEvent::Shutdown);
-                    return;
+                    tracing::warn!(
+                        "hwaccel decoder init failed ({err:#}); falling back to software decode"
+                    );
+                    hwaccel_enabled = false;
+                    match create_decoder(
+                        active_spec.codec,
+                        decoder_kind,
+                        active_spec.width,
+                        active_spec.height,
+                        false,
+                        on_frame.clone(),
+                    ) {
+                        Ok(d) => d,
+                        Err(err2) => {
+                            tracing::error!("failed to initialize video decoder: {err2:#}");
+                            cancel_dec.cancel();
+                            let _ = proxy_dec.send_event(AppEvent::Shutdown);
+                            return;
+                        }
+                    }
                 }
             };
-
-            let mut frames_in_window = 0u32;
-            let mut fps_window_start = Instant::now();
 
             while !cancel_dec.is_cancelled() {
                 let Some(au) = enc_slot.wait_take() else {
@@ -213,17 +286,39 @@ pub async fn start_transport(
                 let target_spec = *desired_dec.lock().expect("decoder spec lock poisoned");
                 if target_spec != active_spec {
                     drop(decoder);
-                    match create_decoder(
+                    let next_dec = create_decoder(
                         target_spec.codec,
                         decoder_kind,
                         target_spec.width,
                         target_spec.height,
-                    ) {
+                        hwaccel_enabled,
+                        on_frame.clone(),
+                    )
+                    .or_else(|err| {
+                        if hwaccel_enabled {
+                            tracing::warn!(
+                                "hwaccel decoder switch failed ({err:#}); falling back to software decode"
+                            );
+                            hwaccel_enabled = false;
+                            create_decoder(
+                                target_spec.codec,
+                                decoder_kind,
+                                target_spec.width,
+                                target_spec.height,
+                                false,
+                                on_frame.clone(),
+                            )
+                        } else {
+                            Err(err)
+                        }
+                    });
+                    match next_dec {
                         Ok(new_dec) => {
                             tracing::info!(
                                 codec = %target_spec.codec,
                                 w = target_spec.width,
                                 h = target_spec.height,
+                                hwaccel = hwaccel_enabled,
                                 "switched client video decoder"
                             );
                             decoder = new_dec;
@@ -238,23 +333,33 @@ pub async fn start_transport(
                     }
                 }
 
-                match decoder.decode(&au.data) {
-                    Ok(Some(yuv)) => {
-                        let _ = dec_slot.push(yuv);
-                        let _ = proxy_dec.send_event(AppEvent::NewFrame);
-                        frames_in_window += 1;
-                        let dt = fps_window_start.elapsed();
-                        if dt >= Duration::from_millis(500) {
-                            let fps_x10 =
-                                ((frames_in_window as f64 / dt.as_secs_f64()) * 10.0).round() as u32;
-                            telem.fps_x10.store(fps_x10, Ordering::Release);
-                            frames_in_window = 0;
-                            fps_window_start = Instant::now();
-                        }
+                if let Err(err) = decoder.decode(&au.data) {
+                    tracing::warn!(
+                        hwaccel = hwaccel_enabled,
+                        "video decoder error ({err:#}); recreating decoder"
+                    );
+                    if hwaccel_enabled {
+                        hwaccel_enabled = false;
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::debug!("video decode error: {err:#}");
+                    drop(decoder);
+                    match create_decoder(
+                        active_spec.codec,
+                        decoder_kind,
+                        active_spec.width,
+                        active_spec.height,
+                        hwaccel_enabled,
+                        on_frame.clone(),
+                    ) {
+                        Ok(new_dec) => {
+                            decoder = new_dec;
+                            let _ = ctrl_tx_dec.try_send(ControlMessage::RequestKeyframe);
+                        }
+                        Err(err2) => {
+                            tracing::error!("failed to recreate video decoder: {err2:#}");
+                            cancel_dec.cancel();
+                            let _ = proxy_dec.send_event(AppEvent::Shutdown);
+                            return;
+                        }
                     }
                 }
             }
@@ -379,6 +484,11 @@ pub async fn start_transport(
                                             if enc_slot.push(frame) {
                                                 telem.frames_dropped.fetch_add(1, Ordering::Relaxed);
                                                 late_win.fetch_add(1, Ordering::AcqRel);
+                                                if last_pli.elapsed() >= Duration::from_millis(250) {
+                                                    last_pli = Instant::now();
+                                                    let _ = ctrl_tx_fb
+                                                        .try_send(ControlMessage::RequestKeyframe);
+                                                }
                                             }
                                         }
                                     }
@@ -455,13 +565,15 @@ pub async fn start_transport(
                                     {
                                         let mut guard =
                                             desired_dec.lock().expect("decoder spec lock poisoned");
+                                        let uses_ffmpeg_pipe = decoder_kind == DecoderKind::Ffmpeg
+                                            || (decoder_kind == DecoderKind::Auto
+                                                && codec != VideoCodec::H264);
                                         if guard.codec != codec
-                                            || (decoder_kind == DecoderKind::Ffmpeg
-                                                && (guard.width != width || guard.height != height))
+                                            || (uses_ffmpeg_pipe
+                                                && (guard.width != width
+                                                    || guard.height != height))
                                         {
-                                            if guard.codec != codec {
-                                                need_keyframe = true;
-                                            }
+                                            need_keyframe = true;
                                             *guard = DecoderSpec {
                                                 codec,
                                                 width,

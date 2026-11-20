@@ -185,7 +185,11 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
         "{}k",
         (cfg.bitrate_kbps * buf_frames / cfg.fps.max(1) as u32).max(200)
     );
-    let gop = (cfg.fps as u32 * 2).max(30).to_string();
+    let gop = match cfg.prefer {
+        QualityPreference::Latency => (cfg.fps as u32).max(30),
+        QualityPreference::Quality => (cfg.fps as u32 * 2).max(30),
+    }
+    .to_string();
     let fps_str = cfg.fps.to_string();
     let nvenc_ffmpeg_preset = match cfg.prefer {
         QualityPreference::Latency => "p1",
@@ -342,7 +346,7 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                 "1",
                 "-bf",
                 "0",
-                "-intra-refresh",
+                "-forced-idr",
                 "1",
                 "-rc",
                 "cbr",
@@ -354,10 +358,11 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                 &bufsize,
                 "-g",
                 &gop,
-                "-f",
-                out_fmt,
-                "pipe:1",
             ]);
+            if matches!(cfg.codec, VideoCodec::H264 | VideoCodec::Hevc) {
+                c.args(["-aud", "1"]);
+            }
+            c.args(["-f", out_fmt, "pipe:1"]);
             Ok(c)
         }
         HwPipelineKind::PipeWireVaapi | HwPipelineKind::PipeWireNvenc => {

@@ -472,6 +472,7 @@ async fn main() -> Result<()> {
     let (video_tx, video_rx) = mpsc::channel(4);
     let (audio_tx, audio_rx) = mpsc::channel(16);
 
+    let peer_ready = Arc::new(tokio::sync::Notify::new());
     let (video_cfg_tx, video_cfg_rx) = watch::channel(video_cfg);
     let live_bitrate_kbps = Arc::new(AtomicU32::new(initial_bitrate_kbps));
     let in_place_bitrate = Arc::new(AtomicBool::new(is_in_place_bitrate_backend(
@@ -492,6 +493,7 @@ async fn main() -> Result<()> {
             idle_timeout: Duration::from_secs(args.idle_timeout_secs),
             start,
             keyframe_req: keyframe_req.clone(),
+            peer_ready: peer_ready.clone(),
             cancel: cancel.clone(),
             adaptive,
             live_bitrate_kbps: live_bitrate_kbps.clone(),
@@ -512,6 +514,7 @@ async fn main() -> Result<()> {
         in_place_bitrate,
         video_tx,
         keyframe_req,
+        peer_ready,
         start,
         cancel.clone(),
     );

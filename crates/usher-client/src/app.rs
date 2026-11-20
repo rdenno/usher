@@ -243,9 +243,10 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                             (phys.width.clamp(64, 3840) as u16) & !1,
                             (phys.height.clamp(64, 2160) as u16) & !1,
                         );
-                        self.window = Some(win);
+                        self.window = Some(win.clone());
                         self.renderer = Some(renderer);
                         self.apply_mouse_mode();
+                        win.request_redraw();
                     }
                     Err(err) => {
                         tracing::error!("GPU renderer initialization failed: {err:#}");

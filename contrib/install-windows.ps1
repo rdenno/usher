@@ -3,6 +3,8 @@ param(
     [ValidateSet("client", "host", "both")]
     [string]$Role = "client",
 
+    [string]$Version = "latest",
+
     [switch]$FromSource,
 
     [switch]$PauseOnExit,
@@ -11,6 +13,20 @@ param(
 
     [string]$Repo = "rdenno/usher"
 )
+
+if (-not $PSBoundParameters.ContainsKey("Role") -and $env:USHER_ROLE) {
+    if ($env:USHER_ROLE -in @("client", "host", "both")) {
+        $Role = $env:USHER_ROLE
+    } else {
+        throw "Invalid USHER_ROLE '$($env:USHER_ROLE)'. Expected: client, host, or both."
+    }
+}
+if (-not $PSBoundParameters.ContainsKey("Version") -and $env:USHER_VERSION) {
+    $Version = $env:USHER_VERSION
+}
+if (-not $PSBoundParameters.ContainsKey("InstallDir") -and $env:USHER_INSTALL_DIR) {
+    $InstallDir = $env:USHER_INSTALL_DIR
+}
 
 $ErrorActionPreference = "Stop"
 $ExitCode = 0
@@ -89,9 +105,15 @@ function Install-From-Cargo {
 
 try {
     $ScriptPath = $MyInvocation.MyCommand.Path
-    $ScriptDir = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { (Get-Location).Path }
-    $RepoRoot = Split-Path -Parent $ScriptDir
-    $HasLocalCargo = (Test-Path (Join-Path $RepoRoot "Cargo.toml")) -and (Test-Path (Join-Path $RepoRoot "crates\usher-client"))
+    $ScriptDir = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { "" }
+    $RepoRoot = if ($ScriptDir) {
+        Split-Path -Parent $ScriptDir
+    } elseif (Test-Path (Join-Path (Get-Location).Path "Cargo.toml")) {
+        (Get-Location).Path
+    } else {
+        ""
+    }
+    $HasLocalCargo = [bool]$RepoRoot -and (Test-Path (Join-Path $RepoRoot "Cargo.toml")) -and (Test-Path (Join-Path $RepoRoot "crates\usher-client"))
 
     $NeedClient = $Role -in @("client", "both")
     $NeedHost = $Role -in @("host", "both")
@@ -100,10 +122,15 @@ try {
 
     $BuildLocally = $FromSource.IsPresent
     if (-not $BuildLocally) {
-        $LocalClientZip = Join-Path $ScriptDir "usher.exe"
-        $LocalHostZip = Join-Path $ScriptDir "usher-host.exe"
-        if ((($NeedClient -and (Test-Path $LocalClientZip)) -or -not $NeedClient) -and
-            (($NeedHost -and (Test-Path $LocalHostZip)) -or -not $NeedHost)) {
+        $HasSiblingPrebuilt = $false
+        if ($ScriptDir) {
+            $LocalClientZip = Join-Path $ScriptDir "usher.exe"
+            $LocalHostZip = Join-Path $ScriptDir "usher-host.exe"
+            $HasSiblingPrebuilt = (($NeedClient -and (Test-Path $LocalClientZip)) -or -not $NeedClient) -and
+                (($NeedHost -and (Test-Path $LocalHostZip)) -or -not $NeedHost)
+        }
+
+        if ($HasSiblingPrebuilt) {
             Write-Host "==> Installing prebuilt binaries from $ScriptDir..."
             if ($NeedClient) {
                 Install-UsherExe -SourcePath $LocalClientZip -BinaryName "usher.exe" -DestDir $InstallDir
@@ -111,20 +138,53 @@ try {
             if ($NeedHost) {
                 Install-UsherExe -SourcePath $LocalHostZip -BinaryName "usher-host.exe" -DestDir $InstallDir
             }
-        } elseif (Get-Command gh -ErrorAction SilentlyContinue) {
+        } else {
             $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("usher-dl-" + [System.Guid]::NewGuid().ToString("N"))
             New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
             try {
-                Write-Host "==> Downloading latest release from github.com/$Repo..."
-                $prevEap = $ErrorActionPreference
-                try {
-                    $ErrorActionPreference = "Continue"
-                    & gh release download --repo $Repo --pattern "usher-windows-x86_64.zip" --dir $tmpDir
-                } finally {
-                    $ErrorActionPreference = $prevEap
+                $zipPath = Join-Path $tmpDir "usher-windows-x86_64.zip"
+                $downloaded = $false
+                $zipUrl = if ($Version -eq "latest") {
+                    "https://github.com/$Repo/releases/latest/download/usher-windows-x86_64.zip"
+                } else {
+                    "https://github.com/$Repo/releases/download/$Version/usher-windows-x86_64.zip"
                 }
-                if ($LASTEXITCODE -eq 0) {
-                    $zipPath = Join-Path $tmpDir "usher-windows-x86_64.zip"
+
+                Write-Host "==> Downloading Usher ($Version) from $zipUrl..."
+                $prevProgress = $ProgressPreference
+                try {
+                    $ProgressPreference = "SilentlyContinue"
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+                    if ((Test-Path $zipPath) -and ((Get-Item $zipPath).Length -gt 0)) {
+                        $downloaded = $true
+                    }
+                } catch {
+                    Write-Verbose "Direct GitHub download failed: $($_.Exception.Message)"
+                } finally {
+                    $ProgressPreference = $prevProgress
+                }
+
+                if (-not $downloaded -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+                    Write-Host "==> Falling back to 'gh release download' for github.com/$Repo..."
+                    $prevEap = $ErrorActionPreference
+                    try {
+                        $ErrorActionPreference = "Continue"
+                        $ghArgs = @("release", "download")
+                        if ($Version -ne "latest") {
+                            $ghArgs += $Version
+                        }
+                        $ghArgs += @("--repo", $Repo, "--pattern", "usher-windows-x86_64.zip", "--dir", $tmpDir)
+                        & gh @ghArgs
+                    } finally {
+                        $ErrorActionPreference = $prevEap
+                    }
+                    if ($LASTEXITCODE -eq 0 -and (Test-Path $zipPath)) {
+                        $downloaded = $true
+                    }
+                }
+
+                if ($downloaded) {
                     $extractDir = Join-Path $tmpDir "extracted"
                     Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
                     if ($NeedClient) {
@@ -134,19 +194,14 @@ try {
                         Install-UsherExe -SourcePath (Join-Path $extractDir "usher-host.exe") -BinaryName "usher-host.exe" -DestDir $InstallDir
                     }
                 } elseif ($HasLocalCargo) {
-                    Write-Warning "No published GitHub Release found yet; falling back to building from source."
+                    Write-Warning "Could not download prebuilt release ($Version); falling back to building from source."
                     $BuildLocally = $true
                 } else {
-                    throw "Failed to download usher-windows-x86_64.zip from $Repo. Check 'gh auth status' or run with -FromSource."
+                    throw "Failed to download usher-windows-x86_64.zip ($Version) from $Repo. Check internet access or download usher-setup-windows-x86_64.exe from https://github.com/$Repo/releases."
                 }
             } finally {
                 Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
             }
-        } elseif ($HasLocalCargo) {
-            Write-Warning "GitHub CLI (gh) not found; building from local repository source."
-            $BuildLocally = $true
-        } else {
-            throw "GitHub CLI (gh) not found and not inside a source checkout. Install 'gh' (https://cli.github.com/) or download & extract usher-windows-x86_64.zip from Releases."
         }
     }
 
@@ -298,4 +353,8 @@ try {
     }
 }
 
-exit $ExitCode
+if ($MyInvocation.MyCommand.Path) {
+    exit $ExitCode
+} elseif ($ExitCode -ne 0) {
+    throw "Usher installation failed (exit code $ExitCode)."
+}

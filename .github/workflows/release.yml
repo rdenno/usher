@@ -91,7 +91,7 @@ jobs:
           }
 
           $rawTag = "${{ github.event.inputs.tag || github.ref_name }}".TrimStart('v')
-          $appVer = if ($rawTag -match '^\d+\.\d+\.\d+') { $rawTag } else { "0.2.0" }
+          $appVer = if ($rawTag -match '^\d+\.\d+\.\d+') { $rawTag } else { "0.2.1" }
           $numVer = ([regex]::Match($appVer, '^\d+\.\d+\.\d+')).Value
 
           & $iscc `

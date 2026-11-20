@@ -378,7 +378,11 @@ async fn run_ddagrab_hw(
         "{}k",
         (cfg.bitrate_kbps * buf_frames / cfg.fps.max(1) as u32).max(200)
     );
-    let gop = (cfg.fps as u32 * 2).max(30).to_string();
+    let gop = match cfg.prefer {
+        QualityPreference::Latency => (cfg.fps as u32).max(30),
+        QualityPreference::Quality => (cfg.fps as u32 * 2).max(30),
+    }
+    .to_string();
     let out_fmt = match cfg.codec {
         VideoCodec::H264 => "h264",
         VideoCodec::Hevc => "hevc",
@@ -425,7 +429,7 @@ async fn run_ddagrab_hw(
                 "1".into(),
                 "-bf".into(),
                 "0".into(),
-                "-intra-refresh".into(),
+                "-forced-idr".into(),
                 "1".into(),
                 "-rc".into(),
                 "cbr".into(),
@@ -438,6 +442,9 @@ async fn run_ddagrab_hw(
                 "-g".into(),
                 gop,
             ]);
+            if matches!(cfg.codec, VideoCodec::H264 | VideoCodec::Hevc) {
+                args.extend(["-aud".into(), "1".into()]);
+            }
         }
         WinHwVendor::Amf => {
             let (usage, quality) = match cfg.prefer {

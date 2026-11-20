@@ -160,16 +160,25 @@ pub fn resolve_video_backend(cfg: &VideoPipelineConfig) -> ResolvedBackend {
     ResolvedBackend::Software
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_video_task(
     mut config_rx: watch::Receiver<VideoPipelineConfig>,
     live_bitrate_kbps: Arc<AtomicU32>,
     in_place_bitrate: Arc<AtomicBool>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
+    peer_ready: Arc<tokio::sync::Notify>,
     start: Instant,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Wait until the first authenticated client UDP packet arrives before starting
+        // capture/encode so Frame 0 (VPS/SPS/PPS + IDR) is delivered cleanly.
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = peer_ready.notified() => {}
+        }
+
         loop {
             if cancel.is_cancelled() {
                 break;

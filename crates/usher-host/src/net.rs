@@ -28,6 +28,7 @@ pub struct NetConfig {
     pub idle_timeout: Duration,
     pub start: Instant,
     pub keyframe_req: Arc<AtomicBool>,
+    pub peer_ready: Arc<tokio::sync::Notify>,
     pub cancel: CancellationToken,
     pub adaptive: Arc<Mutex<AdaptiveController>>,
     pub live_bitrate_kbps: Arc<AtomicU32>,
@@ -57,6 +58,7 @@ pub fn spawn_network_tasks(
         cfg.idle_timeout,
         cfg.start,
         cfg.keyframe_req,
+        cfg.peer_ready,
         cfg.cancel.clone(),
         input_sink,
         RxAdaptCtx {
@@ -159,6 +161,7 @@ async fn run_rx_loop(
     idle_timeout: Duration,
     start: Instant,
     keyframe_req: Arc<AtomicBool>,
+    peer_ready: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     mut input_sink: Box<dyn InputSink>,
     ctx: RxAdaptCtx,
@@ -224,6 +227,7 @@ async fn run_rx_loop(
                         tracing::info!(%src, "authenticated client UDP peer locked");
                         *peer_guard = Some(src);
                         keyframe_req.store(true, Ordering::Release);
+                        peer_ready.notify_one();
                     } else if *peer_guard != Some(src) {
                         tracing::info!(old = ?*peer_guard, new = %src, "client UDP endpoint roamed");
                         *peer_guard = Some(src);
