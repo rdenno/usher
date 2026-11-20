@@ -76,6 +76,16 @@ pub fn spawn_gamepad_thread(
                     last_state = Some(state);
                     let _ = input_tx.try_send(state);
                 }
+            } else if last_state.take().is_some() {
+                let _ = input_tx.try_send(InputEvent::GamepadState {
+                    buttons: 0,
+                    lt: 0,
+                    rt: 0,
+                    lx: 0,
+                    ly: 0,
+                    rx: 0,
+                    ry: 0,
+                });
             }
 
             std::thread::sleep(Duration::from_millis(8));

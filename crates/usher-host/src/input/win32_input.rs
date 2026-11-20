@@ -1,6 +1,6 @@
 use super::InputSink;
 use std::time::{Duration, Instant};
-use usher_proto::input::{InputEvent, MouseButton};
+use usher_proto::input::{HeldInputTracker, InputEvent, MouseButton};
 use vigem_client::{Client as VigemClient, TargetId, XButtons, XGamepad, Xbox360Wired};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -36,19 +36,31 @@ impl Win32InputSink {
                 let mut last_attach = Instant::now() - Duration::from_secs(1);
                 let mut vigem_pad: Option<Xbox360Wired<VigemClient>> = None;
                 let mut vigem_tried = false;
+                let mut held = HeldInputTracker::default();
 
                 while let Ok(event) = rx.recv() {
                     if last_attach.elapsed() >= Duration::from_millis(200) {
                         crate::windows_session::switch_thread_to_input_desktop(&mut prev_desk);
                         last_attach = Instant::now();
                     }
-                    dispatch_input_event(
-                        event,
-                        &mut prev_desk,
-                        &mut last_attach,
-                        &mut vigem_pad,
-                        &mut vigem_tried,
-                    );
+                    if matches!(event, InputEvent::ReleaseAll) {
+                        release_all_held(&mut held, &mut prev_desk, &mut last_attach, &mut vigem_pad);
+                    } else {
+                        held.record(&event);
+                        dispatch_input_event(
+                            event,
+                            &mut prev_desk,
+                            &mut last_attach,
+                            &mut vigem_pad,
+                            &mut vigem_tried,
+                        );
+                    }
+                }
+
+                if !held.is_empty() {
+                    crate::windows_session::switch_thread_to_input_desktop(&mut prev_desk);
+                    last_attach = Instant::now();
+                    release_all_held(&mut held, &mut prev_desk, &mut last_attach, &mut vigem_pad);
                 }
 
                 drop(vigem_pad);
@@ -146,8 +158,34 @@ fn send_single(
 impl InputSink for Win32InputSink {
     fn handle(&mut self, event: InputEvent) {
         if let Some(ref tx) = self.tx {
-            let _ = tx.try_send(event);
+            match event {
+                InputEvent::Key { .. }
+                | InputEvent::MouseButton { .. }
+                | InputEvent::ReleaseAll => {
+                    let _ = tx.send(event);
+                }
+                _ => {
+                    let _ = tx.try_send(event);
+                }
+            }
         }
+    }
+}
+
+fn release_all_held(
+    held: &mut HeldInputTracker,
+    prev_desk: &mut Option<windows::Win32::System::StationsAndDesktops::HDESK>,
+    last_attach: &mut Instant,
+    vigem_pad: &mut Option<Xbox360Wired<VigemClient>>,
+) {
+    let events = held.drain_release_events();
+    if events.is_empty() {
+        return;
+    }
+    tracing::debug!(count = events.len(), "releasing held Win32 inputs");
+    let mut skip_vigem_init = true;
+    for ev in events {
+        dispatch_input_event(ev, prev_desk, last_attach, vigem_pad, &mut skip_vigem_init);
     }
 }
 
@@ -379,6 +417,7 @@ fn dispatch_input_event(
                 }
             }
         }
+        InputEvent::ReleaseAll => {}
     }
 }
 

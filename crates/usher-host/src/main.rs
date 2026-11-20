@@ -622,7 +622,7 @@ async fn main() -> Result<()> {
         Box<dyn crate::input::InputSink>,
         Option<mpsc::Receiver<windows_ipc::HostCmd>>,
     ) = if console_worker.is_some() && !args.no_input {
-        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(512);
         (Box::new(PipeInputSink { cmd_tx }), Some(cmd_rx))
     } else {
         (create_input_sink(!args.no_input), None)

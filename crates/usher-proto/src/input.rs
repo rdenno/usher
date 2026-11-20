@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
+use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum MouseButton {
     Left = 0,
@@ -66,6 +67,8 @@ pub enum InputEvent {
         rx: i16,
         ry: i16,
     },
+    /// Idempotently releases all remotely-held keys, mouse buttons, and gamepad state.
+    ReleaseAll,
 }
 
 impl InputEvent {
@@ -132,6 +135,7 @@ impl InputEvent {
                 out.extend_from_slice(&ry.to_le_bytes());
                 out
             }
+            InputEvent::ReleaseAll => vec![0x08],
         }
     }
 
@@ -208,8 +212,136 @@ impl InputEvent {
                     dy: i16::from_le_bytes([rest[2], rest[3]]),
                 })
             }
+            0x08 => {
+                if !rest.is_empty() {
+                    bail!("invalid ReleaseAll len {}", rest.len());
+                }
+                Ok(Self::ReleaseAll)
+            }
             other => bail!("unknown input event tag {other}"),
         }
+    }
+}
+
+/// Returns the order in which held keys should be released during input cleanup:
+/// `0` = non-modifier keys (released first), `1` = Alt/Meta (released while Ctrl/Shift
+/// are still down to avoid menu/Start activation), `2` = Shift/Ctrl (released last).
+pub fn key_release_priority(evdev_code: u16) -> u8 {
+    match evdev_code {
+        42 | 54 | 29 | 97 => 2,
+        56 | 100 | 125 | 126 => 1,
+        _ => 0,
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct HeldInputTracker {
+    keys: BTreeSet<u16>,
+    buttons: BTreeSet<MouseButton>,
+    gamepad_active: bool,
+}
+
+impl HeldInputTracker {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.buttons.is_empty() && !self.gamepad_active
+    }
+
+    pub fn should_forward_key(&mut self, evdev_code: u16, pressed: bool) -> bool {
+        if pressed {
+            self.keys.insert(evdev_code)
+        } else {
+            self.keys.remove(&evdev_code)
+        }
+    }
+
+    pub fn should_forward_button(&mut self, button: MouseButton, pressed: bool) -> bool {
+        if pressed {
+            self.buttons.insert(button)
+        } else {
+            self.buttons.remove(&button)
+        }
+    }
+
+    pub fn record(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::Key {
+                evdev_code,
+                pressed,
+            } => {
+                if *pressed {
+                    self.keys.insert(*evdev_code);
+                } else {
+                    self.keys.remove(evdev_code);
+                }
+            }
+            InputEvent::MouseButton { button, pressed } => {
+                if *pressed {
+                    self.buttons.insert(*button);
+                } else {
+                    self.buttons.remove(button);
+                }
+            }
+            InputEvent::GamepadState {
+                buttons,
+                lt,
+                rt,
+                lx,
+                ly,
+                rx,
+                ry,
+            } => {
+                self.gamepad_active = *buttons != 0
+                    || *lt != 0
+                    || *rt != 0
+                    || *lx != 0
+                    || *ly != 0
+                    || *rx != 0
+                    || *ry != 0;
+            }
+            InputEvent::ReleaseAll => {
+                self.keys.clear();
+                self.buttons.clear();
+                self.gamepad_active = false;
+            }
+            InputEvent::MouseMoveRel { .. }
+            | InputEvent::MouseMoveAbs { .. }
+            | InputEvent::MouseWheel { .. }
+            | InputEvent::MouseWheelHiRes { .. } => {}
+        }
+    }
+
+    pub fn drain_release_events(&mut self) -> Vec<InputEvent> {
+        let mut out = Vec::with_capacity(
+            self.buttons.len() + self.keys.len() + usize::from(self.gamepad_active),
+        );
+        let buttons = std::mem::take(&mut self.buttons);
+        for button in buttons {
+            out.push(InputEvent::MouseButton {
+                button,
+                pressed: false,
+            });
+        }
+        let mut keys: Vec<u16> = std::mem::take(&mut self.keys).into_iter().collect();
+        keys.sort_by_key(|&code| (key_release_priority(code), code));
+        for evdev_code in keys {
+            out.push(InputEvent::Key {
+                evdev_code,
+                pressed: false,
+            });
+        }
+        if self.gamepad_active {
+            self.gamepad_active = false;
+            out.push(InputEvent::GamepadState {
+                buttons: 0,
+                lt: 0,
+                rt: 0,
+                lx: 0,
+                ly: 0,
+                rx: 0,
+                ry: 0,
+            });
+        }
+        out
     }
 }
 
@@ -244,11 +376,94 @@ mod tests {
                 rx: 100,
                 ry: -32768,
             },
+            InputEvent::ReleaseAll,
         ];
         for ev in events {
             let enc = ev.encode();
             let dec = InputEvent::decode(&enc).unwrap();
             assert_eq!(dec, ev);
         }
+    }
+
+    #[test]
+    fn held_tracker_drains_modifiers_in_safe_order_and_suppresses_stale_ups() {
+        let mut tracker = HeldInputTracker::default();
+        assert!(tracker.is_empty());
+
+        // Suppress unmatched release before press and duplicate press.
+        assert!(!tracker.should_forward_key(29, false));
+        assert!(tracker.should_forward_key(29, true)); // CtrlLeft
+        assert!(!tracker.should_forward_key(29, true));
+        assert!(tracker.should_forward_key(56, true)); // AltLeft
+        assert!(tracker.should_forward_key(42, true)); // ShiftLeft
+        assert!(tracker.should_forward_key(125, true)); // SuperLeft
+        assert!(tracker.should_forward_key(30, true)); // KeyA
+        assert!(tracker.should_forward_key(16, true)); // KeyQ
+        assert!(tracker.should_forward_button(MouseButton::Left, true));
+        assert!(!tracker.should_forward_button(MouseButton::Left, true));
+        assert!(!tracker.should_forward_button(MouseButton::Right, false));
+
+        tracker.record(&InputEvent::GamepadState {
+            buttons: 0x1000,
+            lt: 0,
+            rt: 0,
+            lx: 1000,
+            ly: 0,
+            rx: 0,
+            ry: 0,
+        });
+        assert!(!tracker.is_empty());
+
+        let drained = tracker.drain_release_events();
+        assert_eq!(
+            drained,
+            vec![
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: 16,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: 30,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: 56,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: 125,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: 29,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: 42,
+                    pressed: false,
+                },
+                InputEvent::GamepadState {
+                    buttons: 0,
+                    lt: 0,
+                    rt: 0,
+                    lx: 0,
+                    ly: 0,
+                    rx: 0,
+                    ry: 0,
+                },
+            ]
+        );
+        assert!(tracker.is_empty());
+        assert!(tracker.drain_release_events().is_empty());
+
+        // Subsequent physical key-ups/button-ups after ReleaseAll must be suppressed.
+        assert!(!tracker.should_forward_key(16, false));
+        assert!(!tracker.should_forward_key(56, false));
+        assert!(!tracker.should_forward_key(29, false));
+        assert!(!tracker.should_forward_button(MouseButton::Left, false));
     }
 }

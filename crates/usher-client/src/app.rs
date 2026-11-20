@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use usher_proto::input::{InputEvent, MouseButton as UsherMouseButton};
+use usher_proto::input::{HeldInputTracker, InputEvent, MouseButton as UsherMouseButton};
 use usher_proto::packet::ControlMessage;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -150,6 +150,24 @@ impl ScrollAccumulator {
     }
 }
 
+fn enqueue_release_all(
+    remote_held: &mut HeldInputTracker,
+    input_tx: &mpsc::Sender<InputEvent>,
+    always_send_release_all: bool,
+) {
+    let events = remote_held.drain_release_events();
+    for ev in &events {
+        let _ = input_tx.try_send(*ev);
+    }
+    if !events.is_empty() {
+        // Send twice as a lightweight idempotent guard against single-packet UDP drops.
+        let _ = input_tx.try_send(InputEvent::ReleaseAll);
+        let _ = input_tx.try_send(InputEvent::ReleaseAll);
+    } else if always_send_release_all {
+        let _ = input_tx.try_send(InputEvent::ReleaseAll);
+    }
+}
+
 pub type ConnectFn = Box<dyn FnOnce(Option<(u16, u16, u16)>) -> anyhow::Result<ConnectedSession>>;
 
 pub struct UsherApp {
@@ -161,8 +179,11 @@ pub struct UsherApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     focused: bool,
-    ctrl_down: bool,
-    alt_down: bool,
+    ctrl_left_down: bool,
+    ctrl_right_down: bool,
+    alt_left_down: bool,
+    alt_right_down: bool,
+    remote_held: HeldInputTracker,
     rel_accum_x: f64,
     rel_accum_y: f64,
     scroll_accum: ScrollAccumulator,
@@ -182,8 +203,11 @@ impl UsherApp {
             window: None,
             renderer: None,
             focused: true,
-            ctrl_down: false,
-            alt_down: false,
+            ctrl_left_down: false,
+            ctrl_right_down: false,
+            alt_left_down: false,
+            alt_right_down: false,
+            remote_held: HeldInputTracker::default(),
             rel_accum_x: 0.0,
             rel_accum_y: 0.0,
             scroll_accum: ScrollAccumulator::new(),
@@ -191,6 +215,35 @@ impl UsherApp {
             cursor_inside: false,
             last_title_update: Instant::now(),
             pending_resize: None,
+        }
+    }
+
+    fn ctrl_down(&self) -> bool {
+        self.ctrl_left_down || self.ctrl_right_down
+    }
+
+    fn alt_down(&self) -> bool {
+        self.alt_left_down || self.alt_right_down
+    }
+
+    fn reset_local_modifiers(&mut self) {
+        self.ctrl_left_down = false;
+        self.ctrl_right_down = false;
+        self.alt_left_down = false;
+        self.alt_right_down = false;
+    }
+
+    fn release_all_remote_inputs(&mut self, always_send_release_all: bool) {
+        if let Some(sess) = &self.session
+            && sess.input_enabled
+        {
+            enqueue_release_all(
+                &mut self.remote_held,
+                &sess.input_tx,
+                always_send_release_all,
+            );
+        } else {
+            let _ = self.remote_held.drain_release_events();
         }
     }
 
@@ -303,7 +356,10 @@ impl UsherApp {
         }
     }
 
-    fn shutdown(&self, event_loop: &ActiveEventLoop) {
+    fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        self.release_all_remote_inputs(true);
+        self.reset_local_modifiers();
+        self.scroll_accum.reset();
         if let Some(sess) = &self.session {
             let _ = sess.control_tx.try_send(ControlMessage::Disconnect);
             sess.frame_slot.close();
@@ -441,8 +497,8 @@ impl ApplicationHandler<AppEvent> for UsherApp {
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 if !focused {
-                    self.ctrl_down = false;
-                    self.alt_down = false;
+                    self.release_all_remote_inputs(true);
+                    self.reset_local_modifiers();
                     self.scroll_accum.reset();
                 }
                 self.apply_mouse_mode();
@@ -485,9 +541,12 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
-                        KeyCode::ControlLeft | KeyCode::ControlRight => self.ctrl_down = pressed,
-                        KeyCode::AltLeft | KeyCode::AltRight => self.alt_down = pressed,
-                        KeyCode::KeyS if pressed && self.ctrl_down && self.alt_down => {
+                        KeyCode::ControlLeft => self.ctrl_left_down = pressed,
+                        KeyCode::ControlRight => self.ctrl_right_down = pressed,
+                        KeyCode::AltLeft => self.alt_left_down = pressed,
+                        KeyCode::AltRight => self.alt_right_down = pressed,
+                        KeyCode::KeyS if pressed && self.ctrl_down() && self.alt_down() => {
+                            self.release_all_remote_inputs(false);
                             if let Some(sess) = &mut self.session {
                                 sess.overlay.toggle_open();
                                 if sess.overlay.open {
@@ -500,7 +559,8 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                             }
                             return;
                         }
-                        KeyCode::KeyG if pressed && self.ctrl_down && self.alt_down => {
+                        KeyCode::KeyG if pressed && self.ctrl_down() && self.alt_down() => {
+                            self.release_all_remote_inputs(false);
                             if let Some(sess) = &mut self.session {
                                 sess.relative_mouse = !sess.relative_mouse;
                                 sess.overlay.pointer_mode = if sess.relative_mouse {
@@ -514,11 +574,12 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                             self.update_title();
                             return;
                         }
-                        KeyCode::KeyF if pressed && self.ctrl_down && self.alt_down => {
+                        KeyCode::KeyF if pressed && self.ctrl_down() && self.alt_down() => {
+                            self.release_all_remote_inputs(false);
                             self.toggle_fullscreen();
                             return;
                         }
-                        KeyCode::KeyQ if pressed && self.ctrl_down && self.alt_down => {
+                        KeyCode::KeyQ if pressed && self.ctrl_down() && self.alt_down() => {
                             self.shutdown(event_loop);
                             return;
                         }
@@ -573,6 +634,7 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                         && sess.input_enabled
                         && !event.repeat
                         && let Some(evdev_code) = winit_keycode_to_evdev(code)
+                        && self.remote_held.should_forward_key(evdev_code, pressed)
                     {
                         let _ = sess.input_tx.try_send(InputEvent::Key {
                             evdev_code,
@@ -640,10 +702,13 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                     MouseButton::Forward => UsherMouseButton::Extra,
                     MouseButton::Other(_) => return,
                 };
-                let _ = sess.input_tx.try_send(InputEvent::MouseButton {
-                    button: btn,
-                    pressed: state == ElementState::Pressed,
-                });
+                let pressed = state == ElementState::Pressed;
+                if self.remote_held.should_forward_button(btn, pressed) {
+                    let _ = sess.input_tx.try_send(InputEvent::MouseButton {
+                        button: btn,
+                        pressed,
+                    });
+                }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let (input_tx, hi_res_scroll) = {
@@ -891,5 +956,53 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn ctrl_alt_shortcut_releases_alt_before_ctrl_and_suppresses_physical_ups() {
+        let mut held = HeldInputTracker::default();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let ctrl = winit_keycode_to_evdev(KeyCode::ControlLeft).unwrap();
+        let alt = winit_keycode_to_evdev(KeyCode::AltLeft).unwrap();
+        let key_q = winit_keycode_to_evdev(KeyCode::KeyQ).unwrap();
+
+        assert!(held.should_forward_key(ctrl, true));
+        assert!(held.should_forward_key(alt, true));
+
+        // Pressing Ctrl+Alt+Q triggers enqueue_release_all before sending KeyQ or shutting down.
+        enqueue_release_all(&mut held, &tx, true);
+
+        let mut sent = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            sent.push(ev);
+        }
+        assert_eq!(
+            sent,
+            vec![
+                InputEvent::Key {
+                    evdev_code: alt,
+                    pressed: false,
+                },
+                InputEvent::Key {
+                    evdev_code: ctrl,
+                    pressed: false,
+                },
+                InputEvent::ReleaseAll,
+                InputEvent::ReleaseAll,
+            ]
+        );
+
+        // Physical releases after hotkey / overlay / focus-loss are suppressed cleanly.
+        assert!(!held.should_forward_key(key_q, false));
+        assert!(!held.should_forward_key(alt, false));
+        assert!(!held.should_forward_key(ctrl, false));
+
+        // Nothing held + always_send_release_all=false emits nothing; =true emits one ReleaseAll.
+        enqueue_release_all(&mut held, &tx, false);
+        assert!(rx.try_recv().is_err());
+        enqueue_release_all(&mut held, &tx, true);
+        assert_eq!(rx.try_recv().ok(), Some(InputEvent::ReleaseAll));
+        assert!(rx.try_recv().is_err());
     }
 }

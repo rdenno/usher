@@ -721,14 +721,7 @@ pub async fn start_transport(
             loop {
                 tokio::select! {
                     _ = cancel_tx.cancelled() => {
-                        let _ = send_sealed(
-                            &sock,
-                            &cry,
-                            PacketKind::Control,
-                            &ControlMessage::Disconnect.encode(),
-                            mtu,
-                        )
-                        .await;
+                        flush_inputs_and_disconnect(&sock, &cry, &mut input_rx, mtu).await;
                         break;
                     }
                     _ = retry_tick.tick() => {
@@ -754,12 +747,12 @@ pub async fn start_transport(
                         }
                     }
                     Some(ctrl) = control_rx.recv() => {
-                        let is_disc = matches!(ctrl, ControlMessage::Disconnect);
-                        send_sealed(&sock, &cry, PacketKind::Control, &ctrl.encode(), mtu).await;
-                        if is_disc {
+                        if matches!(ctrl, ControlMessage::Disconnect) {
+                            flush_inputs_and_disconnect(&sock, &cry, &mut input_rx, mtu).await;
                             cancel_tx.cancel();
                             break;
                         }
+                        send_sealed(&sock, &cry, PacketKind::Control, &ctrl.encode(), mtu).await;
                     }
                 }
             }
@@ -772,6 +765,44 @@ pub async fn start_transport(
         decoded_frame_slot,
         telemetry,
     })
+}
+
+async fn flush_inputs_and_disconnect(
+    socket: &UdpSocket,
+    crypto: &Mutex<SessionCrypto>,
+    input_rx: &mut mpsc::Receiver<InputEvent>,
+    mtu: usize,
+) {
+    let mut saw_release_all = false;
+    for _ in 0..64 {
+        match input_rx.try_recv() {
+            Ok(ev) => {
+                if matches!(ev, InputEvent::ReleaseAll) {
+                    saw_release_all = true;
+                }
+                send_sealed(socket, crypto, PacketKind::Input, &ev.encode(), mtu).await;
+            }
+            Err(_) => break,
+        }
+    }
+    if !saw_release_all {
+        send_sealed(
+            socket,
+            crypto,
+            PacketKind::Input,
+            &InputEvent::ReleaseAll.encode(),
+            mtu,
+        )
+        .await;
+    }
+    send_sealed(
+        socket,
+        crypto,
+        PacketKind::Control,
+        &ControlMessage::Disconnect.encode(),
+        mtu,
+    )
+    .await;
 }
 
 async fn send_sealed(

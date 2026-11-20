@@ -5,7 +5,7 @@ use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputEvent as KernelEvent,
     InputId, KeyCode, PropType, RelativeAxisCode, UinputAbsSetup,
 };
-use usher_proto::input::{InputEvent, MouseButton};
+use usher_proto::input::{HeldInputTracker, InputEvent, MouseButton};
 
 pub struct UinputSink {
     keyboard: VirtualDevice,
@@ -15,6 +15,7 @@ pub struct UinputSink {
     last_gamepad_buttons: u16,
     wheel_accum_x: i32,
     wheel_accum_y: i32,
+    held: HeldInputTracker,
 }
 
 impl UinputSink {
@@ -31,6 +32,7 @@ impl UinputSink {
             last_gamepad_buttons: 0,
             wheel_accum_x: 0,
             wheel_accum_y: 0,
+            held: HeldInputTracker::default(),
         })
     }
 }
@@ -155,6 +157,34 @@ fn mouse_button_code(btn: MouseButton) -> KeyCode {
 
 impl InputSink for UinputSink {
     fn handle(&mut self, event: InputEvent) {
+        if matches!(event, InputEvent::ReleaseAll) {
+            self.release_all_held();
+            return;
+        }
+        self.held.record(&event);
+        self.emit_event(event);
+    }
+}
+
+impl Drop for UinputSink {
+    fn drop(&mut self) {
+        self.release_all_held();
+    }
+}
+
+impl UinputSink {
+    fn release_all_held(&mut self) {
+        let events = self.held.drain_release_events();
+        if events.is_empty() {
+            return;
+        }
+        tracing::debug!(count = events.len(), "releasing held uinput inputs");
+        for ev in events {
+            self.emit_event(ev);
+        }
+    }
+
+    fn emit_event(&mut self, event: InputEvent) {
         let res = match event {
             InputEvent::Key {
                 evdev_code,
@@ -300,6 +330,7 @@ impl InputSink for UinputSink {
                 ]);
                 self.gamepad.emit(&batch)
             }
+            InputEvent::ReleaseAll => Ok(()),
         };
 
         if let Err(err) = res {
