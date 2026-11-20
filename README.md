@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
-    <img src="assets/logo-light.svg" width="260" alt="Usher">
+    <img src="assets/logo-light.svg" width="204" alt="Usher">
   </picture>
   <p><strong>U</strong>DP + <strong>S</strong>S<strong>H</strong> = <strong>E</strong>phemeral <strong>R</strong>emote desktop</p>
   <p>Zero-daemon, SSH-bootstrapped remote desktop &amp; game streaming over Tailscale, ZeroTier, or WireGuard.</p>

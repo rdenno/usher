@@ -470,11 +470,15 @@ async fn main() -> Result<()> {
     video_cfg.codec = effective_codec;
 
     let session_key = generate_session_key()?;
-    let socket = Arc::new(
-        UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-            .await
-            .with_context(|| format!("failed to bind UDP socket on {bind_ip}:0"))?,
-    );
+    let udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        .await
+        .with_context(|| format!("failed to bind UDP socket on {bind_ip}:0"))?;
+    {
+        let sock_ref = socket2::SockRef::from(&udp);
+        let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
+        let _ = sock_ref.set_recv_buffer_size(1024 * 1024);
+    }
+    let socket = Arc::new(udp);
     let local_port = socket.local_addr()?.port();
 
     let gamepad_backend = if args.no_input {

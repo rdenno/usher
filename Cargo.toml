@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/rdenno/usher"
@@ -27,6 +27,7 @@ rand = "0.10"
 rusty-opus = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+socket2 = "0.6"
 tokio = { version = "1.50", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.8"

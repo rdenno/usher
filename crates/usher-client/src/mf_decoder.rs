@@ -32,7 +32,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFTEnumEx,
 };
 use windows::Win32::System::Com::{
-    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree,
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::core::{GUID, Interface};
 
@@ -128,15 +128,30 @@ fn enumerate_mf_decoders(codec: VideoCodec) -> Result<Vec<(IMFActivate, String)>
 }
 
 pub fn probe_mf_decoders() -> Vec<VideoCodec> {
-    let mut out = Vec::new();
-    for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
-        if let Ok(list) = enumerate_mf_decoders(codec)
-            && !list.is_empty()
-        {
-            out.push(codec);
-        }
-    }
-    out
+    static CACHED: OnceLock<Vec<VideoCodec>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            // Enumerate MF decoders on a short-lived MTA thread so calling this from the
+            // winit main UI thread never switches the UI thread away from STA (OleInitialize).
+            std::thread::Builder::new()
+                .name("usher-mf-probe".into())
+                .spawn(|| {
+                    let mut out = Vec::new();
+                    for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
+                        if let Ok(list) = enumerate_mf_decoders(codec)
+                            && !list.is_empty()
+                        {
+                            out.push(codec);
+                        }
+                    }
+                    unsafe { CoUninitialize() };
+                    out
+                })
+                .ok()
+                .and_then(|h| h.join().ok())
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 fn create_d3d11_video_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
@@ -816,5 +831,108 @@ mod tests {
             frames.load(Ordering::Acquire) >= 1,
             "expected >= 1 decoded frame from MF H264 decoder"
         );
+    }
+
+    #[test]
+    fn probe_mf_decoders_keeps_caller_thread_sta_compatible() {
+        let res = std::thread::spawn(|| {
+            let codecs = probe_mf_decoders();
+            assert!(codecs.contains(&VideoCodec::H264));
+            let ole_hr = unsafe { windows::Win32::System::Ole::OleInitialize(None) };
+            let ok = ole_hr.is_ok();
+            if ok {
+                unsafe { windows::Win32::System::Ole::OleUninitialize() };
+            }
+            (ok, ole_hr)
+        })
+        .join()
+        .expect("probe STA thread panicked");
+        assert!(
+            res.0,
+            "OleInitialize failed after probe_mf_decoders on caller thread: {:?}",
+            res.1
+        );
+    }
+
+    #[test]
+    fn mf_decoder_decodes_hevc_when_available() {
+        if !probe_mf_decoders().contains(&VideoCodec::Hevc) {
+            return;
+        }
+        let Some(ffmpeg) = crate::decoder::find_working_ffmpeg() else {
+            return;
+        };
+
+        let run_hevc_check = |use_hwaccel: bool| -> Option<u64> {
+            let enc_variants: &[&[&str]] = &[
+                &[
+                    "-pix_fmt", "nv12", "-c:v", "hevc_nvenc", "-preset", "p1", "-tune", "ull",
+                    "-zerolatency", "1", "-bf", "0", "-g", "4", "-forced-idr", "1", "-aud", "1",
+                ],
+                &[
+                    "-pix_fmt", "yuv420p", "-c:v", "libx265", "-preset", "ultrafast", "-tune",
+                    "zerolatency", "-x265-params", "keyint=4:bframes=0:aud=1",
+                ],
+            ];
+            let mut raw = Vec::new();
+            for enc_args in enc_variants {
+                if let Ok(out) = std::process::Command::new(&ffmpeg)
+                    .args([
+                        "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=320x180:rate=30", "-frames:v", "12",
+                    ])
+                    .args(*enc_args)
+                    .args(["-f", "hevc", "pipe:1"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    && out.status.success()
+                    && !out.stdout.is_empty()
+                {
+                    raw = out.stdout;
+                    break;
+                }
+            }
+            if raw.is_empty() {
+                return None;
+            }
+
+            let mut splitter = usher_proto::annexb::AnnexBSplitter::new(VideoCodec::Hevc);
+            let mut aus = splitter.push_bytes(&raw);
+            aus.extend(splitter.flush());
+            assert!(aus.len() >= 6, "expected >= 6 HEVC AUs, got {}", aus.len());
+
+            let frames = Arc::new(AtomicU64::new(0));
+            let frames_cb = frames.clone();
+            let sink: FrameSink = Arc::new(move |f| {
+                assert_eq!((f.width, f.height), (320, 180));
+                frames_cb.fetch_add(1, Ordering::Release);
+            });
+            let mut dec = MfVideoDecoder::new(VideoCodec::Hevc, 320, 180, use_hwaccel, sink)
+                .expect("create MF HEVC decoder");
+            for au in &aus {
+                dec.decode(&au.data).expect("decode HEVC AU via MF");
+            }
+            if dec.event_gen.is_none() {
+                unsafe {
+                    let _ = dec.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+                }
+                let _ = dec.drain_outputs();
+            }
+            Some(frames.load(Ordering::Acquire))
+        };
+
+        let mut tested = false;
+        for hw in [true, false] {
+            if let Some(count) = run_hevc_check(hw) {
+                tested = true;
+                assert!(
+                    count >= 1,
+                    "expected >= 1 decoded HEVC frame (hwaccel={hw}), got {count}"
+                );
+            }
+        }
+        assert!(tested, "ffmpeg produced no HEVC test stream");
     }
 }

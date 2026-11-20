@@ -245,7 +245,9 @@ impl ApplicationHandler<AppEvent> for UsherApp {
         #[cfg(target_os = "windows")]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
-            attrs = attrs.with_taskbar_icon(win_icon);
+            attrs = attrs
+                .with_taskbar_icon(win_icon)
+                .with_drag_and_drop(false);
         }
         if sess.initial_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));

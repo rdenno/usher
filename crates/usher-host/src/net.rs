@@ -671,10 +671,14 @@ async fn run_video_tx_loop(
             }
         }
 
-        for dgram in datagrams {
+        let total = datagrams.len();
+        for (idx, dgram) in datagrams.into_iter().enumerate() {
             if let Err(err) = socket.send_to(&dgram, dst).await {
                 tracing::debug!(%dst, "video send_to error: {err}");
                 break;
+            }
+            if total > 24 && (idx & 15) == 15 {
+                tokio::task::yield_now().await;
             }
         }
     }

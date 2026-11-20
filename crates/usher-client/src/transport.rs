@@ -160,11 +160,15 @@ pub async fn start_transport(
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
 
-    let socket = Arc::new(
-        UdpSocket::bind(local_bind)
-            .await
-            .context("binding client UDP socket")?,
-    );
+    let udp = UdpSocket::bind(local_bind)
+        .await
+        .context("binding client UDP socket")?;
+    {
+        let sock_ref = socket2::SockRef::from(&udp);
+        let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
+        let _ = sock_ref.set_send_buffer_size(1024 * 1024);
+    }
+    let socket = Arc::new(udp);
     socket
         .connect(remote_addr)
         .await
@@ -294,7 +298,7 @@ pub async fn start_transport(
             };
 
             let mut last_frame_id: Option<u32> = None;
-            let mut awaiting_keyframe = false;
+            let mut awaiting_keyframe = true;
             let mut last_dec_pli = Instant::now() - Duration::from_secs(1);
 
             while !cancel_dec.is_cancelled() {
@@ -342,7 +346,7 @@ pub async fn start_transport(
                             );
                             decoder = new_dec;
                             active_spec = target_spec;
-                            awaiting_keyframe = false;
+                            awaiting_keyframe = true;
                             last_frame_id = None;
                         }
                         Err(err) => {
@@ -368,6 +372,10 @@ pub async fn start_transport(
                 last_frame_id = Some(au.frame_id);
                 if awaiting_keyframe {
                     if !is_key {
+                        if last_dec_pli.elapsed() >= Duration::from_millis(250) {
+                            last_dec_pli = Instant::now();
+                            let _ = ctrl_tx_dec.try_send(ControlMessage::RequestKeyframe);
+                        }
                         continue;
                     }
                     awaiting_keyframe = false;
