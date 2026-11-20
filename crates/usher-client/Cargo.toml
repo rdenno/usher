@@ -17,8 +17,10 @@ cpal.workspace = true
 gilrs.workspace = true
 openh264.workspace = true
 rusty-opus.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 usher-proto = { path = "../usher-proto" }

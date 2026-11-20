@@ -6,13 +6,14 @@ use openh264::encoder::{
     RateControlMode, SpsPpsStrategy, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSource;
+use std::os::raw::c_int;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use usher_proto::annexb::is_keyframe_annexb;
-use usher_proto::handshake::VideoCodec;
+use usher_proto::handshake::{QualityPreference, VideoCodec};
 
 struct PlanarI420Frame {
     width: usize,
@@ -141,31 +142,63 @@ impl YUVSource for PlanarI420Frame {
     }
 }
 
+pub fn apply_openh264_bitrate(encoder: &mut Encoder, bitrate_kbps: u32) {
+    let bps = bitrate_kbps.saturating_mul(1000).min(i32::MAX as u32) as c_int;
+    let mut max_info = openh264_sys2::SBitrateInfo {
+        iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+        iBitrate: bps,
+    };
+    let mut target_info = openh264_sys2::SBitrateInfo {
+        iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+        iBitrate: bps,
+    };
+    unsafe {
+        let raw = encoder.raw_api();
+        let _ = raw.set_option(
+            openh264_sys2::ENCODER_OPTION_MAX_BITRATE,
+            (&raw mut max_info).cast(),
+        );
+        let _ = raw.set_option(
+            openh264_sys2::ENCODER_OPTION_BITRATE,
+            (&raw mut target_info).cast(),
+        );
+    }
+}
+
 pub async fn run_software_testsrc(
     cfg: VideoPipelineConfig,
+    live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_blocking(cfg, tx, keyframe_req, start, cancel))
-        .await
-        .map_err(|e| anyhow!("software video worker panicked: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        run_blocking(cfg, live_bitrate_kbps, tx, keyframe_req, start, cancel)
+    })
+    .await
+    .map_err(|e| anyhow!("software video worker panicked: {e}"))?
 }
 
 fn run_blocking(
     cfg: VideoPipelineConfig,
+    live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let initial_kbps = live_bitrate_kbps.load(Ordering::Acquire).max(500);
+    let complexity = match cfg.prefer {
+        QualityPreference::Latency => Complexity::Low,
+        QualityPreference::Quality => Complexity::Medium,
+    };
     let enc_cfg = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(cfg.bitrate_kbps.saturating_mul(1000)))
+        .bitrate(BitRate::from_bps(initial_kbps.saturating_mul(1000)))
         .max_frame_rate(FrameRate::from_hz(cfg.fps as f32))
         .rate_control_mode(RateControlMode::Bitrate)
         .usage_type(UsageType::ScreenContentRealTime)
-        .complexity(Complexity::Low)
+        .complexity(complexity)
         .sps_pps_strategy(SpsPpsStrategy::ConstantId)
         .intra_frame_period(IntraFramePeriod::from_num_frames(cfg.fps as u32 * 2))
         .skip_frames(false)
@@ -174,6 +207,8 @@ fn run_blocking(
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), enc_cfg)
         .map_err(|e| anyhow!("failed to create OpenH264 encoder: {e}"))?;
 
+    let mut applied_bitrate = initial_kbps;
+    let mut have_encoded_first = false;
     let mut frame = PlanarI420Frame::new(cfg.width as usize, cfg.height as usize);
     let frame_period = Duration::from_micros(1_000_000 / cfg.fps.max(1) as u64);
     let mut next_tick = Instant::now();
@@ -183,6 +218,14 @@ fn run_blocking(
         frame.render_test_pattern(frame_idx);
         frame_idx += 1;
 
+        if have_encoded_first {
+            let desired = live_bitrate_kbps.load(Ordering::Acquire).max(500);
+            if desired != applied_bitrate {
+                apply_openh264_bitrate(&mut encoder, desired);
+                applied_bitrate = desired;
+            }
+        }
+
         if keyframe_req.swap(false, Ordering::AcqRel) {
             encoder.force_intra_frame();
         }
@@ -190,6 +233,7 @@ fn run_blocking(
         let bs = encoder
             .encode(&frame)
             .map_err(|e| anyhow!("OpenH264 encode failed: {e}"))?;
+        have_encoded_first = true;
         let data = bs.to_vec();
         if !data.is_empty() {
             let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I)

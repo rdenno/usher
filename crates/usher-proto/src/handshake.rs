@@ -17,6 +17,162 @@ pub enum VideoCodec {
     Av1,
 }
 
+impl VideoCodec {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::H264 => 0,
+            Self::Hevc => 1,
+            Self::Av1 => 2,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(Self::H264),
+            1 => Ok(Self::Hevc),
+            2 => Ok(Self::Av1),
+            other => bail!("unknown VideoCodec byte {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodecPreference {
+    #[default]
+    Auto,
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl CodecPreference {
+    pub fn to_reconfigure_u8(self) -> u8 {
+        match self {
+            Self::Auto => 1,
+            Self::H264 => 2,
+            Self::Hevc => 3,
+            Self::Av1 => 4,
+        }
+    }
+
+    pub fn from_reconfigure_u8(val: u8) -> Result<Option<Self>> {
+        match val {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Auto)),
+            2 => Ok(Some(Self::H264)),
+            3 => Ok(Some(Self::Hevc)),
+            4 => Ok(Some(Self::Av1)),
+            other => bail!("unknown CodecPreference reconfigure byte {other}"),
+        }
+    }
+}
+
+impl fmt::Display for CodecPreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::H264 => write!(f, "h264"),
+            Self::Hevc => write!(f, "hevc"),
+            Self::Av1 => write!(f, "av1"),
+        }
+    }
+}
+
+impl FromStr for CodecPreference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "h264" | "h.264" | "avc" => Ok(Self::H264),
+            "hevc" | "h265" | "h.265" => Ok(Self::Hevc),
+            "av1" => Ok(Self::Av1),
+            other => bail!("unsupported codec preference: {other}"),
+        }
+    }
+}
+
+impl From<VideoCodec> for CodecPreference {
+    fn from(c: VideoCodec) -> Self {
+        match c {
+            VideoCodec::H264 => Self::H264,
+            VideoCodec::Hevc => Self::Hevc,
+            VideoCodec::Av1 => Self::Av1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QualityPreference {
+    #[default]
+    Latency,
+    Quality,
+}
+
+impl QualityPreference {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Latency => 0,
+            Self::Quality => 1,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(Self::Latency),
+            1 => Ok(Self::Quality),
+            other => bail!("unknown QualityPreference byte {other}"),
+        }
+    }
+
+    pub fn to_reconfigure_u8(self) -> u8 {
+        match self {
+            Self::Latency => 1,
+            Self::Quality => 2,
+        }
+    }
+
+    pub fn from_reconfigure_u8(val: u8) -> Result<Option<Self>> {
+        match val {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Latency)),
+            2 => Ok(Some(Self::Quality)),
+            other => bail!("unknown QualityPreference reconfigure byte {other}"),
+        }
+    }
+}
+
+impl fmt::Display for QualityPreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Latency => write!(f, "latency"),
+            Self::Quality => write!(f, "quality"),
+        }
+    }
+}
+
+impl FromStr for QualityPreference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "latency" | "low-latency" => Ok(Self::Latency),
+            "quality" => Ok(Self::Quality),
+            other => bail!("unsupported prefer mode: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    pub index: u8,
+    pub name: String,
+    pub width: u16,
+    pub height: u16,
+}
+
 impl fmt::Display for VideoCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -54,6 +210,20 @@ pub struct HelloMessage {
     pub audio_sample_rate: u32,
     pub audio_channels: u8,
     pub mtu: u16,
+    #[serde(default)]
+    pub max_bitrate_kbps: u32,
+    #[serde(default)]
+    pub bitrate_kbps: u32,
+    #[serde(default)]
+    pub fec_percent: u8,
+    #[serde(default)]
+    pub display_index: u8,
+    #[serde(default)]
+    pub displays: Vec<DisplayInfo>,
+    #[serde(default)]
+    pub prefer: QualityPreference,
+    #[serde(default)]
+    pub supported_codecs: Vec<VideoCodec>,
 }
 
 impl HelloMessage {
@@ -218,6 +388,18 @@ mod tests {
             audio_sample_rate: 48_000,
             audio_channels: 2,
             mtu: 1200,
+            max_bitrate_kbps: 60_000,
+            bitrate_kbps: 25_000,
+            fec_percent: 10,
+            display_index: 0,
+            displays: vec![DisplayInfo {
+                index: 0,
+                name: "Primary".into(),
+                width: 1920,
+                height: 1080,
+            }],
+            prefer: QualityPreference::Latency,
+            supported_codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
         };
         let encoded = encode_hello_line(&msg).unwrap();
         assert!(parse_hello_line("Welcome to Ubuntu 24.04 LTS").is_none());
@@ -228,6 +410,17 @@ mod tests {
             .expect("should parse valid hello");
         assert_eq!(parsed, msg);
         assert_eq!(parsed.decode_session_key().unwrap(), key);
+
+        // Legacy v1 payload without extended fields must still deserialize via serde defaults.
+        let legacy = format!(
+            "{{\"version\":1,\"bind_ip\":\"100.88.12.34\",\"port\":51842,\"session_key\":\"{}\",\"width\":1280,\"height\":720,\"fps\":60,\"codec\":\"h264\",\"audio\":true,\"audio_sample_rate\":48000,\"audio_channels\":2,\"mtu\":1200}}",
+            HelloMessage::encode_session_key(&key)
+        );
+        let parsed_legacy = parse_hello_line(&format!("{HELLO_PREFIX}{legacy}"))
+            .expect("prefix")
+            .expect("valid legacy hello");
+        assert_eq!(parsed_legacy.max_bitrate_kbps, 0);
+        assert_eq!(parsed_legacy.prefer, QualityPreference::Latency);
     }
 
     #[test]

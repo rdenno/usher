@@ -6,7 +6,7 @@
   </picture>
   <p><strong>U</strong>DP + <strong>S</strong>S<strong>H</strong> = <strong>E</strong>phemeral <strong>R</strong>emote desktop</p>
   <p>Zero-daemon, SSH-bootstrapped remote desktop &amp; game streaming over Tailscale, ZeroTier, or WireGuard.</p>
-  <p>Zero open ports when idle &middot; No pairing PINs or accounts &middot; Direct ChaCha20-Poly1305 UDP + XOR-FEC</p>
+  <p>Zero open ports when idle &middot; Adaptive bitrate &amp; FEC &middot; Direct ChaCha20-Poly1305 UDP</p>
 </div>
 
 ---
@@ -15,10 +15,12 @@
 usher my-host
 ```
 
-- **SSH key auth only**: Reuses your existing `~/.ssh/config` aliases and public keys with no background server or manual pairing.
-- **Mesh-native UDP**: Caps packets at `<= 1200` bytes for Tailscale/ZeroTier MTU safety and recovers dropped packets with striped XOR-FEC instead of TCP retransmits.
-- **Hardware capture & encode**: Linux (DRM/PipeWire + VAAPI/NVENC, ephemeral headless `sway`/`gamescope`/`cage`) and Windows (DXGI/`ddagrab` + NVENC/AMF/QSV or built-in OpenH264).
-- **Zero-state teardown**: Closing the client window or dropping SSH exits `usher-host`, destroys virtual input/display devices, and closes the UDP port.
+With zero flags, `usher my-host` matches your monitor & refresh rate, picks the best mutual hardware codec (`HEVC`/`AV1` when both ends support it, otherwise `H.264`), and adapts bitrate & FEC automatically to link conditions.
+
+- **SSH key auth only**: Reuses `~/.ssh/config` aliases and public keys with no background server, PINs, or accounts.
+- **Cut-fast, grow-slow adaptive transport**: 500 ms client network reports steer bitrate (up to 60 Mbps by default) and dynamic XOR-FEC parity within `<= 1200`-byte mesh-safe UDP datagrams.
+- **Hidden in-stream overlay (`Ctrl+Alt+S`)**: Tweak bitrate ceiling, resolution, FPS, codec, latency/quality tuning, audio, monitor, pointer mode, or HUD live and save per-host defaults.
+- **Zero-state teardown**: Closing the window or dropping SSH exits `usher-host`, destroys virtual devices, and closes the UDP port.
 
 ---
 
@@ -26,20 +28,16 @@ usher my-host
 
 ### 1. Install
 
-Download the release artifact for your platform from **Releases** (or build from source):
-
 | Platform | Install / Update |
 | :--- | :--- |
-| **Windows** | Run **`usher-setup-windows-x86_64.exe`** (installs Client/Host to `%LOCALAPPDATA%\Programs\Usher` and updates User `PATH`; re-run newer releases to upgrade in place while keeping settings). Portable `usher-windows-x86_64.zip` and [`contrib/install-windows.ps1`](contrib/install-windows.ps1) are also available. |
+| **Windows** | Run **`usher-setup-windows-x86_64.exe`** from **Releases** (installs Client/Host to `%LOCALAPPDATA%\Programs\Usher` and updates User `PATH`; re-run newer releases to upgrade in place while keeping settings). Portable `usher-windows-x86_64.zip` and [`contrib/install-windows.ps1`](contrib/install-windows.ps1) are also provided. |
 | **Linux** | Extract `usher-linux-x86_64.tar.gz` (`usher` + `usher-host`) and run [`./contrib/install-host.sh`](contrib/install-host.sh) once on the host for `/dev/uinput` permissions. |
 | **macOS** | Extract `usher-macos-aarch64.tar.gz` (`usher` client). |
 | **From Source** | `cargo build --release --workspace` |
 
-> After a fresh Windows install, open a **new** PowerShell window (or refresh your current session with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
+> After a fresh Windows install, open a **new** PowerShell window (or refresh `PATH` in your current shell with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
 
 ### 2. Configure SSH (`~/.ssh/config`)
-
-Point a host alias at your desktop's Tailscale, ZeroTier, or WireGuard IP:
 
 ```sshconfig
 Host desktop
@@ -56,7 +54,7 @@ Host desktop
 usher desktop
 ```
 
-Or run a single-machine loopback sanity check without SSH:
+Single-machine loopback check without SSH:
 
 ```bash
 usher --local --capture testsrc
@@ -64,25 +62,43 @@ usher --local --capture testsrc
 
 ---
 
-## Controls & Hotkeys
+## Configuration (`config.toml`)
 
-Window title bar shows live `fps`, `RTT`, `Mbps`, `FEC` recoveries, and pointer mode.
+Optional defaults live at `~/.config/usher/config.toml` (Linux/macOS) or `%APPDATA%\usher\config.toml` (Windows), using the same option names as CLI flags (CLI flags always win). Press `Ctrl+Alt+S` → **Save for `<host>`** mid-stream to write a host section automatically:
+
+```toml
+max_bitrate_kbps = 60000
+prefer = "latency"
+
+[host.desktop]
+max_bitrate_kbps = 80000
+resolution = "match-window"
+fps = 120
+codec = "auto"
+pointer_mode = "relative"
+stats_overlay = true
+```
+
+---
+
+## Controls & Hotkeys
 
 | Shortcut / Input | Action |
 | :--- | :--- |
+| **`Ctrl+Alt+S`** | Toggle the hidden **Settings & Live Stats Overlay** |
 | **`Ctrl+Alt+G`** | Toggle **Absolute** desktop pointer / **Locked Relative** raw mouse (3D games) |
 | **`Ctrl+Alt+F`** | Toggle borderless fullscreen |
 | **`Ctrl+Alt+Q`** | Disconnect and tear down the remote host session |
-| **Gamepads** | Polled automatically via `gilrs` and forwarded as a virtual Xbox 360 pad on Linux hosts |
+| **Gamepads** | Polled via `gilrs` and mapped to a virtual Xbox 360 pad on Linux hosts |
 
 ---
 
 ## How It Works
 
-1. **Bootstrap (`ssh -T`)**: `usher` runs `usher-host` over OpenSSH public-key auth (`BatchMode=yes`).
-2. **Ephemeral Bind & Handshake**: `usher-host` reads `SSH_CONNECTION`, binds an ephemeral UDP port **strictly on the overlay/private IP** (never `0.0.0.0`), generates a 256-bit CSPRNG session key, and prints one `USHER_HELLO {...}` JSON line to stdout.
-3. **Direct Encrypted UDP**: Video frames, striped XOR-FEC parity, 48 kHz Opus audio, and input events flow over `<= 1200`-byte UDP datagrams encrypted with **ChaCha20-Poly1305**, directional BLAKE3 subkeys, and a 128-packet anti-replay window.
-4. **Zero-State Teardown**: SSH `EOF`/`SIGHUP` or `Ctrl+Alt+Q` shuts down pipelines, virtual devices, and sockets immediately.
+1. **Bootstrap (`ssh -T`)**: `usher` probes client monitor/codec support and launches `usher-host` over OpenSSH public-key auth (`BatchMode=yes`).
+2. **Ephemeral Bind & Handshake**: `usher-host` reads `SSH_CONNECTION`, binds an ephemeral UDP port strictly on the overlay/private IP (never `0.0.0.0`), generates a 256-bit CSPRNG key, and emits `USHER_HELLO {...}` on stdout.
+3. **Adaptive Encrypted UDP**: Encrypted ChaCha20-Poly1305 video, XOR-FEC parity, 48 kHz Opus audio, and input events stream over `<= 1200`-byte packets while 500 ms client reports tune bitrate and FEC live.
+4. **Zero-State Teardown**: SSH `EOF`/`SIGHUP` or `Ctrl+Alt+Q` shuts down encoders, virtual devices, and sockets cleanly.
 
 ---
 
@@ -90,15 +106,16 @@ Window title bar shows live `fps`, `RTT`, `Mbps`, `FEC` recoveries, and pointer 
 
 | Flag | Default | Values / Notes |
 | :--- | :--- | :--- |
-| `--capture` | `auto` | `auto`, `drm`, `pipewire`, `x11`, `dxgi` (Windows), `testsrc` |
+| `--max-bitrate-kbps` | `60000` | Adaptive bitrate ceiling in kbps (client/config/host) |
+| `--resolution` | `auto` | `auto` (client monitor), `native` (host monitor), `match-window`, or `WxH` |
+| `--fps` | `auto` | `auto` (client refresh rate) or `1..=240` |
+| `--codec` | `auto` | `auto` (negotiates `hevc`/`av1`/`h264`), `h264`, `hevc`, `av1` |
+| `--prefer` | `latency` | `latency` (lowest delay + higher min FEC) or `quality` |
+| `--display` | `0` | Multi-monitor host display index |
+| `--stats-overlay` | `false` | Show compact top-left live stats HUD by default |
+| `--capture` | `auto` | `auto`, `drm`, `pipewire`, `x11`, `dxgi`, `testsrc` |
 | `--encoder` | `auto` | `auto`, `vaapi`, `nvenc`, `amf`, `qsv`, `openh264` |
-| `--headless` | `none` | Linux ephemeral `WLR_BACKENDS=headless`: `none`, `sway`, `gamescope`, `cage` |
-| `--codec` | `h264` | `h264`, `hevc`, `av1` |
-| `--width` / `--height` | `0` | `0` auto-detects connected display resolution (or `1280x720`) |
-| `--fps` | `60` | Target frame rate |
-| `--bitrate-kbps` | `20000` | CBR target bitrate |
-| `--mtu` | `1200` | Outer UDP packet cap (`<= 1200` recommended for Tailscale/ZeroTier) |
-| `--fec` | `10` | XOR parity percentage (`0..=50`) for packet-loss recovery |
+| `--mtu` / `--fec` | `1200` / `10` | Outer UDP packet cap (`<= 1200`) and initial XOR parity % (`0..=50`) |
 
 > Keep peer-to-peer UDP hole punching active (`tailscale status` showing a direct peer rather than `relay`); `usher` warns if RTT rises above `60 ms`.
 
@@ -108,6 +125,6 @@ Window title bar shows live `fps`, `RTT`, `Mbps`, `FEC` recoveries, and pointer 
 
 | Crate | Purpose |
 | :--- | :--- |
-| [`crates/usher-proto`](crates/usher-proto) | Wire framing, ChaCha20-Poly1305 AEAD, anti-replay, striped XOR-FEC, MTU fragmenter, Annex-B & audio/input codecs |
+| [`crates/usher-proto`](crates/usher-proto) | Wire framing, ChaCha20-Poly1305 AEAD, anti-replay, striped XOR-FEC, AIMD `AdaptiveController`, and codecs |
 | [`crates/usher-host`](crates/usher-host) | `usher-host` binary (Linux DRM/PipeWire/headless + `uinput`, Windows Session 0→1 `ddagrab`/DXGI + WASAPI + `SendInput`) |
-| [`crates/usher-client`](crates/usher-client) | `usher` binary (SSH bootstrapper, `wgpu` BT.709 renderer, `winit` input, `gilrs` gamepad, `cpal` + Opus audio) |
+| [`crates/usher-client`](crates/usher-client) | `usher` binary (SSH bootstrapper, `config.toml`, `Ctrl+Alt+S` overlay, `wgpu` BT.709 renderer, `winit`/`gilrs`/`cpal`) |

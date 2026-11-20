@@ -1,4 +1,5 @@
 use crate::decoder::Yuv420Frame;
+use crate::overlay::OverlayRenderOutput;
 use anyhow::{Context, Result, anyhow};
 use std::future::Future;
 use std::pin::Pin;
@@ -68,6 +69,80 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const OVERLAY_SHADER_WGSL: &str = r#"
+struct OverlayRect {
+    rect: vec4<f32>,
+};
+
+@group(0) @binding(0) var ov_tex: texture_2d<f32>;
+@group(0) @binding(1) var ov_sampler: sampler;
+@group(0) @binding(2) var<uniform> ov: OverlayRect;
+
+struct OvOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn ov_vs(@builtin(vertex_index) idx: u32) -> OvOut {
+    var pos = array<vec2<f32>, 6>(
+        vec2<f32>(ov.rect.x, ov.rect.w),
+        vec2<f32>(ov.rect.z, ov.rect.w),
+        vec2<f32>(ov.rect.x, ov.rect.y),
+        vec2<f32>(ov.rect.x, ov.rect.y),
+        vec2<f32>(ov.rect.z, ov.rect.w),
+        vec2<f32>(ov.rect.z, ov.rect.y),
+    );
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+    );
+    var out: OvOut;
+    out.pos = vec4<f32>(pos[idx], 0.0, 1.0);
+    out.uv = uvs[idx];
+    return out;
+}
+
+@fragment
+fn ov_fs(in: OvOut) -> @location(0) vec4<f32> {
+    return textureSample(ov_tex, ov_sampler, in.uv);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OverlayRectUniform {
+    x0: f32,
+    y_bot: f32,
+    x1: f32,
+    y_top: f32,
+}
+
+impl OverlayRectUniform {
+    fn as_bytes(&self) -> &[u8] {
+        let ptr = (self as *const Self).cast::<u8>();
+        unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<Self>()) }
+    }
+}
+
+struct OverlayResources {
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    uniform_buf: wgpu::Buffer,
+    tex_w: u32,
+    tex_h: u32,
+    tex: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    format: wgpu::TextureFormat,
+    visible: bool,
+    last_panel: (u32, u32, u32, u32),
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UniformData {
@@ -103,6 +178,7 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     uniform_buf: wgpu::Buffer,
     textures: YuvTextures,
+    overlay: OverlayResources,
     has_frame: bool,
 }
 
@@ -250,6 +326,8 @@ impl Renderer {
             initial_video_h.max(2),
         );
 
+        let overlay = create_overlay_resources(&device, format);
+
         Ok(Self {
             surface,
             device,
@@ -260,6 +338,7 @@ impl Renderer {
             sampler,
             uniform_buf,
             textures,
+            overlay,
             has_frame: false,
         })
     }
@@ -272,6 +351,71 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
+    pub fn update_overlay(&mut self, output: Option<&OverlayRenderOutput>) {
+        let Some(out) = output else {
+            self.overlay.visible = false;
+            return;
+        };
+        if out.width == 0 || out.height == 0 || out.rgba.len() < (out.width * out.height * 4) as usize {
+            self.overlay.visible = false;
+            return;
+        }
+
+        if self.overlay.tex_w != out.width || self.overlay.tex_h != out.height {
+            let (tex, bind_group) = allocate_overlay_texture(
+                &self.device,
+                &self.overlay.bgl,
+                &self.overlay.sampler,
+                &self.overlay.uniform_buf,
+                self.overlay.format,
+                out.width,
+                out.height,
+            );
+            self.overlay.tex = tex;
+            self.overlay.bind_group = bind_group;
+            self.overlay.tex_w = out.width;
+            self.overlay.tex_h = out.height;
+        }
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.overlay.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &out.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(out.width * 4),
+                rows_per_image: Some(out.height),
+            },
+            wgpu::Extent3d {
+                width: out.width,
+                height: out.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.overlay.last_panel = (out.panel_x, out.panel_y, out.panel_w, out.panel_h);
+        self.write_overlay_rect_uniform();
+        self.overlay.visible = true;
+    }
+
+    fn write_overlay_rect_uniform(&self) {
+        let (px, py, pw, ph) = self.overlay.last_panel;
+        let ww = self.config.width.max(1) as f32;
+        let wh = self.config.height.max(1) as f32;
+        let u = OverlayRectUniform {
+            x0: (px as f32 / ww) * 2.0 - 1.0,
+            x1: ((px + pw) as f32 / ww) * 2.0 - 1.0,
+            y_top: 1.0 - (py as f32 / wh) * 2.0,
+            y_bot: 1.0 - ((py + ph) as f32 / wh) * 2.0,
+        };
+        self.queue
+            .write_buffer(&self.overlay.uniform_buf, 0, u.as_bytes());
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -280,6 +424,9 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.update_uniform();
+        if self.overlay.visible {
+            self.write_overlay_rect_uniform();
+        }
     }
 
     pub fn render(&mut self, frame: Option<&Yuv420Frame>) {
@@ -355,6 +502,11 @@ impl Renderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.textures.bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            }
+            if self.overlay.visible {
+                pass.set_pipeline(&self.overlay.pipeline);
+                pass.set_bind_group(0, &self.overlay.bind_group, &[]);
+                pass.draw(0..6, 0..1);
             }
         }
 
@@ -569,4 +721,158 @@ fn block_on<F: Future>(fut: F) -> F::Output {
             Poll::Pending => std::thread::park(),
         }
     }
+}
+
+fn create_overlay_resources(
+    device: &wgpu::Device,
+    surface_format: wgpu::TextureFormat,
+) -> OverlayResources {
+    let ov_tex_format = if surface_format.is_srgb() {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    };
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("usher-overlay-shader"),
+        source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER_WGSL.into()),
+    });
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("usher-overlay-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let init_uniform = OverlayRectUniform {
+        x0: -0.5,
+        y_bot: -0.5,
+        x1: 0.5,
+        y_top: 0.5,
+    };
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("usher-overlay-rect-uniform"),
+        contents: init_uniform.as_bytes(),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("usher-overlay-bgl"),
+        entries: &[
+            tex_entry(0),
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("usher-overlay-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("usher-overlay-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("ov_vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("ov_fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let (tex, bind_group) =
+        allocate_overlay_texture(device, &bgl, &sampler, &uniform_buf, ov_tex_format, 4, 4);
+
+    OverlayResources {
+        pipeline,
+        bgl,
+        sampler,
+        uniform_buf,
+        tex_w: 4,
+        tex_h: 4,
+        tex,
+        bind_group,
+        format: ov_tex_format,
+        visible: false,
+        last_panel: (0, 0, 4, 4),
+    }
+}
+
+fn allocate_overlay_texture(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    uniform_buf: &wgpu::Buffer,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("usher-overlay-tex"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("usher-overlay-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: uniform_buf.as_entire_binding(),
+            },
+        ],
+    });
+    (tex, bind_group)
 }

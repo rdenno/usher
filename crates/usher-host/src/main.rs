@@ -9,21 +9,22 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 #[cfg(target_os = "windows")]
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use usher_proto::adapt::{AdaptiveController, DEFAULT_MAX_BITRATE_KBPS};
 use usher_proto::audio::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use usher_proto::crypto::{Role, SessionCrypto, generate_session_key};
 use usher_proto::handshake::{
-    HelloMessage, PROTOCOL_VERSION, VideoCodec, encode_hello_line, is_overlay_or_private_ip,
-    parse_ssh_connection,
+    CodecPreference, DisplayInfo, HelloMessage, PROTOCOL_VERSION, QualityPreference, VideoCodec,
+    encode_hello_line, is_overlay_or_private_ip, parse_ssh_connection,
 };
 use usher_proto::packet::DEFAULT_MTU;
 
@@ -33,8 +34,8 @@ use crate::net::{NetConfig, spawn_network_tasks};
 use crate::video::drm_probe::probe_drm;
 use crate::video::headless::{HeadlessBackend, HeadlessSession};
 use crate::video::{
-    CaptureSource, EncoderKind, ResolvedBackend, VideoPipelineConfig, resolve_video_backend,
-    spawn_video_task,
+    CaptureSource, EncoderKind, VideoPipelineConfig, is_in_place_bitrate_backend, negotiate_codec,
+    probe_host_codecs, resolve_effective_codec, resolve_video_backend, spawn_video_task,
 };
 
 const UDEV_RULE: &str = r#"KERNEL=="uinput", GROUP="input", MODE="0660""#;
@@ -62,13 +63,33 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     fps: u16,
 
-    /// Target video bitrate in kbps
-    #[arg(long, default_value_t = 20_000)]
-    bitrate_kbps: u32,
+    /// Maximum adaptive video bitrate ceiling in kbps
+    #[arg(long, default_value_t = DEFAULT_MAX_BITRATE_KBPS)]
+    max_bitrate_kbps: u32,
 
-    /// Video codec (h264, hevc, av1)
+    /// Optional explicit initial video bitrate in kbps
+    #[arg(long)]
+    bitrate_kbps: Option<u32>,
+
+    /// Video codec preference (auto, h264, hevc, av1)
+    #[arg(long, default_value = "auto")]
+    codec: CodecPreference,
+
+    /// Comma-separated client-supported codecs for auto negotiation
     #[arg(long, default_value = "h264")]
-    codec: VideoCodec,
+    client_codecs: String,
+
+    /// Stream tuning preference (latency, quality)
+    #[arg(long, default_value = "latency")]
+    prefer: QualityPreference,
+
+    /// Host monitor index (for multi-monitor systems)
+    #[arg(long, default_value_t = 0)]
+    display: u8,
+
+    /// Disable adaptive bitrate and FEC adjustments
+    #[arg(long)]
+    no_adaptive: bool,
 
     /// Video capture source
     #[arg(long, value_enum, default_value_t = CaptureSource::Auto)]
@@ -197,18 +218,32 @@ async fn main() -> Result<()> {
 
     let probe = probe_drm();
 
+    #[cfg(target_os = "windows")]
+    let displays: Vec<DisplayInfo> = if capture == CaptureSource::Testsrc {
+        Vec::new()
+    } else {
+        video::windows_capture::enumerate_displays()
+    };
+    #[cfg(target_os = "linux")]
+    let displays: Vec<DisplayInfo> = probe.displays.clone();
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let displays: Vec<DisplayInfo> = Vec::new();
+
+    let active_display = if displays.is_empty() {
+        0
+    } else {
+        args.display.min((displays.len() - 1) as u8)
+    };
+
     let (raw_w, raw_h) = if args.width > 0 && args.height > 0 {
         (args.width, args.height)
     } else if args.headless == HeadlessBackend::None && capture != CaptureSource::Testsrc {
-        #[cfg(target_os = "linux")]
-        let detected = probe.active_mode;
-        #[cfg(target_os = "windows")]
-        let detected = video::windows_capture::primary_monitor_resolution();
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        let res = detected.unwrap_or((1280, 720));
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        let res = (1280, 720);
-        res
+        displays
+            .iter()
+            .find(|d| d.index == active_display)
+            .or_else(|| displays.first())
+            .map(|d| (d.width, d.height))
+            .unwrap_or((1280, 720))
     } else {
         (1280, 720)
     };
@@ -218,46 +253,53 @@ async fn main() -> Result<()> {
     let mtu = args.mtu.max(512);
     let fec = args.fec.min(50);
 
+    let max_bitrate_kbps = args
+        .max_bitrate_kbps
+        .max(args.bitrate_kbps.unwrap_or(0))
+        .max(1_500);
+    let adaptive_controller = AdaptiveController::new(
+        max_bitrate_kbps,
+        args.bitrate_kbps,
+        fec,
+        args.prefer,
+        !args.no_adaptive,
+    );
+    let initial_bitrate_kbps = adaptive_controller.applied_bitrate_kbps;
+    let initial_fec = adaptive_controller.fec_percent;
+
     let headless_session = HeadlessSession::start(args.headless, width, height, fps)?;
+
+    let client_codecs: Vec<VideoCodec> = args
+        .client_codecs
+        .split(',')
+        .filter_map(|s| s.trim().parse::<VideoCodec>().ok())
+        .collect();
+    let host_codecs = probe_host_codecs(capture, args.encoder, &probe);
+    let negotiated_codec = negotiate_codec(args.codec, &client_codecs, &host_codecs);
 
     let mut video_cfg = VideoPipelineConfig {
         width,
         height,
         fps,
-        bitrate_kbps: args.bitrate_kbps,
-        codec: args.codec,
+        bitrate_kbps: initial_bitrate_kbps,
+        codec: negotiated_codec,
         capture,
         encoder: args.encoder,
+        prefer: args.prefer,
+        display_index: active_display,
         render_node: probe.render_node,
         wayland_runtime_dir: headless_session.runtime_dir().map(std::path::Path::to_path_buf),
         wayland_display: headless_session.wayland_display().map(str::to_string),
     };
     let resolved_backend = resolve_video_backend(&video_cfg);
-    let effective_codec = match &resolved_backend {
-        ResolvedBackend::Software => {
-            if args.codec != VideoCodec::H264 {
-                tracing::warn!(
-                    "resolved OpenH264 software backend emits H.264; adjusting handshake codec to h264"
-                );
-            }
-            VideoCodec::H264
-        }
-        #[cfg(target_os = "linux")]
-        ResolvedBackend::Hw(_) => args.codec,
-        #[cfg(target_os = "windows")]
-        ResolvedBackend::Win(video::windows_capture::WinVideoBackend::NativeDxgiOpenH264) => {
-            if args.codec != VideoCodec::H264 {
-                tracing::warn!(
-                    "built-in DXGI + OpenH264 backend emits H.264; adjusting handshake codec to h264"
-                );
-            }
-            VideoCodec::H264
-        }
-        #[cfg(target_os = "windows")]
-        ResolvedBackend::Win(video::windows_capture::WinVideoBackend::DdagrabHw { .. }) => {
-            args.codec
-        }
-    };
+    let effective_codec = resolve_effective_codec(&video_cfg);
+    if effective_codec != negotiated_codec {
+        tracing::warn!(
+            requested = %negotiated_codec,
+            effective = %effective_codec,
+            "selected backend forces codec adjustment"
+        );
+    }
     video_cfg.codec = effective_codec;
 
     let session_key = generate_session_key()?;
@@ -281,6 +323,13 @@ async fn main() -> Result<()> {
         audio_sample_rate: AUDIO_SAMPLE_RATE,
         audio_channels: AUDIO_CHANNELS,
         mtu,
+        max_bitrate_kbps: adaptive_controller.max_bitrate_kbps,
+        bitrate_kbps: initial_bitrate_kbps,
+        fec_percent: initial_fec,
+        display_index: active_display,
+        displays: displays.clone(),
+        prefer: args.prefer,
+        supported_codecs: host_codecs.clone(),
     };
 
     let hello_line = encode_hello_line(&hello)?;
@@ -423,17 +472,34 @@ async fn main() -> Result<()> {
     let (video_tx, video_rx) = mpsc::channel(4);
     let (audio_tx, audio_rx) = mpsc::channel(16);
 
+    let (video_cfg_tx, video_cfg_rx) = watch::channel(video_cfg);
+    let live_bitrate_kbps = Arc::new(AtomicU32::new(initial_bitrate_kbps));
+    let in_place_bitrate = Arc::new(AtomicBool::new(is_in_place_bitrate_backend(
+        &resolved_backend,
+    )));
+    let fec_percent = Arc::new(AtomicU8::new(initial_fec));
+    let audio_enabled = Arc::new(AtomicBool::new(!args.no_audio));
+    let adaptive = Arc::new(Mutex::new(adaptive_controller));
+
     let net_handles = spawn_network_tasks(
         NetConfig {
             socket,
             crypto,
             expected_client_ip,
             mtu: mtu as usize,
-            fec_percent: fec,
+            fec_percent,
+            audio_enabled,
             idle_timeout: Duration::from_secs(args.idle_timeout_secs),
             start,
             keyframe_req: keyframe_req.clone(),
             cancel: cancel.clone(),
+            adaptive,
+            live_bitrate_kbps: live_bitrate_kbps.clone(),
+            in_place_bitrate: in_place_bitrate.clone(),
+            video_cfg_tx,
+            client_codecs,
+            host_codecs,
+            displays,
         },
         input_sink,
         video_rx,
@@ -441,8 +507,9 @@ async fn main() -> Result<()> {
     );
 
     let video_handle = spawn_video_task(
-        video_cfg,
-        resolved_backend,
+        video_cfg_rx,
+        live_bitrate_kbps,
+        in_place_bitrate,
         video_tx,
         keyframe_req,
         start,
@@ -508,10 +575,16 @@ fn build_worker_args(
         args.height.to_string(),
         "--fps".into(),
         args.fps.to_string(),
-        "--bitrate-kbps".into(),
-        args.bitrate_kbps.to_string(),
+        "--max-bitrate-kbps".into(),
+        args.max_bitrate_kbps.to_string(),
         "--codec".into(),
         args.codec.to_string(),
+        "--client-codecs".into(),
+        args.client_codecs.clone(),
+        "--prefer".into(),
+        args.prefer.to_string(),
+        "--display".into(),
+        args.display.to_string(),
         "--capture".into(),
         capture_str.into(),
         "--encoder".into(),
@@ -523,6 +596,13 @@ fn build_worker_args(
         "--idle-timeout-secs".into(),
         args.idle_timeout_secs.to_string(),
     ];
+    if let Some(br) = args.bitrate_kbps {
+        out.push("--bitrate-kbps".into());
+        out.push(br.to_string());
+    }
+    if args.no_adaptive {
+        out.push("--no-adaptive".into());
+    }
     if let Some(ip) = expected_client_ip {
         out.push("--expected-client-ip".into());
         out.push(ip.to_string());

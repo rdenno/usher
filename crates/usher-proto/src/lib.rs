@@ -1,3 +1,4 @@
+pub mod adapt;
 pub mod annexb;
 pub mod audio;
 pub mod crypto;

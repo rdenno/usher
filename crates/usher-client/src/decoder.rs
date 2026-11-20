@@ -3,15 +3,115 @@ use clap::ValueEnum;
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder as OpenH264Inner, DecoderConfig};
 use openh264::formats::YUVSource;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use usher_proto::handshake::VideoCodec;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DecoderKind {
     Auto,
     Openh264,
     Ffmpeg,
+}
+
+pub fn find_working_ffmpeg() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("USHER_FFMPEG") {
+        candidates.push(PathBuf::from(p));
+    }
+    candidates.push(PathBuf::from("ffmpeg"));
+
+    #[cfg(target_os = "windows")]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let scoop_ffmpeg = PathBuf::from(profile).join("scoop").join("apps").join("ffmpeg");
+        if let Ok(entries) = std::fs::read_dir(scoop_ffmpeg) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy() != "current" {
+                    let bin = entry.path().join("bin").join("ffmpeg.exe");
+                    if bin.exists() {
+                        candidates.push(bin);
+                    }
+                }
+            }
+        }
+    }
+
+    for cand in candidates {
+        if let Ok(out) = Command::new(&cand)
+            .args(["-hide_banner", "-version"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            && out.status.success()
+        {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+pub fn probe_client_codecs(kind: DecoderKind) -> Vec<VideoCodec> {
+    if kind == DecoderKind::Openh264 {
+        return vec![VideoCodec::H264];
+    }
+    let Some(ffmpeg) = find_working_ffmpeg() else {
+        return vec![VideoCodec::H264];
+    };
+
+    let hw_ok = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-hwaccels"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            #[cfg(target_os = "windows")]
+            {
+                text.contains("d3d11va") || text.contains("cuda") || text.contains("dxva2")
+            }
+            #[cfg(target_os = "macos")]
+            {
+                text.contains("videotoolbox")
+            }
+            #[cfg(target_os = "linux")]
+            {
+                text.contains("vaapi") || text.contains("cuda") || text.contains("vulkan")
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            {
+                let _ = text;
+                false
+            }
+        });
+
+    let decs_text = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-decoders"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    if hw_ok || kind == DecoderKind::Ffmpeg {
+        if decs_text.contains(" hevc") {
+            out.push(VideoCodec::Hevc);
+        }
+        if decs_text.contains(" av1") || decs_text.contains("libdav1d") {
+            out.push(VideoCodec::Av1);
+        }
+    }
+    if !out.contains(&VideoCodec::H264) {
+        out.push(VideoCodec::H264);
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +211,8 @@ impl FfmpegPipeDecoder {
             VideoCodec::Hevc => "hevc",
             VideoCodec::Av1 => "ivf",
         };
-        let mut child = Command::new("ffmpeg")
+        let ffmpeg_bin = find_working_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        let mut child = Command::new(&ffmpeg_bin)
             .args([
                 "-hide_banner",
                 "-loglevel",

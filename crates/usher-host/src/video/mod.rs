@@ -11,11 +11,11 @@ pub mod windows_capture;
 use clap::ValueEnum;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use usher_proto::handshake::VideoCodec;
+use usher_proto::handshake::{CodecPreference, QualityPreference, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CaptureSource {
@@ -54,6 +54,8 @@ pub struct VideoPipelineConfig {
     pub codec: VideoCodec,
     pub capture: CaptureSource,
     pub encoder: EncoderKind,
+    pub prefer: QualityPreference,
+    pub display_index: u8,
     pub render_node: Option<PathBuf>,
     pub wayland_runtime_dir: Option<PathBuf>,
     pub wayland_display: Option<String>,
@@ -66,6 +68,76 @@ pub enum ResolvedBackend {
     #[cfg(target_os = "windows")]
     Win(windows_capture::WinVideoBackend),
     Software,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub fn probe_host_codecs(
+    capture: CaptureSource,
+    encoder: EncoderKind,
+    probe: &drm_probe::DrmProbe,
+) -> Vec<VideoCodec> {
+    if capture == CaptureSource::Testsrc || encoder == EncoderKind::Openh264 {
+        return vec![VideoCodec::H264];
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_capture::probe_supported_codecs(capture, encoder)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hw_pipeline::probe_linux_supported_codecs(probe)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = probe;
+        vec![VideoCodec::H264]
+    }
+}
+
+pub fn negotiate_codec(
+    pref: CodecPreference,
+    client_codecs: &[VideoCodec],
+    host_codecs: &[VideoCodec],
+) -> VideoCodec {
+    match pref {
+        CodecPreference::H264 => VideoCodec::H264,
+        CodecPreference::Hevc => VideoCodec::Hevc,
+        CodecPreference::Av1 => VideoCodec::Av1,
+        CodecPreference::Auto => {
+            for candidate in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
+                if host_codecs.contains(&candidate) && client_codecs.contains(&candidate) {
+                    return candidate;
+                }
+            }
+            VideoCodec::H264
+        }
+    }
+}
+
+pub fn is_in_place_bitrate_backend(backend: &ResolvedBackend) -> bool {
+    match backend {
+        ResolvedBackend::Software => true,
+        #[cfg(target_os = "linux")]
+        ResolvedBackend::Hw(_) => false,
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(windows_capture::WinVideoBackend::NativeDxgiOpenH264) => true,
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(windows_capture::WinVideoBackend::DdagrabHw { .. }) => false,
+    }
+}
+
+pub fn resolve_effective_codec(cfg: &VideoPipelineConfig) -> VideoCodec {
+    match resolve_video_backend(cfg) {
+        ResolvedBackend::Software => VideoCodec::H264,
+        #[cfg(target_os = "linux")]
+        ResolvedBackend::Hw(_) => cfg.codec,
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(windows_capture::WinVideoBackend::NativeDxgiOpenH264) => {
+            VideoCodec::H264
+        }
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(windows_capture::WinVideoBackend::DdagrabHw { .. }) => cfg.codec,
+    }
 }
 
 pub fn resolve_video_backend(cfg: &VideoPipelineConfig) -> ResolvedBackend {
@@ -89,83 +161,163 @@ pub fn resolve_video_backend(cfg: &VideoPipelineConfig) -> ResolvedBackend {
 }
 
 pub fn spawn_video_task(
-    cfg: VideoPipelineConfig,
-    backend: ResolvedBackend,
+    mut config_rx: watch::Receiver<VideoPipelineConfig>,
+    live_bitrate_kbps: Arc<AtomicU32>,
+    in_place_bitrate: Arc<AtomicBool>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        match backend {
-            #[cfg(target_os = "linux")]
-            ResolvedBackend::Hw(hw_kind) => {
-                tracing::info!(?hw_kind, codec = %cfg.codec, "starting hardware zero-copy video pipeline");
-                match hw_pipeline::run_hw_pipeline(
-                    hw_kind,
-                    cfg.clone(),
-                    tx.clone(),
-                    keyframe_req.clone(),
-                    start,
-                    cancel.clone(),
-                )
-                .await
-                {
-                    Ok(()) => return,
-                    Err(err) => {
-                        tracing::warn!(
-                            "hardware video pipeline failed ({err:#}); falling back to OpenH264 testsrc"
-                        );
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let cfg = config_rx.borrow_and_update().clone();
+            live_bitrate_kbps.store(cfg.bitrate_kbps, Ordering::Release);
+            let backend = resolve_video_backend(&cfg);
+            in_place_bitrate.store(is_in_place_bitrate_backend(&backend), Ordering::Release);
+            let child_cancel = cancel.child_token();
+
+            let runner = run_one_backend(
+                cfg,
+                backend,
+                live_bitrate_kbps.clone(),
+                in_place_bitrate.clone(),
+                tx.clone(),
+                keyframe_req.clone(),
+                start,
+                child_cancel.clone(),
+            );
+            tokio::pin!(runner);
+
+            let mut restart_for_change = false;
+            tokio::select! {
+                _ = &mut runner => {}
+                res = config_rx.changed() => {
+                    if res.is_ok() {
+                        restart_for_change = true;
+                        keyframe_req.store(true, Ordering::Release);
+                        child_cancel.cancel();
+                        let _ = tokio::time::timeout(Duration::from_millis(800), &mut runner).await;
                     }
                 }
+                _ = cancel.cancelled() => {
+                    child_cancel.cancel();
+                    let _ = tokio::time::timeout(Duration::from_millis(500), &mut runner).await;
+                    break;
+                }
             }
-            #[cfg(target_os = "windows")]
-            ResolvedBackend::Win(win_backend) => {
-                let was_hw = matches!(win_backend, windows_capture::WinVideoBackend::DdagrabHw { .. });
-                match windows_capture::run_windows_backend(
-                    win_backend,
-                    cfg.clone(),
-                    tx.clone(),
-                    keyframe_req.clone(),
-                    start,
-                    cancel.clone(),
-                )
-                .await
-                {
-                    Ok(()) => return,
-                    Err(err) => {
-                        tracing::warn!("Windows capture pipeline failed ({err:#})");
-                        if was_hw && !cancel.is_cancelled() && cfg.codec == VideoCodec::H264 {
-                            tracing::info!("falling back to built-in DXGI + OpenH264 capture");
-                            if windows_capture::run_windows_backend(
-                                windows_capture::WinVideoBackend::NativeDxgiOpenH264,
-                                cfg.clone(),
-                                tx.clone(),
-                                keyframe_req.clone(),
-                                start,
-                                cancel.clone(),
-                            )
-                            .await
-                            .is_ok()
-                            {
-                                return;
-                            }
+            if !restart_for_change {
+                break;
+            }
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_backend(
+    cfg: VideoPipelineConfig,
+    backend: ResolvedBackend,
+    live_bitrate_kbps: Arc<AtomicU32>,
+    in_place_bitrate: Arc<AtomicBool>,
+    tx: mpsc::Sender<EncodedFrame>,
+    keyframe_req: Arc<AtomicBool>,
+    start: Instant,
+    child_cancel: CancellationToken,
+) {
+    match backend {
+        #[cfg(target_os = "linux")]
+        ResolvedBackend::Hw(hw_kind) => {
+            tracing::info!(
+                ?hw_kind,
+                codec = %cfg.codec,
+                bitrate_kbps = cfg.bitrate_kbps,
+                "starting hardware zero-copy video pipeline"
+            );
+            match hw_pipeline::run_hw_pipeline(
+                hw_kind,
+                cfg.clone(),
+                tx.clone(),
+                keyframe_req.clone(),
+                start,
+                child_cancel.clone(),
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(err) => {
+                    if child_cancel.is_cancelled() {
+                        return;
+                    }
+                    tracing::warn!(
+                        "hardware video pipeline failed ({err:#}); falling back to OpenH264 testsrc"
+                    );
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        ResolvedBackend::Win(win_backend) => {
+            let was_hw = matches!(win_backend, windows_capture::WinVideoBackend::DdagrabHw { .. });
+            match windows_capture::run_windows_backend(
+                win_backend,
+                cfg.clone(),
+                live_bitrate_kbps.clone(),
+                tx.clone(),
+                keyframe_req.clone(),
+                start,
+                child_cancel.clone(),
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(err) => {
+                    if child_cancel.is_cancelled() {
+                        return;
+                    }
+                    tracing::warn!("Windows capture pipeline failed ({err:#})");
+                    if was_hw && cfg.codec == VideoCodec::H264 {
+                        tracing::info!("falling back to built-in DXGI + OpenH264 capture");
+                        in_place_bitrate.store(true, Ordering::Release);
+                        if windows_capture::run_windows_backend(
+                            windows_capture::WinVideoBackend::NativeDxgiOpenH264,
+                            cfg.clone(),
+                            live_bitrate_kbps.clone(),
+                            tx.clone(),
+                            keyframe_req.clone(),
+                            start,
+                            child_cancel.clone(),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            return;
                         }
                     }
                 }
             }
-            ResolvedBackend::Software => {
-                tracing::info!("starting built-in OpenH264 video stream");
-            }
         }
+        ResolvedBackend::Software => {
+            tracing::info!("starting built-in OpenH264 video stream");
+        }
+    }
 
-        if !cancel.is_cancelled()
-            && let Err(err) =
-                software::run_software_testsrc(cfg, tx, keyframe_req, start, cancel).await
+    if !child_cancel.is_cancelled() {
+        in_place_bitrate.store(true, Ordering::Release);
+        if let Err(err) = software::run_software_testsrc(
+            cfg,
+            live_bitrate_kbps,
+            tx,
+            keyframe_req,
+            start,
+            child_cancel,
+        )
+        .await
         {
             tracing::error!("software encoder stopped: {err:#}");
         }
-    })
+    }
 }
 
 #[cfg(target_os = "linux")]

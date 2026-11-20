@@ -1,4 +1,5 @@
 use super::ivf::IvfReader;
+use super::software::apply_openh264_bitrate;
 use super::{CaptureSource, EncodedFrame, EncoderKind, VideoPipelineConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
@@ -10,16 +11,16 @@ use openh264::formats::YUVSource;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use usher_proto::annexb::{AnnexBSplitter, is_keyframe_annexb};
-use usher_proto::handshake::VideoCodec;
+use usher_proto::handshake::{DisplayInfo, QualityPreference, VideoCodec};
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
@@ -27,8 +28,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice,
-    IDXGIOutput1, IDXGIOutputDuplication,
+    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -70,6 +71,105 @@ pub fn primary_monitor_resolution() -> Option<(u16, u16)> {
     }
 }
 
+struct EnumeratedDisplay {
+    info: DisplayInfo,
+    adapter: IDXGIAdapter1,
+    output_idx: u32,
+}
+
+fn enumerate_windows_adapters_and_outputs() -> (Vec<WinHwVendor>, Vec<EnumeratedDisplay>) {
+    let mut vendors = Vec::new();
+    let mut displays = Vec::new();
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+            return (vendors, displays);
+        };
+        let mut adapter_idx = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
+            adapter_idx += 1;
+            if let Ok(desc) = adapter.GetDesc1() {
+                let vendor = match desc.VendorId {
+                    0x10DE => Some(WinHwVendor::Nvenc),
+                    0x1002 => Some(WinHwVendor::Amf),
+                    0x8086 => Some(WinHwVendor::Qsv),
+                    _ => None,
+                };
+                if let Some(v) = vendor
+                    && !vendors.contains(&v)
+                {
+                    vendors.push(v);
+                }
+            }
+            let mut output_idx = 0u32;
+            while let Ok(output) = adapter.EnumOutputs(output_idx) {
+                if let Ok(desc) = output.GetDesc()
+                    && desc.AttachedToDesktop.as_bool()
+                {
+                    let w = (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left).max(0);
+                    let h = (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top).max(0);
+                    if w >= 64 && h >= 64 && w <= u16::MAX as i32 && h <= u16::MAX as i32 {
+                        let end = desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.DeviceName.len());
+                        let raw_name = String::from_utf16_lossy(&desc.DeviceName[..end]);
+                        let short_name = raw_name
+                            .strip_prefix(r"\\.\")
+                            .unwrap_or(&raw_name)
+                            .to_string();
+                        if let Ok(idx) = u8::try_from(displays.len()) {
+                            let label = if short_name.is_empty() {
+                                format!("Display {}", idx + 1)
+                            } else {
+                                short_name
+                            };
+                            displays.push(EnumeratedDisplay {
+                                info: DisplayInfo {
+                                    index: idx,
+                                    name: label,
+                                    width: (w as u16) & !1,
+                                    height: (h as u16) & !1,
+                                },
+                                adapter: adapter.clone(),
+                                output_idx,
+                            });
+                        }
+                    }
+                }
+                output_idx += 1;
+            }
+        }
+    }
+    (vendors, displays)
+}
+
+pub fn enumerate_displays() -> Vec<DisplayInfo> {
+    let (_, displays) = enumerate_windows_adapters_and_outputs();
+    let mut out: Vec<DisplayInfo> = displays.into_iter().map(|d| d.info).collect();
+    if out.is_empty()
+        && let Some((w, h)) = primary_monitor_resolution()
+    {
+        out.push(DisplayInfo {
+            index: 0,
+            name: "Primary".into(),
+            width: w,
+            height: h,
+        });
+    }
+    out
+}
+
+#[allow(dead_code)]
+pub fn display_resolution(display_index: u8) -> Option<(u16, u16)> {
+    let displays = enumerate_displays();
+    displays
+        .iter()
+        .find(|d| d.index == display_index)
+        .or_else(|| displays.first())
+        .map(|d| (d.width, d.height))
+}
+
 fn find_working_ffmpeg() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("USHER_FFMPEG") {
@@ -107,32 +207,93 @@ fn find_working_ffmpeg() -> Option<PathBuf> {
     None
 }
 
-fn ffmpeg_has_ddagrab_and_encoder(ffmpeg: &Path, encoder: &str) -> bool {
-    let Ok(filters) = std::process::Command::new(ffmpeg)
+fn query_ffmpeg_caps(ffmpeg: &Path) -> Option<(bool, String)> {
+    let filters = std::process::Command::new(ffmpeg)
         .args(["-hide_banner", "-filters"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-    else {
-        return false;
-    };
+        .ok()?;
     let f_text = String::from_utf8_lossy(&filters.stdout);
-    if !f_text.contains("ddagrab") || !f_text.contains("scale_d3d11") {
-        return false;
+    let has_ddagrab = f_text.contains("ddagrab") && f_text.contains("scale_d3d11");
+    if !has_ddagrab {
+        return Some((false, String::new()));
     }
 
-    let Ok(encs) = std::process::Command::new(ffmpeg)
+    let encs = std::process::Command::new(ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-    else {
-        return false;
+        .ok()?;
+    Some((true, String::from_utf8_lossy(&encs.stdout).into_owned()))
+}
+
+fn encoder_candidates(
+    encoder_kind: EncoderKind,
+    codec: VideoCodec,
+    detected_vendors: &[WinHwVendor],
+) -> Vec<(&'static str, WinHwVendor)> {
+    let mut order: Vec<WinHwVendor> = match encoder_kind {
+        EncoderKind::Nvenc => vec![WinHwVendor::Nvenc],
+        EncoderKind::Amf => vec![WinHwVendor::Amf],
+        EncoderKind::Qsv => vec![WinHwVendor::Qsv],
+        EncoderKind::Openh264 => return Vec::new(),
+        EncoderKind::Vaapi | EncoderKind::Auto => {
+            let mut list = Vec::new();
+            for v in [WinHwVendor::Nvenc, WinHwVendor::Amf, WinHwVendor::Qsv] {
+                if detected_vendors.is_empty() || detected_vendors.contains(&v) {
+                    list.push(v);
+                }
+            }
+            list
+        }
     };
-    let e_text = String::from_utf8_lossy(&encs.stdout);
-    e_text.contains(encoder)
+    if order.is_empty() {
+        order = vec![WinHwVendor::Nvenc, WinHwVendor::Amf, WinHwVendor::Qsv];
+    }
+    order
+        .into_iter()
+        .map(|v| {
+            let name = match (v, codec) {
+                (WinHwVendor::Nvenc, VideoCodec::H264) => "h264_nvenc",
+                (WinHwVendor::Nvenc, VideoCodec::Hevc) => "hevc_nvenc",
+                (WinHwVendor::Nvenc, VideoCodec::Av1) => "av1_nvenc",
+                (WinHwVendor::Amf, VideoCodec::H264) => "h264_amf",
+                (WinHwVendor::Amf, VideoCodec::Hevc) => "hevc_amf",
+                (WinHwVendor::Amf, VideoCodec::Av1) => "av1_amf",
+                (WinHwVendor::Qsv, VideoCodec::H264) => "h264_qsv",
+                (WinHwVendor::Qsv, VideoCodec::Hevc) => "hevc_qsv",
+                (WinHwVendor::Qsv, VideoCodec::Av1) => "av1_qsv",
+            };
+            (name, v)
+        })
+        .collect()
+}
+
+pub fn probe_supported_codecs(capture: CaptureSource, encoder: EncoderKind) -> Vec<VideoCodec> {
+    let mut out = Vec::new();
+    if capture != CaptureSource::Testsrc
+        && encoder != EncoderKind::Openh264
+        && let Some(ffmpeg) = find_working_ffmpeg()
+        && let Some((true, encs_text)) = query_ffmpeg_caps(&ffmpeg)
+    {
+        let (vendors, _) = enumerate_windows_adapters_and_outputs();
+        for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
+            for (enc_name, _) in encoder_candidates(encoder, codec, &vendors) {
+                if encs_text.contains(enc_name) {
+                    out.push(codec);
+                    break;
+                }
+            }
+        }
+    }
+    if !out.contains(&VideoCodec::H264) {
+        out.push(VideoCodec::H264);
+    }
+    out
 }
 
 pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBackend> {
@@ -143,37 +304,12 @@ pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBacke
         return Some(WinVideoBackend::NativeDxgiOpenH264);
     }
 
-    if let Some(ffmpeg) = find_working_ffmpeg() {
-        let candidates: &[(&'static str, WinHwVendor)] = match (cfg.encoder, cfg.codec) {
-            (EncoderKind::Nvenc, VideoCodec::H264) => &[("h264_nvenc", WinHwVendor::Nvenc)],
-            (EncoderKind::Nvenc, VideoCodec::Hevc) => &[("hevc_nvenc", WinHwVendor::Nvenc)],
-            (EncoderKind::Nvenc, VideoCodec::Av1) => &[("av1_nvenc", WinHwVendor::Nvenc)],
-            (EncoderKind::Amf, VideoCodec::H264) => &[("h264_amf", WinHwVendor::Amf)],
-            (EncoderKind::Amf, VideoCodec::Hevc) => &[("hevc_amf", WinHwVendor::Amf)],
-            (EncoderKind::Amf, VideoCodec::Av1) => &[("av1_amf", WinHwVendor::Amf)],
-            (EncoderKind::Qsv, VideoCodec::H264) => &[("h264_qsv", WinHwVendor::Qsv)],
-            (EncoderKind::Qsv, VideoCodec::Hevc) => &[("hevc_qsv", WinHwVendor::Qsv)],
-            (EncoderKind::Qsv, VideoCodec::Av1) => &[("av1_qsv", WinHwVendor::Qsv)],
-            (EncoderKind::Auto, VideoCodec::H264) => &[
-                ("h264_nvenc", WinHwVendor::Nvenc),
-                ("h264_amf", WinHwVendor::Amf),
-                ("h264_qsv", WinHwVendor::Qsv),
-            ],
-            (EncoderKind::Auto, VideoCodec::Hevc) => &[
-                ("hevc_nvenc", WinHwVendor::Nvenc),
-                ("hevc_amf", WinHwVendor::Amf),
-                ("hevc_qsv", WinHwVendor::Qsv),
-            ],
-            (EncoderKind::Auto, VideoCodec::Av1) => &[
-                ("av1_nvenc", WinHwVendor::Nvenc),
-                ("av1_amf", WinHwVendor::Amf),
-                ("av1_qsv", WinHwVendor::Qsv),
-            ],
-            _ => &[],
-        };
-
-        for &(enc_name, vendor) in candidates {
-            if ffmpeg_has_ddagrab_and_encoder(&ffmpeg, enc_name) {
+    if let Some(ffmpeg) = find_working_ffmpeg()
+        && let Some((true, encs_text)) = query_ffmpeg_caps(&ffmpeg)
+    {
+        let (vendors, _) = enumerate_windows_adapters_and_outputs();
+        for (enc_name, vendor) in encoder_candidates(cfg.encoder, cfg.codec, &vendors) {
+            if encs_text.contains(enc_name) {
                 return Some(WinVideoBackend::DdagrabHw {
                     ffmpeg_path: ffmpeg,
                     encoder_name: enc_name,
@@ -189,6 +325,7 @@ pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBacke
 pub async fn run_windows_backend(
     backend: WinVideoBackend,
     cfg: VideoPipelineConfig,
+    live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
@@ -204,14 +341,19 @@ pub async fn run_windows_backend(
                 ffmpeg = %ffmpeg_path.display(),
                 encoder = encoder_name,
                 codec = %cfg.codec,
+                display = cfg.display_index,
+                bitrate_kbps = cfg.bitrate_kbps,
                 "starting Windows zero-copy ddagrab hardware video pipeline"
             );
             run_ddagrab_hw(ffmpeg_path, encoder_name, vendor, cfg, tx, keyframe_req, start, cancel)
                 .await
         }
         WinVideoBackend::NativeDxgiOpenH264 => {
-            tracing::info!("starting built-in DXGI Desktop Duplication + OpenH264 capture");
-            run_native_dxgi_openh264(cfg, tx, keyframe_req, start, cancel).await
+            tracing::info!(
+                display = cfg.display_index,
+                "starting built-in DXGI Desktop Duplication + OpenH264 capture"
+            );
+            run_native_dxgi_openh264(cfg, live_bitrate_kbps, tx, keyframe_req, start, cancel).await
         }
     }
 }
@@ -227,8 +369,15 @@ async fn run_ddagrab_hw(
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let buf_frames = match cfg.prefer {
+        QualityPreference::Latency => 1u32,
+        QualityPreference::Quality => 2u32,
+    };
     let br = format!("{}k", cfg.bitrate_kbps);
-    let bufsize = format!("{}k", (cfg.bitrate_kbps / cfg.fps.max(1) as u32).max(200));
+    let bufsize = format!(
+        "{}k",
+        (cfg.bitrate_kbps * buf_frames / cfg.fps.max(1) as u32).max(200)
+    );
     let gop = (cfg.fps as u32 * 2).max(30).to_string();
     let out_fmt = match cfg.codec {
         VideoCodec::H264 => "h264",
@@ -237,8 +386,8 @@ async fn run_ddagrab_hw(
     };
 
     let filter = format!(
-        "ddagrab=output_idx=0:framerate={}:draw_mouse=1:dup_frames=1,scale_d3d11=width={}:height={}:format=nv12",
-        cfg.fps, cfg.width, cfg.height
+        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1,scale_d3d11=width={}:height={}:format=nv12",
+        cfg.display_index, cfg.fps, cfg.width, cfg.height
     );
 
     let mut args = vec![
@@ -259,11 +408,19 @@ async fn run_ddagrab_hw(
 
     match vendor {
         WinHwVendor::Nvenc => {
+            let preset = match cfg.prefer {
+                QualityPreference::Latency => "p1",
+                QualityPreference::Quality => "p4",
+            };
+            let tune = match cfg.prefer {
+                QualityPreference::Latency => "ull",
+                QualityPreference::Quality => "ll",
+            };
             args.extend([
                 "-preset".into(),
-                "p1".into(),
+                preset.into(),
                 "-tune".into(),
-                "ull".into(),
+                tune.into(),
                 "-zerolatency".into(),
                 "1".into(),
                 "-bf".into(),
@@ -283,9 +440,15 @@ async fn run_ddagrab_hw(
             ]);
         }
         WinHwVendor::Amf => {
+            let (usage, quality) = match cfg.prefer {
+                QualityPreference::Latency => ("ultralowlatency", "speed"),
+                QualityPreference::Quality => ("lowlatency", "balanced"),
+            };
             args.extend([
                 "-usage".into(),
-                "ultralowlatency".into(),
+                usage.into(),
+                "-quality".into(),
+                quality.into(),
                 "-rc".into(),
                 "cbr".into(),
                 "-b:v".into(),
@@ -301,9 +464,13 @@ async fn run_ddagrab_hw(
             ]);
         }
         WinHwVendor::Qsv => {
+            let preset = match cfg.prefer {
+                QualityPreference::Latency => "veryfast",
+                QualityPreference::Quality => "balanced",
+            };
             args.extend([
                 "-preset".into(),
-                "veryfast".into(),
+                preset.into(),
                 "-low_power".into(),
                 "1".into(),
                 "-bf".into(),
@@ -506,30 +673,62 @@ struct DxgiSession {
     staging: ID3D11Texture2D,
     src_w: usize,
     src_h: usize,
+    display_index: u8,
 }
 
 impl DxgiSession {
-    fn new() -> Result<Self> {
+    fn new(display_index: u8) -> Result<Self> {
         ensure_dpi_aware();
         unsafe {
-            let mut device = None;
-            let mut ctx = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut ctx),
-            )
-            .context("D3D11CreateDevice failed")?;
+            let (_, displays) = enumerate_windows_adapters_and_outputs();
+            let chosen = displays
+                .iter()
+                .find(|d| d.info.index == display_index)
+                .or_else(|| displays.first());
 
-            let device = device.ok_or_else(|| anyhow!("missing D3D11Device"))?;
-            let ctx = ctx.ok_or_else(|| anyhow!("missing D3D11DeviceContext"))?;
-            let (dupl, staging, src_w, src_h) = Self::create_duplication(&device)?;
+            let (device, ctx, out_idx) = if let Some(entry) = chosen {
+                let mut device = None;
+                let mut ctx = None;
+                D3D11CreateDevice(
+                    &entry.adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut ctx),
+                )
+                .context("D3D11CreateDevice on display adapter failed")?;
+                (
+                    device.ok_or_else(|| anyhow!("missing D3D11Device"))?,
+                    ctx.ok_or_else(|| anyhow!("missing D3D11DeviceContext"))?,
+                    entry.output_idx,
+                )
+            } else {
+                let mut device = None;
+                let mut ctx = None;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut ctx),
+                )
+                .context("D3D11CreateDevice failed")?;
+                (
+                    device.ok_or_else(|| anyhow!("missing D3D11Device"))?,
+                    ctx.ok_or_else(|| anyhow!("missing D3D11DeviceContext"))?,
+                    0,
+                )
+            };
+
+            let (dupl, staging, src_w, src_h) = Self::create_duplication(&device, out_idx)?;
 
             Ok(Self {
                 device,
@@ -538,17 +737,21 @@ impl DxgiSession {
                 staging,
                 src_w,
                 src_h,
+                display_index,
             })
         }
     }
 
     unsafe fn create_duplication(
         device: &ID3D11Device,
+        output_idx: u32,
     ) -> Result<(IDXGIOutputDuplication, ID3D11Texture2D, usize, usize)> {
         unsafe {
             let dxgi_dev: IDXGIDevice = device.cast().context("cast IDXGIDevice")?;
             let adapter = dxgi_dev.GetAdapter().context("IDXGIAdapter")?;
-            let output = adapter.EnumOutputs(0).context("EnumOutputs(0)")?;
+            let output = adapter
+                .EnumOutputs(output_idx)
+                .with_context(|| format!("EnumOutputs({output_idx})"))?;
             let output1: IDXGIOutput1 = output.cast().context("cast IDXGIOutput1")?;
             let dupl = output1
                 .DuplicateOutput(device)
@@ -583,7 +786,12 @@ impl DxgiSession {
 
     fn recreate(&mut self) -> Result<()> {
         unsafe {
-            let (dupl, staging, src_w, src_h) = Self::create_duplication(&self.device)?;
+            let (_, displays) = enumerate_windows_adapters_and_outputs();
+            let out_idx = displays
+                .iter()
+                .find(|d| d.info.index == self.display_index)
+                .map_or(0, |d| d.output_idx);
+            let (dupl, staging, src_w, src_h) = Self::create_duplication(&self.device, out_idx)?;
             self.dupl = dupl;
             self.staging = staging;
             self.src_w = src_w;
@@ -635,30 +843,39 @@ impl DxgiSession {
 
 async fn run_native_dxgi_openh264(
     cfg: VideoPipelineConfig,
+    live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
-    tokio::task::spawn_blocking(move || run_dxgi_blocking(cfg, tx, keyframe_req, start, cancel))
-        .await
-        .map_err(|e| anyhow!("DXGI worker panicked: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        run_dxgi_blocking(cfg, live_bitrate_kbps, tx, keyframe_req, start, cancel)
+    })
+    .await
+    .map_err(|e| anyhow!("DXGI worker panicked: {e}"))?
 }
 
 fn run_dxgi_blocking(
     cfg: VideoPipelineConfig,
+    live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let mut dxgi = DxgiSession::new()?;
+    let mut dxgi = DxgiSession::new(cfg.display_index)?;
+    let initial_kbps = live_bitrate_kbps.load(Ordering::Acquire).max(500);
+    let complexity = match cfg.prefer {
+        QualityPreference::Latency => Complexity::Low,
+        QualityPreference::Quality => Complexity::Medium,
+    };
     let enc_cfg = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(cfg.bitrate_kbps.saturating_mul(1000)))
+        .bitrate(BitRate::from_bps(initial_kbps.saturating_mul(1000)))
         .max_frame_rate(FrameRate::from_hz(cfg.fps as f32))
         .rate_control_mode(RateControlMode::Bitrate)
         .usage_type(UsageType::ScreenContentRealTime)
-        .complexity(Complexity::Low)
+        .complexity(complexity)
         .sps_pps_strategy(SpsPpsStrategy::ConstantId)
         .intra_frame_period(IntraFramePeriod::from_num_frames(cfg.fps as u32 * 2))
         .skip_frames(false)
@@ -667,6 +884,8 @@ fn run_dxgi_blocking(
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), enc_cfg)
         .map_err(|e| anyhow!("failed to create OpenH264 encoder: {e}"))?;
 
+    let mut applied_bitrate = initial_kbps;
+    let mut have_encoded_first = false;
     let mut frame = DxgiI420Frame::new(cfg.width as usize, cfg.height as usize);
     let frame_period = Duration::from_micros(1_000_000 / cfg.fps.max(1) as u64);
     let timeout_ms = frame_period.as_millis().clamp(4, 33) as u32;
@@ -696,6 +915,14 @@ fn run_dxgi_blocking(
             }
         }
 
+        if have_encoded_first {
+            let desired = live_bitrate_kbps.load(Ordering::Acquire).max(500);
+            if desired != applied_bitrate {
+                apply_openh264_bitrate(&mut encoder, desired);
+                applied_bitrate = desired;
+            }
+        }
+
         if keyframe_req.swap(false, Ordering::AcqRel) {
             encoder.force_intra_frame();
         }
@@ -703,6 +930,7 @@ fn run_dxgi_blocking(
         let bs = encoder
             .encode(&frame)
             .map_err(|e| anyhow!("OpenH264 encode failed: {e}"))?;
+        have_encoded_first = true;
         let data = bs.to_vec();
         if !data.is_empty() {
             let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I)

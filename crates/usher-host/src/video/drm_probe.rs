@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use usher_proto::handshake::DisplayInfo;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub struct DrmProbe {
     pub card_node: Option<PathBuf>,
     pub vendor: Option<GpuVendor>,
     pub active_mode: Option<(u16, u16)>,
+    pub displays: Vec<DisplayInfo>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -97,8 +99,17 @@ pub fn probe_drm() -> DrmProbe {
                     && let Ok(modes) = fs::read_to_string(base.join("modes"))
                     && let Some(mode) = parse_drm_mode(&modes)
                 {
-                    probe.active_mode = Some(mode);
-                    break;
+                    if probe.active_mode.is_none() {
+                        probe.active_mode = Some(mode);
+                    }
+                    if let Ok(idx) = u8::try_from(probe.displays.len()) {
+                        probe.displays.push(DisplayInfo {
+                            index: idx,
+                            name: name.clone(),
+                            width: mode.0,
+                            height: mode.1,
+                        });
+                    }
                 }
             }
         }

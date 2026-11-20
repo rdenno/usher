@@ -1,8 +1,10 @@
 mod app;
 mod audio;
+mod config;
 mod decoder;
 mod gamepad;
 mod keymap;
+mod overlay;
 mod renderer;
 mod ssh;
 mod transport;
@@ -10,17 +12,24 @@ mod transport;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
-use usher_proto::handshake::VideoCodec;
-use usher_proto::packet::DEFAULT_MTU;
+use usher_proto::handshake::{CodecPreference, QualityPreference, VideoCodec};
 use winit::event_loop::EventLoop;
 
-use crate::app::UsherApp;
+use crate::app::{ConnectedSession, UsherApp};
 use crate::audio::AudioPlayer;
-use crate::decoder::DecoderKind;
+use crate::config::{
+    EffectiveConfig, FpsSetting, HostSettings, PointerMode, ResolutionMode, default_config_path,
+    load_config,
+};
+use crate::decoder::{DecoderKind, probe_client_codecs};
 use crate::gamepad::spawn_gamepad_thread;
+use crate::overlay::OverlayState;
 use crate::ssh::{HostConnection, SshConnectConfig};
 use crate::transport::{AppEvent, start_transport};
 
@@ -38,9 +47,13 @@ struct Args {
     #[arg(long)]
     local: bool,
 
+    /// Path to config.toml (defaults to ~/.config/usher/config.toml or %APPDATA%\usher\config.toml)
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Remote usher-host binary path/name on the target machine
-    #[arg(long, default_value = "usher-host")]
-    remote_bin: String,
+    #[arg(long)]
+    remote_bin: Option<String>,
 
     /// Extra OpenSSH -o Key=Value option (repeatable)
     #[arg(long = "ssh-opt")]
@@ -50,45 +63,73 @@ struct Args {
     #[arg(long)]
     bind_ip: Option<IpAddr>,
 
-    /// Requested stream width (0 = host auto-detects DRM display or 1280)
-    #[arg(long, default_value_t = 0)]
-    width: u16,
+    /// Maximum adaptive bitrate ceiling in kbps (default: 60000)
+    #[arg(long)]
+    max_bitrate_kbps: Option<u32>,
 
-    /// Requested stream height (0 = host auto-detects DRM display or 720)
-    #[arg(long, default_value_t = 0)]
-    height: u16,
+    /// Optional explicit initial video bitrate in kbps
+    #[arg(long)]
+    bitrate_kbps: Option<u32>,
 
-    /// Target frame rate
-    #[arg(long, default_value_t = 60)]
-    fps: u16,
+    /// Resolution mode (auto, native, match-window, or WxH e.g. 1920x1080)
+    #[arg(long)]
+    resolution: Option<ResolutionMode>,
 
-    /// Target video bitrate in kbps
-    #[arg(long, default_value_t = 20_000)]
-    bitrate_kbps: u32,
+    /// Explicit stream width (overrides resolution mode when paired with --height)
+    #[arg(long)]
+    width: Option<u16>,
 
-    /// Video codec (h264, hevc, av1)
-    #[arg(long, default_value = "h264")]
-    codec: VideoCodec,
+    /// Explicit stream height (overrides resolution mode when paired with --width)
+    #[arg(long)]
+    height: Option<u16>,
+
+    /// Frame rate setting (auto or 1..=240)
+    #[arg(long)]
+    fps: Option<FpsSetting>,
+
+    /// Video codec preference (auto, h264, hevc, av1)
+    #[arg(long)]
+    codec: Option<CodecPreference>,
+
+    /// Stream tuning preference (latency, quality)
+    #[arg(long)]
+    prefer: Option<QualityPreference>,
+
+    /// Host monitor index for multi-monitor setups
+    #[arg(long)]
+    display: Option<u8>,
+
+    /// Default mouse pointer mode (absolute, relative)
+    #[arg(long)]
+    pointer_mode: Option<PointerMode>,
+
+    /// Show compact live stats HUD overlay
+    #[arg(long)]
+    stats_overlay: bool,
+
+    /// Hide compact live stats HUD overlay
+    #[arg(long, conflicts_with = "stats_overlay")]
+    no_stats_overlay: bool,
 
     /// Capture source passed to usher-host (auto, drm, pipewire, x11, dxgi, testsrc)
-    #[arg(long, default_value = "auto")]
-    capture: String,
+    #[arg(long)]
+    capture: Option<String>,
 
     /// Encoder backend passed to usher-host (auto, vaapi, nvenc, amf, qsv, openh264)
-    #[arg(long, default_value = "auto")]
-    encoder: String,
+    #[arg(long)]
+    encoder: Option<String>,
 
     /// Headless Wayland compositor passed to usher-host (none, sway, gamescope, cage)
-    #[arg(long, default_value = "none")]
-    headless: String,
+    #[arg(long)]
+    headless: Option<String>,
 
     /// Outer UDP MTU budget in bytes (recommended <= 1200 for Tailscale/ZeroTier)
-    #[arg(long, default_value_t = DEFAULT_MTU as u16)]
-    mtu: u16,
+    #[arg(long)]
+    mtu: Option<u16>,
 
-    /// XOR FEC parity redundancy percentage (0..=50)
-    #[arg(long, default_value_t = 10)]
-    fec: u8,
+    /// Initial XOR FEC parity redundancy percentage (0..=50)
+    #[arg(long)]
+    fec: Option<u8>,
 
     /// Disable audio playback
     #[arg(long)]
@@ -106,46 +147,122 @@ struct Args {
     #[arg(long)]
     relative_mouse: bool,
 
+    /// Disable automatic adaptive bitrate/FEC on the host
+    #[arg(long)]
+    no_adaptive: bool,
+
     /// Client video decoder backend
-    #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
-    decoder: DecoderKind,
+    #[arg(long, value_enum)]
+    decoder: Option<DecoderKind>,
 }
 
-fn build_host_args(args: &Args) -> Vec<String> {
+fn build_cli_overrides(args: &Args) -> HostSettings {
+    let resolution = if args.width.is_some() || args.height.is_some() {
+        Some(ResolutionMode::Fixed(
+            args.width.unwrap_or(1280),
+            args.height.unwrap_or(720),
+        ))
+    } else {
+        args.resolution
+    };
+    let pointer_mode = if args.relative_mouse {
+        Some(PointerMode::Relative)
+    } else {
+        args.pointer_mode
+    };
+    let stats_overlay = if args.stats_overlay {
+        Some(true)
+    } else if args.no_stats_overlay {
+        Some(false)
+    } else {
+        None
+    };
+
+    HostSettings {
+        max_bitrate_kbps: args.max_bitrate_kbps,
+        resolution,
+        fps: args.fps,
+        codec: args.codec,
+        prefer: args.prefer,
+        audio: if args.no_audio { Some(false) } else { None },
+        display: args.display,
+        pointer_mode,
+        stats_overlay,
+        fullscreen: if args.fullscreen { Some(true) } else { None },
+        capture: args.capture.clone(),
+        encoder: args.encoder.clone(),
+        decoder: args.decoder,
+        headless: args.headless.clone(),
+        mtu: args.mtu,
+        fec: args.fec,
+        remote_bin: args.remote_bin.clone(),
+        bind_ip: args.bind_ip,
+        ssh_opts: if args.ssh_opts.is_empty() {
+            None
+        } else {
+            Some(args.ssh_opts.clone())
+        },
+        no_adaptive: if args.no_adaptive { Some(true) } else { None },
+    }
+}
+
+fn build_host_args(
+    eff: &EffectiveConfig,
+    req_w: u16,
+    req_h: u16,
+    req_fps: u16,
+    client_codecs: &[VideoCodec],
+    is_local: bool,
+) -> Vec<String> {
+    let codec_list = client_codecs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let mut out = vec![
         "--width".into(),
-        args.width.to_string(),
+        req_w.to_string(),
         "--height".into(),
-        args.height.to_string(),
+        req_h.to_string(),
         "--fps".into(),
-        args.fps.to_string(),
-        "--bitrate-kbps".into(),
-        args.bitrate_kbps.to_string(),
+        req_fps.to_string(),
+        "--max-bitrate-kbps".into(),
+        eff.max_bitrate_kbps.to_string(),
         "--codec".into(),
-        args.codec.to_string(),
+        eff.codec.to_string(),
+        "--client-codecs".into(),
+        codec_list,
+        "--prefer".into(),
+        eff.prefer.to_string(),
+        "--display".into(),
+        eff.display.to_string(),
         "--capture".into(),
-        args.capture.clone(),
+        eff.capture.clone(),
         "--encoder".into(),
-        args.encoder.clone(),
+        eff.encoder.clone(),
         "--headless".into(),
-        args.headless.clone(),
+        eff.headless.clone(),
         "--mtu".into(),
-        args.mtu.to_string(),
+        eff.mtu.to_string(),
         "--fec".into(),
-        args.fec.to_string(),
+        eff.fec.to_string(),
     ];
-    if let Some(ip) = args.bind_ip {
+    if let Some(br) = eff.explicit_bitrate_kbps {
+        out.push("--bitrate-kbps".into());
+        out.push(br.to_string());
+    }
+    if eff.no_adaptive {
+        out.push("--no-adaptive".into());
+    }
+    if let Some(ip) = eff.bind_ip {
         out.push("--bind-ip".into());
         out.push(ip.to_string());
-    } else if args.local {
+    } else if is_local {
         out.push("--bind-ip".into());
         out.push("127.0.0.1".into());
     }
-    if args.no_audio {
+    if !eff.audio {
         out.push("--no-audio".into());
-    }
-    if args.no_input {
-        out.push("--no-input".into());
     }
     out
 }
@@ -169,31 +286,18 @@ fn main() -> Result<()> {
         args.host.clone().unwrap_or_default()
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("creating Tokio runtime")?;
-
-    let ssh_cfg = SshConnectConfig {
-        host: args.host.clone(),
-        local: args.local,
-        remote_bin: args.remote_bin.clone(),
-        ssh_opts: args.ssh_opts.clone(),
-        host_args: build_host_args(&args),
-    };
-
-    tracing::info!(target = %host_label, "bootstrapping usher-host via SSH...");
-    let conn = rt.block_on(HostConnection::connect(&ssh_cfg))?;
-    let hello = conn.hello.clone();
-    tracing::info!(
-        bind_ip = %hello.bind_ip,
-        port = hello.port,
-        width = hello.width,
-        height = hello.height,
-        fps = hello.fps,
-        codec = %hello.codec,
-        audio = hello.audio,
-        "handshake received"
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    let cfg_file = load_config(&config_path)?;
+    let cli_overrides = build_cli_overrides(&args);
+    let eff = EffectiveConfig::resolve(
+        &cfg_file,
+        if args.local {
+            Some("local")
+        } else {
+            args.host.as_deref()
+        },
+        &cli_overrides,
+        args.bitrate_kbps,
     );
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
@@ -202,57 +306,160 @@ fn main() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let cancel = CancellationToken::new();
 
-    let (audio_tx, _audio_player) = if !args.no_audio && hello.audio {
-        let (tx, rx) = mpsc::channel(32);
-        match AudioPlayer::start(rx, cancel.clone()) {
-            Ok(player) => (Some(tx), Some(player)),
-            Err(err) => {
-                tracing::warn!("audio output disabled ({err:#})");
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
-
-    let transport = rt.block_on(start_transport(
-        hello.clone(),
-        args.decoder,
-        audio_tx,
-        proxy.clone(),
-        cancel.clone(),
-    ))?;
-
-    // Watch SSH liveness and exit UI cleanly if remote exits
-    {
-        let cancel_ssh = cancel.clone();
-        let proxy_ssh = proxy.clone();
-        rt.spawn(async move {
-            conn.watch_until_shutdown(cancel_ssh).await;
-            let _ = proxy_ssh.send_event(AppEvent::Shutdown);
-        });
-    }
-
-    if !args.no_input {
-        spawn_gamepad_thread(transport.input_tx.clone(), cancel.clone());
-    }
-
-    let mut app = UsherApp::new(
-        host_label,
-        hello.width,
-        hello.height,
-        args.fullscreen,
-        args.relative_mouse,
-        !args.no_input,
-        transport.input_tx,
-        transport.control_tx,
-        transport.decoded_frame_slot,
-        transport.telemetry,
-        cancel.clone(),
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("creating Tokio runtime")?,
     );
 
+    let rt_conn = rt.clone();
+    let cancel_conn = cancel.clone();
+    let no_input = args.no_input;
+    let host_arg = args.host.clone();
+    let is_local = args.local;
+
+    let connect_fn = Box::new(move |mon_info: Option<(u16, u16, u16)>| -> Result<ConnectedSession> {
+        let (mon_w, mon_h, mon_fps) = mon_info.unwrap_or((1920, 1080, 60));
+
+        let (req_w, req_h) = match eff.resolution {
+            ResolutionMode::Auto | ResolutionMode::MatchWindow => {
+                if eff.capture == "testsrc" {
+                    (1280, 720)
+                } else {
+                    (mon_w, mon_h)
+                }
+            }
+            ResolutionMode::Native => (0, 0),
+            ResolutionMode::Fixed(w, h) => ((w.clamp(64, 3840)) & !1, (h.clamp(64, 2160)) & !1),
+        };
+        let req_fps = match eff.fps {
+            FpsSetting::Auto => mon_fps,
+            FpsSetting::Fixed(f) => f.clamp(1, 240),
+        };
+        let client_codecs = probe_client_codecs(eff.decoder);
+
+        let mut host_args = build_host_args(&eff, req_w, req_h, req_fps, &client_codecs, is_local);
+        if no_input {
+            host_args.push("--no-input".into());
+        }
+
+        let ssh_cfg = SshConnectConfig {
+            host: host_arg,
+            local: is_local,
+            remote_bin: eff.remote_bin.clone(),
+            ssh_opts: eff.ssh_opts.clone(),
+            host_args,
+        };
+
+        tracing::info!(
+            target = %host_label,
+            max_bitrate_kbps = eff.max_bitrate_kbps,
+            codec = %eff.codec,
+            prefer = %eff.prefer,
+            width = req_w,
+            height = req_h,
+            fps = req_fps,
+            "bootstrapping usher-host via SSH..."
+        );
+        let conn = rt_conn.block_on(HostConnection::connect(&ssh_cfg))?;
+        let hello = conn.hello.clone();
+        tracing::info!(
+            bind_ip = %hello.bind_ip,
+            port = hello.port,
+            width = hello.width,
+            height = hello.height,
+            fps = hello.fps,
+            codec = %hello.codec,
+            bitrate_kbps = hello.bitrate_kbps,
+            max_bitrate_kbps = hello.max_bitrate_kbps,
+            fec_percent = hello.fec_percent,
+            audio = hello.audio,
+            "handshake received"
+        );
+
+        let audio_muted = Arc::new(AtomicBool::new(!eff.audio || !hello.audio));
+        let (audio_tx, audio_player) = if hello.audio {
+            let (tx, rx) = mpsc::channel(32);
+            match AudioPlayer::start(rx, audio_muted.clone(), cancel_conn.clone()) {
+                Ok(player) => (Some(tx), Some(player)),
+                Err(err) => {
+                    tracing::warn!("audio output disabled ({err:#})");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let transport = rt_conn.block_on(start_transport(
+            hello.clone(),
+            eff.decoder,
+            audio_tx,
+            audio_muted.clone(),
+            proxy.clone(),
+            cancel_conn.clone(),
+        ))?;
+
+        // Watch SSH liveness and exit UI cleanly if remote exits
+        {
+            let cancel_ssh = cancel_conn.clone();
+            let proxy_ssh = proxy.clone();
+            rt_conn.spawn(async move {
+                conn.watch_until_shutdown(cancel_ssh).await;
+                let _ = proxy_ssh.send_event(AppEvent::Shutdown);
+            });
+        }
+
+        if !no_input {
+            spawn_gamepad_thread(transport.input_tx.clone(), cancel_conn.clone());
+        }
+
+        let overlay = OverlayState::new(
+            host_label.clone(),
+            config_path,
+            hello.displays.clone(),
+            (mon_w, mon_h),
+            mon_fps,
+            (hello.width, hello.height),
+            eff.max_bitrate_kbps,
+            eff.resolution,
+            eff.fps,
+            eff.codec,
+            eff.prefer,
+            eff.audio && hello.audio,
+            hello.display_index,
+            eff.pointer_mode,
+            eff.stats_overlay,
+        );
+
+        Ok(ConnectedSession {
+            host_label,
+            video_w: hello.width,
+            video_h: hello.height,
+            initial_fullscreen: eff.fullscreen,
+            relative_mouse: eff.pointer_mode == PointerMode::Relative,
+            input_enabled: !no_input,
+            input_tx: transport.input_tx,
+            control_tx: transport.control_tx,
+            frame_slot: transport.decoded_frame_slot,
+            telemetry: transport.telemetry,
+            audio_muted,
+            overlay,
+            _audio_player: audio_player,
+        })
+    });
+
+    let mut app = UsherApp::new(connect_fn, cancel.clone());
     event_loop.run_app(&mut app)?;
+    let startup_err = app.startup_error.take();
+    drop(app);
     cancel.cancel();
-    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    if let Ok(rt) = Arc::try_unwrap(rt) {
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
+    if let Some(err) = startup_err {
+        return Err(err);
+    }
     Ok(())
 }

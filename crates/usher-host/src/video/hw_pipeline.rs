@@ -1,3 +1,4 @@
+use super::drm_probe::GpuVendor;
 use super::ivf::IvfReader;
 use super::{EncodedFrame, VideoPipelineConfig};
 use anyhow::{Context, Result, bail};
@@ -10,7 +11,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use usher_proto::annexb::{AnnexBSplitter, is_keyframe_annexb};
-use usher_proto::handshake::VideoCodec;
+use usher_proto::handshake::{QualityPreference, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwPipelineKind {
@@ -41,6 +42,32 @@ pub fn ffmpeg_supports_encoder(enc: &str) -> bool {
     };
     let text = String::from_utf8_lossy(&out.stdout);
     text.contains(enc)
+}
+
+pub fn probe_linux_supported_codecs(probe: &super::drm_probe::DrmProbe) -> Vec<VideoCodec> {
+    let mut out = Vec::new();
+    if command_exists("ffmpeg") {
+        let is_nvidia = matches!(probe.vendor, Some(GpuVendor::Nvidia));
+        for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
+            let vaapi = match codec {
+                VideoCodec::H264 => "h264_vaapi",
+                VideoCodec::Hevc => "hevc_vaapi",
+                VideoCodec::Av1 => "av1_vaapi",
+            };
+            let nvenc = match codec {
+                VideoCodec::H264 => "h264_nvenc",
+                VideoCodec::Hevc => "hevc_nvenc",
+                VideoCodec::Av1 => "av1_nvenc",
+            };
+            if (is_nvidia && ffmpeg_supports_encoder(nvenc)) || ffmpeg_supports_encoder(vaapi) {
+                out.push(codec);
+            }
+        }
+    }
+    if !out.contains(&VideoCodec::H264) {
+        out.push(VideoCodec::H264);
+    }
+    out
 }
 
 pub async fn run_hw_pipeline(
@@ -149,10 +176,29 @@ pub async fn run_hw_pipeline(
 }
 
 fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Command> {
+    let buf_frames = match cfg.prefer {
+        QualityPreference::Latency => 1u32,
+        QualityPreference::Quality => 2u32,
+    };
     let br = format!("{}k", cfg.bitrate_kbps);
-    let bufsize = format!("{}k", (cfg.bitrate_kbps / cfg.fps.max(1) as u32).max(200));
+    let bufsize = format!(
+        "{}k",
+        (cfg.bitrate_kbps * buf_frames / cfg.fps.max(1) as u32).max(200)
+    );
     let gop = (cfg.fps as u32 * 2).max(30).to_string();
     let fps_str = cfg.fps.to_string();
+    let nvenc_ffmpeg_preset = match cfg.prefer {
+        QualityPreference::Latency => "p1",
+        QualityPreference::Quality => "p4",
+    };
+    let nvenc_ffmpeg_tune = match cfg.prefer {
+        QualityPreference::Latency => "ull",
+        QualityPreference::Quality => "ll",
+    };
+    let nvenc_gst_preset = match cfg.prefer {
+        QualityPreference::Latency => "low-latency",
+        QualityPreference::Quality => "low-latency-hq",
+    };
     let out_fmt = match cfg.codec {
         VideoCodec::H264 => "h264",
         VideoCodec::Hevc => "hevc",
@@ -289,9 +335,9 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                 "-c:v",
                 enc,
                 "-preset",
-                "p1",
+                nvenc_ffmpeg_preset,
                 "-tune",
-                "ull",
+                nvenc_ffmpeg_tune,
                 "-zerolatency",
                 "1",
                 "-bf",
@@ -326,13 +372,13 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                     format!("vaapiav1enc bitrate={}", cfg.bitrate_kbps)
                 }
                 (HwPipelineKind::PipeWireNvenc, VideoCodec::H264) => {
-                    format!("nvh264enc preset=low-latency-hq zerolatency=true rc-mode=cbr bitrate={} gop-size={gop}", cfg.bitrate_kbps)
+                    format!("nvh264enc preset={nvenc_gst_preset} zerolatency=true rc-mode=cbr bitrate={} gop-size={gop}", cfg.bitrate_kbps)
                 }
                 (HwPipelineKind::PipeWireNvenc, VideoCodec::Hevc) => {
-                    format!("nvh265enc preset=low-latency-hq zerolatency=true rc-mode=cbr bitrate={} gop-size={gop}", cfg.bitrate_kbps)
+                    format!("nvh265enc preset={nvenc_gst_preset} zerolatency=true rc-mode=cbr bitrate={} gop-size={gop}", cfg.bitrate_kbps)
                 }
                 (HwPipelineKind::PipeWireNvenc, VideoCodec::Av1) => {
-                    format!("nvav1enc preset=low-latency-hq bitrate={}", cfg.bitrate_kbps)
+                    format!("nvav1enc preset={nvenc_gst_preset} bitrate={}", cfg.bitrate_kbps)
                 }
                 _ => unreachable!(),
             };

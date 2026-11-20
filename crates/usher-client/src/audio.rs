@@ -3,6 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 use rusty_opus::OpusDecoder;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,7 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     pub fn start(
         mut audio_rx: mpsc::Receiver<AudioPacket>,
+        muted: Arc<AtomicBool>,
         cancel: CancellationToken,
     ) -> Result<Self> {
         let host = cpal::default_host();
@@ -39,6 +41,7 @@ impl AudioPlayer {
         )));
 
         let q_decode = queue.clone();
+        let muted_dec = muted.clone();
         std::thread::spawn(move || {
             let Ok(mut decoder) = OpusDecoder::new(AUDIO_SAMPLE_RATE as i32, AUDIO_CHANNELS as usize)
             else {
@@ -51,6 +54,13 @@ impl AudioPlayer {
                 let Some(pkt) = audio_rx.blocking_recv() else {
                     break;
                 };
+
+                if muted_dec.load(Ordering::Acquire) {
+                    expected_seq = Some(pkt.seq.wrapping_add(1));
+                    let mut guard = q_decode.lock().expect("audio queue poisoned");
+                    guard.clear();
+                    continue;
+                }
 
                 if let Some(exp) = expected_seq {
                     let gap = pkt.seq.wrapping_sub(exp);
@@ -104,19 +114,21 @@ impl AudioPlayer {
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let q = queue.clone();
+                let m = muted.clone();
                 device.build_output_stream(
                     stream_cfg,
-                    move |out: &mut [f32], _| pop_audio_samples(&q, out, |s| s),
+                    move |out: &mut [f32], _| pop_audio_samples(&q, &m, out, |s| s),
                     err_fn,
                     None,
                 )?
             }
             SampleFormat::I16 => {
                 let q = queue.clone();
+                let m = muted.clone();
                 device.build_output_stream(
                     stream_cfg,
                     move |out: &mut [i16], _| {
-                        pop_audio_samples(&q, out, |s| {
+                        pop_audio_samples(&q, &m, out, |s| {
                             (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
                         })
                     },
@@ -126,10 +138,11 @@ impl AudioPlayer {
             }
             SampleFormat::U16 => {
                 let q = queue.clone();
+                let m = muted.clone();
                 device.build_output_stream(
                     stream_cfg,
                     move |out: &mut [u16], _| {
-                        pop_audio_samples(&q, out, |s| {
+                        pop_audio_samples(&q, &m, out, |s| {
                             ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u16
                         })
                     },
@@ -204,9 +217,14 @@ fn push_resampled(
 
 fn pop_audio_samples<T: Sample, F: Fn(f32) -> T>(
     queue: &Mutex<VecDeque<f32>>,
+    muted: &AtomicBool,
     out: &mut [T],
     convert: F,
 ) {
+    if muted.load(Ordering::Acquire) {
+        out.fill(T::EQUILIBRIUM);
+        return;
+    }
     let mut guard = queue.lock().expect("audio queue poisoned");
     for dst in out.iter_mut() {
         *dst = match guard.pop_front() {

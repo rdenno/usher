@@ -137,6 +137,8 @@ pub struct CompletedFrame {
 pub struct ReassembleOutcome {
     pub completed: Option<CompletedFrame>,
     pub request_keyframe: bool,
+    pub packets_lost_unrecovered: u16,
+    pub frames_dropped_incomplete: u16,
 }
 
 struct InFlightFrame {
@@ -164,6 +166,13 @@ impl InFlightFrame {
 
     fn is_complete(&self) -> bool {
         self.received_data == self.data_slots.len()
+    }
+
+    fn missing_data_shards(&self) -> u16 {
+        self.data_slots
+            .len()
+            .saturating_sub(self.received_data)
+            .min(u16::MAX as usize) as u16
     }
 
     fn try_fec_recover(&mut self) {
@@ -275,9 +284,14 @@ impl FrameReassembler {
                     let diff = a.wrapping_sub(b) as i32;
                     diff.cmp(&0)
                 })
+                && let Some(evicted) = self.in_flight.remove(&oldest_id)
             {
-                self.in_flight.remove(&oldest_id);
                 outcome.request_keyframe = true;
+                outcome.frames_dropped_incomplete =
+                    outcome.frames_dropped_incomplete.saturating_add(1);
+                outcome.packets_lost_unrecovered = outcome
+                    .packets_lost_unrecovered
+                    .saturating_add(evicted.missing_data_shards());
             }
         }
 
@@ -327,7 +341,13 @@ impl FrameReassembler {
                 .collect();
             if !older_ids.is_empty() {
                 for id in older_ids {
-                    self.in_flight.remove(&id);
+                    if let Some(evicted) = self.in_flight.remove(&id) {
+                        outcome.frames_dropped_incomplete =
+                            outcome.frames_dropped_incomplete.saturating_add(1);
+                        outcome.packets_lost_unrecovered = outcome
+                            .packets_lost_unrecovered
+                            .saturating_add(evicted.missing_data_shards());
+                    }
                 }
                 outcome.request_keyframe = true;
             }
@@ -422,14 +442,20 @@ mod tests {
         // Complete frame 2 -> evicts incomplete frame 1 and requests keyframe
         let mut saw_pli = false;
         let mut got_f2 = false;
+        let mut dropped_frames = 0u16;
+        let mut lost_pkts = 0u16;
         for (kind, pt) in p2 {
             let res = reassembler.push_packet(kind, &pt).unwrap();
             saw_pli |= res.request_keyframe;
+            dropped_frames += res.frames_dropped_incomplete;
+            lost_pkts += res.packets_lost_unrecovered;
             if res.completed.is_some() {
                 got_f2 = true;
             }
         }
         assert!(got_f2);
         assert!(saw_pli);
+        assert_eq!(dropped_frames, 1);
+        assert_eq!(lost_pkts, 1);
     }
 }

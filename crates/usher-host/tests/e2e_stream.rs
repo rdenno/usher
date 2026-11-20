@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use usher_proto::audio::{AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES_5MS, AUDIO_SAMPLE_RATE, AudioPacket};
 use usher_proto::crypto::{Role, SessionCrypto};
 use usher_proto::fragment::{FrameReassembler, VideoSubheader};
-use usher_proto::handshake::{VideoCodec, parse_hello_line};
+use usher_proto::handshake::{HelloMessage, VideoCodec, parse_hello_line};
 use usher_proto::input::InputEvent;
 use usher_proto::packet::{
     ControlMessage, PacketKind, PingPayload, PongPayload, open_packet, seal_packet,
@@ -27,29 +27,18 @@ impl Drop for ChildGuard {
     }
 }
 
-#[test]
-fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
+fn spawn_test_host(
+    extra_args: &[&str],
+) -> (
+    ChildGuard,
+    std::process::ChildStdin,
+    HelloMessage,
+    UdpSocket,
+    SessionCrypto,
+) {
     let bin = env!("CARGO_BIN_EXE_usher-host");
     let mut child = Command::new(bin)
-        .args([
-            "--bind-ip",
-            "127.0.0.1",
-            "--capture",
-            "testsrc",
-            "--width",
-            "1280",
-            "--height",
-            "720",
-            "--fps",
-            "30",
-            "--bitrate-kbps",
-            "12000",
-            "--fec",
-            "25",
-            "--mtu",
-            "1200",
-            "--no-input",
-        ])
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -58,7 +47,7 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
 
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut guard = ChildGuard(Some(child));
+    let guard = ChildGuard(Some(child));
 
     let mut reader = BufReader::new(stdout);
     let mut hello = None;
@@ -73,6 +62,59 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
         }
     }
     let hello = hello.expect("expected USHER_HELLO line");
+    let key = hello.decode_session_key().expect("valid session key");
+    let crypto = SessionCrypto::new(&key, Role::Client);
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind client UDP");
+    sock.connect(SocketAddr::new(hello.bind_ip, hello.port))
+        .expect("connect client UDP");
+    sock.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set timeout");
+    (guard, stdin, hello, sock, crypto)
+}
+
+fn send_ctrl(sock: &UdpSocket, crypto: &mut SessionCrypto, mtu: u16, msg: &ControlMessage) {
+    let pkt = seal_packet(crypto, PacketKind::Control, &msg.encode(), mtu as usize).unwrap();
+    sock.send(&pkt).unwrap();
+}
+
+fn wait_clean_exit(mut guard: ChildGuard, stdin: std::process::ChildStdin) {
+    drop(stdin);
+    let mut child = guard.0.take().expect("child present");
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break st;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            panic!("usher-host did not exit within 3s of stdin EOF");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "usher-host exited non-zero: {status}");
+}
+
+#[test]
+fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
+    let (guard, stdin, hello, sock, mut crypto) = spawn_test_host(&[
+        "--bind-ip",
+        "127.0.0.1",
+        "--capture",
+        "testsrc",
+        "--width",
+        "1280",
+        "--height",
+        "720",
+        "--fps",
+        "30",
+        "--bitrate-kbps",
+        "12000",
+        "--fec",
+        "25",
+        "--mtu",
+        "1200",
+        "--no-input",
+    ]);
     assert_eq!(hello.bind_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
     assert_eq!(hello.width, 1280);
     assert_eq!(hello.height, 720);
@@ -81,26 +123,15 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
     assert!(hello.audio);
     assert_eq!(hello.mtu, 1200);
 
-    let key = hello.decode_session_key().expect("valid session key");
-    let mut crypto = SessionCrypto::new(&key, Role::Client);
-    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind client UDP");
-    sock.connect(SocketAddr::new(hello.bind_ip, hello.port))
-        .expect("connect client UDP");
-    sock.set_read_timeout(Some(Duration::from_millis(100)))
-        .expect("set timeout");
-
-    let client_hello = seal_packet(
+    send_ctrl(
+        &sock,
         &mut crypto,
-        PacketKind::Control,
+        hello.mtu,
         &ControlMessage::ClientHello {
-            client_version: 1,
-            capabilities: 1,
-        }
-        .encode(),
-        hello.mtu as usize,
-    )
-    .unwrap();
-    sock.send(&client_hello).unwrap();
+            client_version: 2,
+            capabilities: 0x03,
+        },
+    );
 
     let ping = seal_packet(
         &mut crypto,
@@ -133,6 +164,7 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
     let mut opus_pcm = vec![0.0f32; AUDIO_FRAME_SAMPLES_5MS * AUDIO_CHANNELS as usize * 2];
 
     let mut got_pong = false;
+    let mut got_status = false;
     let mut dropped_for_frame = HashSet::<u32>::new();
     let mut fec_recovered_total = 0usize;
     let mut decoded_video_frames = 0usize;
@@ -142,6 +174,7 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
     let deadline = Instant::now() + Duration::from_secs(6);
     while Instant::now() < deadline {
         if got_pong
+            && got_status
             && decoded_video_frames >= 3
             && decoded_audio_frames >= 3
             && fec_recovered_total >= 1
@@ -163,6 +196,14 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
                 let pong = PongPayload::decode(&pt).expect("valid Pong");
                 assert_eq!(pong.sent_us, 987_654);
                 got_pong = true;
+            }
+            PacketKind::Control => {
+                if let ControlMessage::StreamStatus { width, height, .. } =
+                    ControlMessage::decode(&pt).expect("valid Control")
+                {
+                    assert_eq!((width, height), (1280, 720));
+                    got_status = true;
+                }
             }
             PacketKind::VideoData | PacketKind::VideoFec => {
                 let (sub, _) = VideoSubheader::decode_split(&pt).expect("valid subheader");
@@ -200,6 +241,7 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
         }
     }
 
+    assert!(got_status, "did not receive initial StreamStatus");
     assert!(
         got_pong,
         "did not receive Pong reply (video={decoded_video_frames}, audio={decoded_audio_frames}, fec={fec_recovered_total})"
@@ -218,19 +260,121 @@ fn host_streams_encrypted_fec_video_and_opus_audio_and_exits_on_stdin_eof() {
         "expected >= 3 decoded 48kHz Opus frames, got {decoded_audio_frames}"
     );
 
-    // Closing stdin simulates SSH connection drop / EOF; host must exit cleanly right away.
-    drop(stdin);
-    let mut child = guard.0.take().expect("child present");
-    let exit_deadline = Instant::now() + Duration::from_secs(3);
-    let status = loop {
-        if let Some(st) = child.try_wait().expect("try_wait") {
-            break st;
+    wait_clean_exit(guard, stdin);
+}
+
+fn recv_status(
+    sock: &UdpSocket,
+    crypto: &mut SessionCrypto,
+    pred: impl Fn(&ControlMessage) -> bool,
+) -> ControlMessage {
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(n) = sock.recv(&mut buf)
+            && let Ok((PacketKind::Control, _, pt)) = open_packet(crypto, &buf[..n])
+            && let Ok(msg) = ControlMessage::decode(&pt)
+            && pred(&msg)
+        {
+            return msg;
         }
-        if Instant::now() >= exit_deadline {
-            let _ = child.kill();
-            panic!("usher-host did not exit within 3s of stdin EOF");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    assert!(status.success(), "usher-host exited non-zero: {status}");
+    }
+    panic!("timed out waiting for expected StreamStatus");
+}
+
+#[test]
+fn host_adapts_bitrate_and_fec_on_feedback_and_applies_reconfigure() {
+    let (guard, stdin, hello, sock, mut crypto) = spawn_test_host(&[
+        "--bind-ip",
+        "127.0.0.1",
+        "--capture",
+        "testsrc",
+        "--width",
+        "640",
+        "--height",
+        "360",
+        "--fps",
+        "30",
+        "--max-bitrate-kbps",
+        "40000",
+        "--bitrate-kbps",
+        "20000",
+        "--fec",
+        "10",
+        "--no-input",
+    ]);
+
+    send_ctrl(
+        &sock,
+        &mut crypto,
+        hello.mtu,
+        &ControlMessage::ClientHello {
+            client_version: 2,
+            capabilities: 0x03,
+        },
+    );
+
+    let init = recv_status(&sock, &mut crypto, |m| {
+        matches!(
+            m,
+            ControlMessage::StreamStatus {
+                target_bitrate_kbps: 20_000,
+                fec_percent: 10,
+                ..
+            }
+        )
+    });
+    assert!(matches!(init, ControlMessage::StreamStatus { .. }));
+
+    // Simulate loss -> host cuts bitrate fast and raises FEC parity.
+    send_ctrl(
+        &sock,
+        &mut crypto,
+        hello.mtu,
+        &ControlMessage::NetworkFeedback {
+            loss_after_fec_bps: 300,
+            fec_recovery_bps: 0,
+            rtt_us: 10_000,
+            late_frames: 0,
+            recv_kbps: 15_000,
+        },
+    );
+    let adapted = recv_status(&sock, &mut crypto, |m| {
+        matches!(
+            m,
+            ControlMessage::StreamStatus {
+                target_bitrate_kbps,
+                fec_percent,
+                ..
+            } if *target_bitrate_kbps < 20_000 && *fec_percent > 10
+        )
+    });
+    assert!(matches!(adapted, ControlMessage::StreamStatus { .. }));
+
+    // Mid-stream Reconfigure -> clamp max bitrate ceiling to 10 Mbps and mute audio.
+    let mut reconf = ControlMessage::reconfigure_unchanged();
+    if let ControlMessage::Reconfigure {
+        ref mut max_bitrate_kbps,
+        ref mut audio,
+        ..
+    } = reconf
+    {
+        *max_bitrate_kbps = 10_000;
+        *audio = 1;
+    }
+    send_ctrl(&sock, &mut crypto, hello.mtu, &reconf);
+    let reconf_status = recv_status(&sock, &mut crypto, |m| {
+        matches!(
+            m,
+            ControlMessage::StreamStatus {
+                max_bitrate_kbps: 10_000,
+                target_bitrate_kbps,
+                audio_enabled: false,
+                ..
+            } if *target_bitrate_kbps <= 10_000
+        )
+    });
+    assert!(matches!(reconf_status, ControlMessage::StreamStatus { .. }));
+
+    wait_clean_exit(guard, stdin);
 }
