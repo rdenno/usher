@@ -175,8 +175,8 @@ unsafe extern "C" fn vt_output_callback(
         return;
     }
 
-    let w = unsafe { CVPixelBufferGetWidth(image_buffer) } as usize;
-    let h = unsafe { CVPixelBufferGetHeight(image_buffer) } as usize;
+    let w = unsafe { CVPixelBufferGetWidth(image_buffer) };
+    let h = unsafe { CVPixelBufferGetHeight(image_buffer) };
     let y_ptr = unsafe { CVPixelBufferGetBaseAddressOfPlane(image_buffer, 0) };
     let uv_ptr = unsafe { CVPixelBufferGetBaseAddressOfPlane(image_buffer, 1) };
     let y_pitch = unsafe { CVPixelBufferGetBytesPerRowOfPlane(image_buffer, 0) };
@@ -250,7 +250,7 @@ impl VideoToolboxDecoder {
     fn destroy_session(&mut self) {
         unsafe {
             if !self.session.is_null() {
-                VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                let _ = VTDecompressionSessionWaitForAsynchronousFrames(self.session);
                 VTDecompressionSessionInvalidate(self.session);
                 CFRelease(self.session as CFTypeRef);
                 self.session = null_mut();
@@ -337,8 +337,8 @@ impl VideoToolboxDecoder {
                 null(),
                 null(),
                 0,
-                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
             )
         };
         let keys = unsafe { [kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferIOSurfacePropertiesKey] };
@@ -349,8 +349,8 @@ impl VideoToolboxDecoder {
                 keys.as_ptr(),
                 vals.as_ptr(),
                 2,
-                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
             )
         };
 

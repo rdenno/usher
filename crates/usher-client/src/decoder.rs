@@ -197,8 +197,7 @@ pub fn create_decoder(
         }
 
         #[cfg(target_os = "macos")]
-        match crate::vt_decoder::VideoToolboxDecoder::new(codec, width, height, on_frame.clone())
-        {
+        match crate::vt_decoder::VideoToolboxDecoder::new(codec, on_frame.clone()) {
             Ok(dec) => return Ok(Box::new(dec)),
             Err(err) => {
                 if kind == DecoderKind::Native {
