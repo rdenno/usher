@@ -1,9 +1,14 @@
 #[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use rusty_opus::OpusDecoder;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use usher_proto::audio::{AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES_5MS, AUDIO_SAMPLE_RATE, AudioCodec, AudioPacket};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use usher_proto::audio::{
+    AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES_5MS, AUDIO_SAMPLE_RATE, AudioCodec,
+};
+use usher_proto::audio::AudioPacket;
 
 #[allow(unused_variables, unused_mut)]
 pub fn spawn_mic_sink_task(
@@ -31,6 +36,7 @@ pub fn spawn_mic_sink_task(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn decode_packet(decoder: &mut OpusDecoder, pkt: &AudioPacket, pcm_scratch: &mut Vec<f32>) -> usize {
     let ch = AUDIO_CHANNELS as usize;
     match pkt.codec {

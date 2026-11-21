@@ -136,12 +136,14 @@ pub enum HostCursorEvent {
 
 /// Requests a single crisp IDR frame refresh after the screen stays visually
 /// unchanged for at least 350ms, then stays idle until the next pixel change.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 pub struct StaticRefreshTracker {
     last_hash: Option<u64>,
     changed_at: Instant,
     refreshed: bool,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 impl StaticRefreshTracker {
     pub fn new(now: Instant) -> Self {
         Self {
@@ -181,6 +183,7 @@ impl StaticRefreshTracker {
     }
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 fn sample_frame_hash(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (data.len() as u64);
     if data.is_empty() {

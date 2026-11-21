@@ -70,7 +70,7 @@ pub fn spawn_clipboard_task(
     })
 }
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn has_linux_display_vars(display: Option<&str>, wayland_display: Option<&str>) -> bool {
     display.is_some_and(|s| !s.is_empty()) || wayland_display.is_some_and(|s| !s.is_empty())
 }
