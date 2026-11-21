@@ -307,6 +307,7 @@ pub struct HostSettings {
     pub fec: Option<u8>,
     pub remote_bin: Option<String>,
     pub bind_ip: Option<IpAddr>,
+    pub endpoints: Option<Vec<String>>,
     pub ssh_opts: Option<Vec<String>>,
     pub no_adaptive: Option<bool>,
     pub no_system: Option<bool>,
@@ -345,6 +346,7 @@ impl HostSettings {
         take_some!(fec);
         take_some!(remote_bin);
         take_some!(bind_ip);
+        take_some!(endpoints);
         take_some!(ssh_opts);
         take_some!(no_adaptive);
         take_some!(no_system);
@@ -387,6 +389,7 @@ pub struct EffectiveConfig {
     pub fec: u8,
     pub remote_bin: String,
     pub bind_ip: Option<IpAddr>,
+    pub endpoints: Vec<String>,
     pub ssh_opts: Vec<String>,
     pub no_adaptive: bool,
     pub no_system: bool,
@@ -420,6 +423,7 @@ impl Default for EffectiveConfig {
             fec: 10,
             remote_bin: "usher-host".to_string(),
             bind_ip: None,
+            endpoints: Vec::new(),
             ssh_opts: Vec::new(),
             no_adaptive: false,
             no_system: false,
@@ -469,6 +473,7 @@ impl EffectiveConfig {
             fec: merged.fec.unwrap_or(def.fec),
             remote_bin: merged.remote_bin.unwrap_or(def.remote_bin),
             bind_ip: merged.bind_ip,
+            endpoints: merged.endpoints.unwrap_or(def.endpoints),
             ssh_opts: merged.ssh_opts.unwrap_or(def.ssh_opts),
             no_adaptive: merged.no_adaptive.unwrap_or(def.no_adaptive),
             no_system: merged.no_system.unwrap_or(def.no_system),
@@ -654,5 +659,46 @@ mic = false
         assert_eq!(eff_tv.display, DisplaySelector::Index(2));
         assert_eq!(eff_tv.chroma, ChromaPreference::Yuv420);
         assert!(!eff_tv.mic);
+    }
+
+    #[test]
+    fn resolves_and_preserves_host_endpoints_across_overlay_saves() {
+        let tmp = std::env::temp_dir().join(format!(
+            "usher-endpoints-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let initial = r#"
+[host.lolas-computer]
+endpoints = ["100.66.242.48", "172.28.159.21"]
+max_bitrate_kbps = 20000
+"#;
+        std::fs::write(&tmp, initial).unwrap();
+
+        let cfg = load_config(&tmp).unwrap();
+        let eff = EffectiveConfig::resolve(&cfg, Some("lolas-computer"), &HostSettings::default(), None);
+        assert_eq!(
+            eff.endpoints,
+            vec!["100.66.242.48".to_string(), "172.28.159.21".to_string()]
+        );
+
+        // Saving unrelated overlay settings must preserve configured endpoints.
+        let overlay_save = HostSettings {
+            max_bitrate_kbps: Some(25_000),
+            stats_overlay: Some(true),
+            ..Default::default()
+        };
+        save_host_settings(&tmp, "lolas-computer", &overlay_save).unwrap();
+
+        let reloaded = load_config(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let eff_after =
+            EffectiveConfig::resolve(&reloaded, Some("lolas-computer"), &HostSettings::default(), None);
+        assert_eq!(eff_after.max_bitrate_kbps, 25_000);
+        assert_eq!(
+            eff_after.endpoints,
+            vec!["100.66.242.48".to_string(), "172.28.159.21".to_string()]
+        );
     }
 }

@@ -345,6 +345,8 @@ struct RxState<'a> {
     pkts_ok_in_win: u64,
     fec_rec_in_win: u64,
     lost_in_win: u64,
+    rtt_min_in_win: u32,
+    rtt_samples_in_win: u32,
     last_pli: Instant,
     derp_warned: bool,
     video_pkts_rx: u64,
@@ -453,6 +455,12 @@ impl<'a> RxState<'a> {
                     let prev = self.telem.rtt_us.load(Ordering::Acquire);
                     let smoothed = if prev == 0 { rtt } else { (prev * 3 + rtt) / 4 };
                     self.telem.rtt_us.store(smoothed, Ordering::Release);
+                    self.rtt_min_in_win = if self.rtt_samples_in_win == 0 {
+                        rtt
+                    } else {
+                        self.rtt_min_in_win.min(rtt)
+                    };
+                    self.rtt_samples_in_win += 1;
                     if smoothed > 60_000
                         && !self.derp_warned
                         && self.telem.transport_mode.load(Ordering::Acquire) == TRANSPORT_UDP
@@ -1003,6 +1011,8 @@ pub async fn start_transport(
                 pkts_ok_in_win: 0,
                 fec_rec_in_win: 0,
                 lost_in_win: 0,
+                rtt_min_in_win: 0,
+                rtt_samples_in_win: 0,
                 last_pli: Instant::now() - Duration::from_secs(1),
                 derp_warned: false,
                 video_pkts_rx: 0,
@@ -1058,7 +1068,11 @@ pub async fn start_transport(
                             .store(rec_bps as u32, Ordering::Release);
 
                         if connected_rx.load(Ordering::Acquire) {
-                            let rtt_us = telem.rtt_us.load(Ordering::Acquire);
+                            let rtt_us = if state.rtt_samples_in_win > 0 {
+                                state.rtt_min_in_win
+                            } else {
+                                0
+                            };
                             let _ = ctrl_tx_fb.try_send(ControlMessage::NetworkFeedback {
                                 loss_after_fec_bps: loss_bps,
                                 fec_recovery_bps: rec_bps,
@@ -1072,6 +1086,8 @@ pub async fn start_transport(
                         state.pkts_ok_in_win = 0;
                         state.fec_rec_in_win = 0;
                         state.lost_in_win = 0;
+                        state.rtt_min_in_win = 0;
+                        state.rtt_samples_in_win = 0;
                         bw_window_start = Instant::now();
                     }
                     pkt_res = async {
@@ -1142,7 +1158,7 @@ pub async fn start_transport(
                     .await;
             }
 
-            let mut ping_tick = tokio::time::interval(Duration::from_secs(1));
+            let mut ping_tick = tokio::time::interval(Duration::from_millis(250));
             let mut retry_tick = tokio::time::interval(Duration::from_millis(200));
             let mut clip_transfer_id = 1u32;
             let clip_max_pt = max_plaintext_len(mtu);

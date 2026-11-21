@@ -116,9 +116,39 @@ pub async fn run_doctor(
     };
 
     // 3) Resolve SSH target IP & Tailscale/ZeroTier link path
+    let (resolved_ssh_opts, probe_summary) = crate::ssh::resolve_ssh_opts_with_endpoints(
+        host_alias,
+        is_local,
+        &eff.endpoints,
+        ssh_args,
+        &eff.ssh_opts,
+    )
+    .await;
+    if let Some(summary) = probe_summary {
+        println!(
+            "[INFO] Multi-endpoint probe -> selected `{}`{}",
+            summary.chosen,
+            summary.chosen_rtt.map_or_else(String::new, |r| {
+                format!(" ({:.1} ms)", r.as_secs_f64() * 1000.0)
+            })
+        );
+        for res in &summary.results {
+            if let Some(rtt) = res.rtt {
+                println!(
+                    "       - {}: {:.1} ms",
+                    res.endpoint,
+                    rtt.as_secs_f64() * 1000.0
+                );
+            } else if let Some(ref err) = res.error {
+                println!("       - {}: unavailable ({err})", res.endpoint);
+            } else {
+                println!("       - {}: selected", res.endpoint);
+            }
+        }
+    }
     let mut target_ip: Option<IpAddr> = None;
     if let Some(alias) = host_alias {
-        match resolve_ssh_hostname(alias, ssh_args) {
+        match resolve_ssh_hostname(alias, ssh_args, &resolved_ssh_opts) {
             Some(host_str) => {
                 println!("[INFO] SSH target `{alias}` -> HostName `{host_str}`");
                 if let Ok(ip) = host_str.parse::<IpAddr>() {
@@ -172,7 +202,7 @@ pub async fn run_doctor(
         local: is_local,
         remote_bin: eff.remote_bin.clone(),
         ssh_args: ssh_args.to_vec(),
-        ssh_opts: eff.ssh_opts.clone(),
+        ssh_opts: resolved_ssh_opts,
         batch_mode: eff.batch_mode,
         auto_install: eff.auto_install,
         host_args,
@@ -517,9 +547,17 @@ fn check_mesh_path(target_ip: IpAddr) {
     }
 }
 
-pub fn resolve_ssh_hostname(alias: &str, ssh_args: &[String]) -> Option<String> {
-    let out = std::process::Command::new("ssh")
-        .args(ssh_args)
+pub fn resolve_ssh_hostname(
+    alias: &str,
+    ssh_args: &[String],
+    ssh_opts: &[String],
+) -> Option<String> {
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(ssh_args);
+    for opt in ssh_opts {
+        cmd.arg("-o").arg(opt);
+    }
+    let out = cmd
         .args(["-G", alias])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

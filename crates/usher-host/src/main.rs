@@ -293,8 +293,47 @@ impl crate::input::InputSink for PipeInputSink {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[cfg(target_os = "windows")]
+struct HighResTimerGuard(u32);
+
+#[cfg(target_os = "windows")]
+impl HighResTimerGuard {
+    fn new(period_ms: u32) -> Self {
+        unsafe {
+            if windows::Win32::Media::timeBeginPeriod(period_ms)
+                == windows::Win32::Media::TIMERR_NOERROR
+            {
+                Self(period_ms)
+            } else {
+                Self(0)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for HighResTimerGuard {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            unsafe {
+                let _ = windows::Win32::Media::timeEndPeriod(self.0);
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("creating Tokio runtime")?;
+    let res = rt.block_on(async_main());
+    // Bounded shutdown ensures a blocked stdin ReadFile thread on Windows never leaves an orphaned process.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    res
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
 
     if args.print_udev_rule {
@@ -348,6 +387,9 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+
+    #[cfg(target_os = "windows")]
+    let _timer_guard = HighResTimerGuard::new(1);
 
     let (bind_ip, detected_client_ip) = resolve_bind_ip(args.bind_ip, args.allow_public)?;
     let expected_client_ip = args.expected_client_ip.or(detected_client_ip);
@@ -1051,6 +1093,7 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
         .context("sending console worker HelloInfo")?;
 
     let worker_cancel = CancellationToken::new();
+    let _timer_guard = HighResTimerGuard::new(1);
     let start = Instant::now();
     let mut input_sink = create_input_sink(!args.no_input);
 

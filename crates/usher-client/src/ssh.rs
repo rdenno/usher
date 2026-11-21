@@ -3,9 +3,11 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use usher_proto::handshake::{HelloMessage, parse_hello_line};
 
@@ -85,6 +87,287 @@ pub fn map_remote_target(os_arch_output: &str) -> Result<RemoteTarget> {
             os_arch_output.trim()
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointProbeResult {
+    pub endpoint: String,
+    pub rtt: Option<Duration>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointProbeSummary {
+    pub chosen: String,
+    pub chosen_rtt: Option<Duration>,
+    pub results: Vec<EndpointProbeResult>,
+}
+
+fn is_hostname_ssh_opt(opt: &str) -> bool {
+    let lower = opt.trim().to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("hostname") {
+        rest.starts_with('=') || rest.starts_with(' ') || rest.starts_with('\t')
+    } else {
+        false
+    }
+}
+
+/// Returns `true` if OpenSSH arguments or `ssh_opts` already specify `-o HostName=...`.
+pub fn has_explicit_hostname_override(ssh_args: &[String], ssh_opts: &[String]) -> bool {
+    if ssh_opts.iter().any(|o| is_hostname_ssh_opt(o)) {
+        return true;
+    }
+    let mut i = 0usize;
+    while i < ssh_args.len() {
+        let arg = &ssh_args[i];
+        if arg == "-o" {
+            if let Some(val) = ssh_args.get(i + 1)
+                && is_hostname_ssh_opt(val)
+            {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("-o")
+            && !val.is_empty()
+            && is_hostname_ssh_opt(val)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Parses `port` and whether a non-`none` `ProxyJump` is configured from `ssh -G` output.
+pub fn parse_ssh_g_endpoint_meta(stdout: &str) -> (u16, bool) {
+    let mut port = 22u16;
+    let mut uses_proxy_jump = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("port ")
+            && let Ok(p) = rest.trim().parse::<u16>()
+            && p > 0
+        {
+            port = p;
+        } else if let Some(rest) = trimmed.strip_prefix("proxyjump ") {
+            let val = rest.trim();
+            if !val.is_empty() && !val.eq_ignore_ascii_case("none") {
+                uses_proxy_jump = true;
+            }
+        }
+    }
+    (port, uses_proxy_jump)
+}
+
+/// Selects the lowest-RTT endpoint, breaking near-ties within `tie_margin` by config order.
+pub fn pick_best_endpoint(
+    results: &[(usize, String, Duration)],
+    tie_margin: Duration,
+) -> Option<(String, Duration)> {
+    let min_rtt = results.iter().map(|(_, _, r)| *r).min()?;
+    let cutoff = min_rtt.saturating_add(tie_margin);
+    results
+        .iter()
+        .filter(|(_, _, r)| *r <= cutoff)
+        .min_by_key(|(idx, _, _)| *idx)
+        .map(|(_, ep, r)| (ep.clone(), *r))
+}
+
+async fn probe_endpoint_set(candidates: &[String], port: u16) -> Option<EndpointProbeSummary> {
+    const OVERALL_TIMEOUT: Duration = Duration::from_millis(2000);
+    const TIE_GRACE: Duration = Duration::from_millis(50);
+    const TIE_MARGIN: Duration = Duration::from_millis(5);
+
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        let ep = candidates[0].clone();
+        return Some(EndpointProbeSummary {
+            chosen: ep.clone(),
+            chosen_rtt: None,
+            results: vec![EndpointProbeResult {
+                endpoint: ep,
+                rtt: None,
+                error: None,
+            }],
+        });
+    }
+
+    let overall_deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
+    let mut grace_deadline: Option<tokio::time::Instant> = None;
+    let mut set = JoinSet::new();
+    for (idx, ep) in candidates.iter().enumerate() {
+        let ep_owned = ep.clone();
+        set.spawn(async move {
+            let t0 = Instant::now();
+            match TcpStream::connect((ep_owned.as_str(), port)).await {
+                Ok(_stream) => (idx, ep_owned, Ok(t0.elapsed())),
+                Err(err) => (idx, ep_owned, Err(err.to_string())),
+            }
+        });
+    }
+
+    let mut outcomes: Vec<Option<EndpointProbeResult>> = vec![None; candidates.len()];
+    let mut succeeded: Vec<(usize, String, Duration)> = Vec::new();
+
+    while !set.is_empty() {
+        let deadline = grace_deadline.map_or(overall_deadline, |g| g.min(overall_deadline));
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                set.abort_all();
+                break;
+            }
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, ep, Ok(rtt)))) => {
+                        outcomes[idx] = Some(EndpointProbeResult {
+                            endpoint: ep.clone(),
+                            rtt: Some(rtt),
+                            error: None,
+                        });
+                        succeeded.push((idx, ep, rtt));
+                        if grace_deadline.is_none() {
+                            grace_deadline =
+                                Some((tokio::time::Instant::now() + TIE_GRACE).min(overall_deadline));
+                        }
+                    }
+                    Some(Ok((idx, ep, Err(err)))) => {
+                        outcomes[idx] = Some(EndpointProbeResult {
+                            endpoint: ep,
+                            rtt: None,
+                            error: Some(err),
+                        });
+                    }
+                    Some(Err(_)) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let (chosen, chosen_rtt) = pick_best_endpoint(&succeeded, TIE_MARGIN)?;
+    let results = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, ep)| {
+            outcomes[idx].take().unwrap_or_else(|| EndpointProbeResult {
+                endpoint: ep.clone(),
+                rtt: None,
+                error: Some("timed out / slower than winner".to_string()),
+            })
+        })
+        .collect();
+
+    Some(EndpointProbeSummary {
+        chosen,
+        chosen_rtt: Some(chosen_rtt),
+        results,
+    })
+}
+
+async fn query_ssh_g_endpoint_meta(
+    host_alias: &str,
+    ssh_args: &[String],
+    ssh_opts: &[String],
+) -> (u16, bool) {
+    let mut cmd = Command::new("ssh");
+    cmd.args(ssh_args);
+    for opt in ssh_opts {
+        cmd.arg("-o").arg(opt);
+    }
+    cmd.arg("-G").arg(host_alias);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(3), cmd.output()).await else {
+        return (22, false);
+    };
+    if !out.status.success() {
+        return (22, false);
+    }
+    parse_ssh_g_endpoint_meta(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Probes configured candidate endpoints concurrently on the resolved SSH TCP port and
+/// selects the fastest reachable endpoint (preferring earlier order within a 5 ms tie margin).
+pub async fn probe_fastest_endpoint(
+    host_alias: &str,
+    endpoints: &[String],
+    ssh_args: &[String],
+    ssh_opts: &[String],
+) -> Option<EndpointProbeSummary> {
+    let mut candidates = Vec::new();
+    for ep in endpoints {
+        let clean = ep.trim();
+        if !clean.is_empty() && !candidates.iter().any(|c| c == clean) {
+            candidates.push(clean.to_string());
+        }
+    }
+    if candidates.is_empty() || has_explicit_hostname_override(ssh_args, ssh_opts) {
+        return None;
+    }
+
+    let (port, uses_proxy_jump) = query_ssh_g_endpoint_meta(host_alias, ssh_args, ssh_opts).await;
+    if uses_proxy_jump {
+        tracing::debug!(
+            host = %host_alias,
+            "ProxyJump configured in SSH; skipping multi-endpoint TCP probe"
+        );
+        return None;
+    }
+
+    let summary = probe_endpoint_set(&candidates, port).await;
+    if summary.is_none() {
+        tracing::warn!(
+            host = %host_alias,
+            port,
+            candidates = ?candidates,
+            "all configured endpoints failed TCP probe; falling back to SSH config HostName"
+        );
+    }
+    summary
+}
+
+/// Resolves SSH options with `-o HostName=<best>` prepended when multi-endpoint probing selects
+/// an endpoint for a non-local target.
+pub async fn resolve_ssh_opts_with_endpoints(
+    host_alias: Option<&str>,
+    is_local: bool,
+    endpoints: &[String],
+    ssh_args: &[String],
+    ssh_opts: &[String],
+) -> (Vec<String>, Option<EndpointProbeSummary>) {
+    if is_local || endpoints.is_empty() {
+        return (ssh_opts.to_vec(), None);
+    }
+    let Some(alias) = host_alias else {
+        return (ssh_opts.to_vec(), None);
+    };
+    let summary = probe_fastest_endpoint(alias, endpoints, ssh_args, ssh_opts).await;
+    let mut resolved = ssh_opts.to_vec();
+    if let Some(ref s) = summary {
+        if let Some(rtt) = s.chosen_rtt {
+            tracing::info!(
+                host = %alias,
+                endpoint = %s.chosen,
+                rtt_ms = format_args!("{:.1}", rtt.as_secs_f64() * 1000.0),
+                "selected fastest SSH endpoint"
+            );
+        } else {
+            tracing::info!(
+                host = %alias,
+                endpoint = %s.chosen,
+                "selected configured SSH endpoint"
+            );
+        }
+        resolved.insert(0, format!("HostName={}", s.chosen));
+    }
+    (resolved, summary)
 }
 
 /// Constructs OpenSSH base arguments in first-option-wins order:
@@ -932,5 +1215,89 @@ mod tests {
         assert!(!scp.contains(&"-X".to_string()));
         assert!(!scp.contains(&"-W".to_string()));
         assert!(!scp.contains(&"internal:22".to_string()));
+    }
+
+    #[test]
+    fn detects_explicit_hostname_override_in_ssh_args_and_opts() {
+        assert!(!has_explicit_hostname_override(
+            &["-p".into(), "2222".into(), "-o".into(), "User=alice".into()],
+            &["ControlMaster=auto".into()],
+        ));
+        assert!(has_explicit_hostname_override(
+            &["-o".into(), "HostName=1.2.3.4".into()],
+            &[],
+        ));
+        assert!(has_explicit_hostname_override(
+            &["-ohostname 1.2.3.4".into()],
+            &[],
+        ));
+        assert!(has_explicit_hostname_override(
+            &[],
+            &["HostName=100.66.242.48".into()],
+        ));
+    }
+
+    #[test]
+    fn parses_ssh_g_port_and_proxyjump_meta() {
+        assert_eq!(parse_ssh_g_endpoint_meta("hostname 10.0.0.1\nport 2222\n"), (2222, false));
+        assert_eq!(
+            parse_ssh_g_endpoint_meta("port 22\nproxyjump none\n"),
+            (22, false)
+        );
+        assert_eq!(
+            parse_ssh_g_endpoint_meta("port 2200\nproxyjump bastion\n"),
+            (2200, true)
+        );
+    }
+
+    #[test]
+    fn picks_fastest_endpoint_with_order_tie_breaker() {
+        let results = vec![
+            (0usize, "ts".to_string(), Duration::from_millis(14)),
+            (1usize, "zt".to_string(), Duration::from_millis(11)),
+        ];
+        // Within 5ms tie margin -> prefers lower configured index (0 = "ts").
+        assert_eq!(
+            pick_best_endpoint(&results, Duration::from_millis(5)),
+            Some(("ts".to_string(), Duration::from_millis(14)))
+        );
+
+        let clear = vec![
+            (0usize, "ts".to_string(), Duration::from_millis(40)),
+            (1usize, "zt".to_string(), Duration::from_millis(10)),
+        ];
+        assert_eq!(
+            pick_best_endpoint(&clear, Duration::from_millis(5)),
+            Some(("zt".to_string(), Duration::from_millis(10)))
+        );
+        assert_eq!(pick_best_endpoint(&[], Duration::from_millis(5)), None);
+    }
+
+    #[tokio::test]
+    async fn probe_endpoint_set_picks_reachable_listener_over_closed_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open_port = listener.local_addr().unwrap().port();
+        let _accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let summary = probe_endpoint_set(&["127.0.0.1".to_string()], open_port)
+            .await
+            .unwrap();
+        assert_eq!(summary.chosen, "127.0.0.1");
+
+        // Compare two live candidates on an unused address vs loopback.
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+        assert!(probe_endpoint_set(&["127.0.0.1".to_string(), "127.0.0.1".to_string()], closed_port).await.is_none());
+
+        // Single closed/unreachable IP fails vs open loopback on same port: use non-routable TEST-NET-1 first, loopback second.
+        let candidates = vec!["192.0.2.1".to_string(), "127.0.0.1".to_string()];
+        let picked = probe_endpoint_set(&candidates, open_port)
+            .await
+            .expect("loopback listener should win");
+        assert_eq!(picked.chosen, "127.0.0.1");
+        assert!(picked.chosen_rtt.is_some());
     }
 }

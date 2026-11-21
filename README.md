@@ -107,6 +107,7 @@ prefer = "latency"
 chroma = "auto"
 
 [host.desktop]
+endpoints = ["100.88.12.34", "172.28.159.21"]
 max_bitrate_kbps = 80000
 resolution = "match-window"
 fps = 120
@@ -148,6 +149,7 @@ mic = false
 | `--list-displays` | `false` | Enumerate available host displays (`index: name (WxH)`) and exit |
 | `--display` | `0` | Host monitor index or connector/display name from `--list-displays` |
 | `--transport` | `auto` | `auto` (UDP with automatic SSH stdio TCP tunnel fallback), `udp`, or `tcp` |
+| `--endpoint` | none | Candidate host IPs/DNS names to probe in parallel; selects fastest reachable (repeatable; or `endpoints = [...]` in `config.toml`) |
 | `--headless` | `none` | Ephemeral remote Wayland session (`none`, `auto`, `sway`, `gamescope`, `cage`; auto-enabled with trailing `-- <cmd>`) |
 | `--windowed` | `false` | Start in a window instead of borderless fullscreen (`Ctrl+Alt+F` toggles) |
 | `--capture` / `--encoder` / `--decoder` | `auto` | Backend overrides (`dxgi`, `drm`, `pipewire`, `x11`, `testsrc`, `nvenc`, `vaapi`, `openh264`, `ffmpeg`, `native`) |

@@ -129,6 +129,9 @@ pub fn spawn_network_tasks(
         drop(stdio_out_rx);
     }
 
+    let video_tx_cfg_rx = cfg.video_cfg_tx.subscribe();
+    let video_tx_live_br = cfg.live_bitrate_kbps.clone();
+
     handles.push(tokio::spawn(run_rx_loop(
         cfg.socket.clone(),
         stdio_in_rx,
@@ -168,6 +171,8 @@ pub fn spawn_network_tasks(
         peer.clone(),
         cfg.mtu,
         cfg.fec_percent,
+        video_tx_live_br,
+        video_tx_cfg_rx,
         cfg.cancel.clone(),
         video_rx,
     )));
@@ -608,7 +613,7 @@ async fn run_rx_loop(
                             let cur_cfg = ctx.video_cfg_tx.borrow().clone();
                             let in_place = ctx.in_place_bitrate.load(Ordering::Acquire);
                             let now = Instant::now();
-                            let (action, status) = {
+                            let (action, applied_br, status) = {
                                 let mut adapt = ctx.adaptive.lock().expect("adaptive lock poisoned");
                                 let action = adapt.on_feedback(
                                     &fb,
@@ -624,6 +629,9 @@ async fn run_rx_loop(
                                 if let Some((nw, nh)) = action.step_down_resolution {
                                     preview_cfg.width = nw;
                                     preview_cfg.height = nh;
+                                } else if let Some((nw, nh)) = action.step_up_resolution {
+                                    preview_cfg.width = nw;
+                                    preview_cfg.height = nh;
                                 }
                                 let codec = current_effective_codec(&ctx, preview_cfg.codec);
                                 let status = build_stream_status(
@@ -632,7 +640,7 @@ async fn run_rx_loop(
                                     &adapt,
                                     ctx.audio_enabled.load(Ordering::Acquire),
                                 );
-                                (action, status)
+                                (action, adapt.applied_bitrate_kbps, status)
                             };
 
                             if let Some(new_fec) = action.new_fec_percent {
@@ -659,8 +667,20 @@ async fn run_rx_loop(
                                     new_h = nh,
                                     "sustained congestion at bitrate floor; stepping down resolution one notch"
                                 );
+                            } else if let Some((nw, nh)) = action.step_up_resolution {
+                                next_cfg.width = nw;
+                                next_cfg.height = nh;
+                                video_changed = true;
+                                tracing::info!(
+                                    old_w = cur_cfg.width,
+                                    old_h = cur_cfg.height,
+                                    new_w = nw,
+                                    new_h = nh,
+                                    "bandwidth recovered; restoring original stream resolution"
+                                );
                             }
                             if video_changed {
+                                next_cfg.bitrate_kbps = applied_br;
                                 let _ = ctx.video_cfg_tx.send(next_cfg);
                             }
 
@@ -790,7 +810,7 @@ async fn run_rx_loop(
                                     ctx.audio_enabled.store(true, Ordering::Release);
                                 }
 
-                                if video_changed && !in_place {
+                                if video_changed {
                                     next.bitrate_kbps = adapt.applied_bitrate_kbps;
                                 }
 
@@ -873,9 +893,12 @@ async fn run_video_tx_loop(
     peer: Arc<RwLock<Option<ActivePeer>>>,
     mtu: usize,
     fec_percent: Arc<AtomicU8>,
+    live_bitrate_kbps: Arc<AtomicU32>,
+    video_cfg_rx: watch::Receiver<VideoPipelineConfig>,
     cancel: CancellationToken,
     mut video_rx: mpsc::Receiver<EncodedFrame>,
 ) {
+    const PACE_BURST: usize = 4;
     let mut frame_id = 0u32;
 
     loop {
@@ -938,11 +961,45 @@ async fn run_video_tx_loop(
 
         let total = datagrams.len();
         let drop_if_congested = is_tunnel && !frame.keyframe;
+        let (max_spread_us, pacing_spread_us) = if !is_tunnel && total > 8 {
+            let fps = video_cfg_rx.borrow().fps.max(1) as u64;
+            let frame_period_us = 1_000_000 / fps;
+            let max_spread_us = if frame.keyframe {
+                12_000
+            } else {
+                (frame_period_us / 2).clamp(2_000, 10_000)
+            };
+            let total_bytes: u64 = datagrams.iter().map(|d| d.len() as u64).sum();
+            let pacing_bps = (live_bitrate_kbps.load(Ordering::Acquire).max(2_000) as u64)
+                .saturating_mul(2_000);
+            let ideal_us = total_bytes
+                .saturating_mul(8_000_000)
+                .checked_div(pacing_bps)
+                .unwrap_or(0);
+            let spread = if ideal_us >= 1_000 {
+                ideal_us.min(max_spread_us)
+            } else {
+                0
+            };
+            (max_spread_us, spread)
+        } else {
+            (0, 0)
+        };
+        let frame_tx_start = Instant::now();
         for (idx, dgram) in datagrams.into_iter().enumerate() {
             if !send_to_peer(&socket, dst, &stdio_out_tx, dgram, drop_if_congested).await {
                 break;
             }
-            if total > 24 && (idx & 15) == 15 {
+            if pacing_spread_us > 0 {
+                if idx + 1 < total && (idx + 1).is_multiple_of(PACE_BURST) {
+                    let target_us = (pacing_spread_us * (idx as u64 + 1)) / (total as u64);
+                    let elapsed_us = frame_tx_start.elapsed().as_micros() as u64;
+                    if elapsed_us < max_spread_us && target_us > elapsed_us + 750 {
+                        let sleep_us = (target_us - elapsed_us).min(max_spread_us - elapsed_us);
+                        tokio::time::sleep(Duration::from_micros(sleep_us)).await;
+                    }
+                }
+            } else if total > 24 && (idx & 15) == 15 {
                 tokio::task::yield_now().await;
             }
         }

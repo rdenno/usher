@@ -13,7 +13,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
     IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFSample, IMFTransform,
     METransformHaveOutput, METransformNeedInput, MF_E_NOTACCEPTING,
@@ -599,8 +600,21 @@ impl MfHwEncoder {
         let Some(ref api) = self.codec_api else {
             return false;
         };
-        let mut br = variant_u32(kbps.max(500).saturating_mul(1000));
-        unsafe { api.set_value(&CODECAPI_AVEncCommonMeanBitRate, &mut br).is_ok() }
+        let br_bps = kbps.max(500).saturating_mul(1000);
+        let mut br = variant_u32(br_bps);
+        let hr = unsafe { api.set_value(&CODECAPI_AVEncCommonMeanBitRate, &mut br) };
+        if hr.is_err() {
+            tracing::warn!(
+                ?hr,
+                encoder = %self.encoder_name,
+                kbps,
+                "CODECAPI_AVEncCommonMeanBitRate failed"
+            );
+            return false;
+        }
+        let mut max_br = variant_u32(br_bps.saturating_mul(3) / 2);
+        let _ = unsafe { api.set_value(&CODECAPI_AVEncCommonMaxBitRate, &mut max_br) };
+        true
     }
 
     fn apply_pending_keyframe(&mut self) {

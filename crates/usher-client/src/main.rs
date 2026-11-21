@@ -69,6 +69,10 @@ struct Args {
     #[arg(long = "ssh-opt")]
     ssh_opts: Vec<String>,
 
+    /// Candidate SSH/UDP host IPs or DNS names to probe in parallel; picks fastest reachable (repeatable)
+    #[arg(long = "endpoint")]
+    endpoints: Vec<String>,
+
     /// Explicit overlay IP to ask usher-host to bind to (optional)
     #[arg(long)]
     bind_ip: Option<IpAddr>,
@@ -268,6 +272,11 @@ fn build_cli_overrides(args: &Args) -> HostSettings {
         fec: args.fec,
         remote_bin: args.remote_bin.clone(),
         bind_ip: args.bind_ip,
+        endpoints: if args.endpoints.is_empty() {
+            None
+        } else {
+            Some(args.endpoints.clone())
+        },
         ssh_opts: if args.ssh_opts.is_empty() {
             None
         } else {
@@ -457,12 +466,19 @@ fn main() -> Result<()> {
         if eff.no_system {
             host_args.push("--no-system".into());
         }
+        let (resolved_ssh_opts, _) = rt.block_on(crate::ssh::resolve_ssh_opts_with_endpoints(
+            args.host.as_deref(),
+            args.local,
+            &eff.endpoints,
+            &split.ssh_args,
+            &eff.ssh_opts,
+        ));
         let ssh_cfg = SshConnectConfig {
             host: args.host.clone(),
             local: args.local,
             remote_bin: eff.remote_bin.clone(),
             ssh_args: split.ssh_args.clone(),
-            ssh_opts: eff.ssh_opts.clone(),
+            ssh_opts: resolved_ssh_opts,
             batch_mode: eff.batch_mode,
             auto_install: eff.auto_install,
             host_args,
@@ -511,12 +527,19 @@ fn main() -> Result<()> {
         if args.no_input {
             host_args.push("--no-input".into());
         }
+        let (resolved_ssh_opts, _) = rt.block_on(crate::ssh::resolve_ssh_opts_with_endpoints(
+            args.host.as_deref(),
+            args.local,
+            &eff.endpoints,
+            &split.ssh_args,
+            &eff.ssh_opts,
+        ));
         let ssh_cfg = SshConnectConfig {
             host: args.host.clone(),
             local: args.local,
             remote_bin: eff.remote_bin.clone(),
             ssh_args: split.ssh_args.clone(),
-            ssh_opts: eff.ssh_opts.clone(),
+            ssh_opts: resolved_ssh_opts,
             batch_mode: eff.batch_mode,
             auto_install: eff.auto_install,
             host_args,
@@ -578,9 +601,16 @@ fn main() -> Result<()> {
             host_args.push("--no-input".into());
         }
 
+        let (resolved_ssh_opts, _) = rt_conn.block_on(crate::ssh::resolve_ssh_opts_with_endpoints(
+            host_arg.as_deref(),
+            is_local,
+            &eff.endpoints,
+            &ssh_args,
+            &eff.ssh_opts,
+        ));
         let drop_host = host_arg.clone();
         let drop_ssh_args = ssh_args.clone();
-        let drop_ssh_opts = eff.ssh_opts.clone();
+        let drop_ssh_opts = resolved_ssh_opts.clone();
         let drop_batch_mode = eff.batch_mode;
 
         let ssh_cfg = SshConnectConfig {
@@ -588,7 +618,7 @@ fn main() -> Result<()> {
             local: is_local,
             remote_bin: eff.remote_bin.clone(),
             ssh_args,
-            ssh_opts: eff.ssh_opts.clone(),
+            ssh_opts: resolved_ssh_opts,
             batch_mode: eff.batch_mode,
             auto_install: eff.auto_install,
             host_args,

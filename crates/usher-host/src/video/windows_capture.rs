@@ -1942,6 +1942,7 @@ fn run_native_dxgi_mf_blocking(
     );
 
     let mut applied_bitrate = initial_kbps;
+    let mut last_mf_reinit: Option<Instant> = None;
     let mut have_encoded_first = false;
     let mut frame = DxgiNv12Frame::new(cfg.width as usize, cfg.height as usize);
     let frame_period = Duration::from_micros(1_000_000 / cfg.fps.max(1) as u64);
@@ -1997,8 +1998,37 @@ fn run_native_dxgi_mf_blocking(
                         new_kbps = desired,
                         "applied in-place MF bitrate update"
                     );
+                    applied_bitrate = desired;
+                } else if desired.abs_diff(applied_bitrate) >= (applied_bitrate / 5).max(500)
+                    && last_mf_reinit.is_none_or(|t| t.elapsed() >= Duration::from_secs(4))
+                {
+                    last_mf_reinit = Some(Instant::now());
+                    tracing::warn!(
+                        old_kbps = applied_bitrate,
+                        new_kbps = desired,
+                        "in-place MF bitrate update failed; reinitializing MF encoder"
+                    );
+                    match super::mf_encoder::MfHwEncoder::new(
+                        codec,
+                        encoder_kind,
+                        cfg.width,
+                        cfg.height,
+                        cfg.fps,
+                        desired,
+                        cfg.prefer == QualityPreference::Latency,
+                    ) {
+                        Ok(new_enc) => {
+                            encoder = new_enc;
+                            applied_bitrate = desired;
+                            have_encoded_first = false;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "failed to reinitialize MF encoder for bitrate {desired} kbps: {err:#}"
+                            );
+                        }
+                    }
                 }
-                applied_bitrate = desired;
             }
         }
 

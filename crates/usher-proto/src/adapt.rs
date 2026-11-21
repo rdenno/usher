@@ -11,6 +11,7 @@ pub struct AdaptiveAction {
     pub new_bitrate_kbps: Option<u32>,
     pub new_fec_percent: Option<u8>,
     pub step_down_resolution: Option<(u16, u16)>,
+    pub step_up_resolution: Option<(u16, u16)>,
     pub status_changed: bool,
 }
 
@@ -26,9 +27,12 @@ pub struct AdaptiveController {
     pub baseline_rtt_us: u32,
     pub high_rtt_streak: u32,
     pub clean_streak: u32,
+    pub consecutive_clean_grows: u32,
     pub fec_clean_streak: u32,
     pub floor_congestion_streak: u32,
     pub resolution_stepped_down: bool,
+    pub pre_step_down_resolution: Option<(u16, u16)>,
+    pub recovery_clean_streak: u32,
     pub last_restart_at: Option<Instant>,
 }
 
@@ -62,9 +66,12 @@ impl AdaptiveController {
             baseline_rtt_us: 0,
             high_rtt_streak: 0,
             clean_streak: 0,
+            consecutive_clean_grows: 0,
             fec_clean_streak: 0,
             floor_congestion_streak: 0,
             resolution_stepped_down: false,
+            pre_step_down_resolution: None,
+            recovery_clean_streak: 0,
             last_restart_at: None,
         }
     }
@@ -105,6 +112,8 @@ impl AdaptiveController {
     pub fn reset_resolution_step_down(&mut self) {
         self.resolution_stepped_down = false;
         self.floor_congestion_streak = 0;
+        self.pre_step_down_resolution = None;
+        self.recovery_clean_streak = 0;
     }
 
     pub fn on_feedback(
@@ -135,26 +144,31 @@ impl AdaptiveController {
             if self.baseline_rtt_us == 0 {
                 self.baseline_rtt_us = rtt_us;
             } else if rtt_us < self.baseline_rtt_us {
-                self.baseline_rtt_us = (self.baseline_rtt_us * 3 + rtt_us) / 4;
+                self.baseline_rtt_us = (self.baseline_rtt_us * 7 + rtt_us) / 8;
             } else {
-                self.baseline_rtt_us = (self.baseline_rtt_us * 31 + rtt_us) / 32;
+                self.baseline_rtt_us = (self.baseline_rtt_us * 15 + rtt_us) / 16;
             }
         }
 
+        let min_headroom = match self.prefer {
+            QualityPreference::Latency => 25_000,
+            QualityPreference::Quality => 35_000,
+        };
         let rtt_threshold = self
             .baseline_rtt_us
-            .saturating_add((self.baseline_rtt_us / 2).max(12_000));
-        let rtt_inflated = rtt_us > 0 && self.baseline_rtt_us > 0 && rtt_us > rtt_threshold;
-        if rtt_inflated {
-            self.high_rtt_streak += 1;
-        } else {
-            self.high_rtt_streak = 0;
+            .saturating_add(self.baseline_rtt_us.max(min_headroom));
+        if rtt_us > 0 && self.baseline_rtt_us > 0 {
+            if rtt_us > rtt_threshold {
+                self.high_rtt_streak += 1;
+            } else {
+                self.high_rtt_streak = 0;
+            }
         }
 
         let unrecovered_loss = loss_after_fec_bps > 0;
         let high_recovery = fec_recovery_bps >= 100;
         let late_spike = late_frames >= 2;
-        let sustained_rtt = self.high_rtt_streak >= 2;
+        let sustained_rtt = rtt_us > 0 && self.high_rtt_streak >= 3;
         let congested = unrecovered_loss || late_spike || sustained_rtt;
 
         // 1) Adaptive FEC (zero restart cost)
@@ -182,30 +196,56 @@ impl AdaptiveController {
             action.status_changed = true;
         }
 
-        // 2) AIMD Bitrate adaptation (cut fast, grow slow)
+        // 2) AIMD Bitrate adaptation (cut fast on loss, damped on RTT inflation, ramp quickly when clean)
         if unrecovered_loss {
             self.clean_streak = 0;
+            self.consecutive_clean_grows = 0;
             let pct = if loss_after_fec_bps >= 300 { 65 } else { 75 };
             self.target_bitrate_kbps = ((self.target_bitrate_kbps as u64 * pct) / 100) as u32;
-        } else if late_spike || sustained_rtt {
+        } else if late_spike {
             self.clean_streak = 0;
+            self.consecutive_clean_grows = 0;
             let pct = match self.prefer {
                 QualityPreference::Latency => 82,
                 QualityPreference::Quality => 86,
+            };
+            self.target_bitrate_kbps = ((self.target_bitrate_kbps as u64 * pct) / 100) as u32;
+        } else if sustained_rtt {
+            self.clean_streak = 0;
+            self.consecutive_clean_grows = 0;
+            // Allow at least 2 more consecutive inflated intervals (~1s) for queue drain before cutting again.
+            self.high_rtt_streak = 1;
+            let pct = match self.prefer {
+                QualityPreference::Latency => 90,
+                QualityPreference::Quality => 92,
             };
             self.target_bitrate_kbps = ((self.target_bitrate_kbps as u64 * pct) / 100) as u32;
         } else if !high_recovery {
             self.clean_streak += 1;
             if self.clean_streak >= 2 {
                 self.clean_streak = 0;
+                self.consecutive_clean_grows = self.consecutive_clean_grows.saturating_add(1);
                 let step = match self.prefer {
-                    QualityPreference::Latency => (self.target_bitrate_kbps / 20).max(500),
-                    QualityPreference::Quality => (self.target_bitrate_kbps / 14).max(750),
+                    QualityPreference::Latency => {
+                        if self.consecutive_clean_grows >= 3 {
+                            (self.target_bitrate_kbps / 8).max(1_500)
+                        } else {
+                            (self.target_bitrate_kbps / 12).max(1_000)
+                        }
+                    }
+                    QualityPreference::Quality => {
+                        if self.consecutive_clean_grows >= 3 {
+                            (self.target_bitrate_kbps / 6).max(2_000)
+                        } else {
+                            (self.target_bitrate_kbps / 10).max(1_250)
+                        }
+                    }
                 };
                 self.target_bitrate_kbps = self.target_bitrate_kbps.saturating_add(step);
             }
         } else {
             self.clean_streak = 0;
+            self.consecutive_clean_grows = 0;
         }
 
         self.target_bitrate_kbps = self
@@ -248,8 +288,9 @@ impl AdaptiveController {
             action.status_changed = true;
         }
 
-        // 4) Optional single-notch resolution step-down only after prolonged congestion at floor
-        if congested && self.target_bitrate_kbps <= self.min_bitrate_kbps + 200 {
+        // 4) Optional single-notch resolution step-down on severe floor congestion, with clean step-up recovery
+        let severe_congestion = unrecovered_loss || late_spike;
+        if severe_congestion && self.target_bitrate_kbps <= self.min_bitrate_kbps + 200 {
             self.floor_congestion_streak += 1;
         } else if !congested && !high_recovery {
             self.floor_congestion_streak = 0;
@@ -262,10 +303,28 @@ impl AdaptiveController {
             let next_h = if cur_h > 1080 { 1080u16 } else { 720u16 };
             let next_w =
                 ((((cur_w as u32) * (next_h as u32)) / cur_h as u32).max(64) as u16) & !1;
+            self.pre_step_down_resolution = Some((cur_w, cur_h));
             self.resolution_stepped_down = true;
             self.floor_congestion_streak = 0;
+            self.recovery_clean_streak = 0;
             action.step_down_resolution = Some((next_w, next_h));
             action.status_changed = true;
+        } else if self.resolution_stepped_down {
+            let step_up_min_br =
+                (self.min_bitrate_kbps.saturating_mul(3)).min(self.max_bitrate_kbps);
+            if !congested && !high_recovery && self.target_bitrate_kbps >= step_up_min_br {
+                self.recovery_clean_streak += 1;
+                if self.recovery_clean_streak >= STEP_DOWN_FLOOR_INTERVALS
+                    && let Some(orig) = self.pre_step_down_resolution.take()
+                {
+                    self.resolution_stepped_down = false;
+                    self.recovery_clean_streak = 0;
+                    action.step_up_resolution = Some(orig);
+                    action.status_changed = true;
+                }
+            } else if congested || high_recovery {
+                self.recovery_clean_streak = 0;
+            }
         }
 
         action
@@ -324,7 +383,7 @@ mod tests {
             1920,
             1080,
         );
-        assert_eq!(a3.new_bitrate_kbps, Some(15_750));
+        assert_eq!(a3.new_bitrate_kbps, Some(16_250));
     }
 
     #[test]
@@ -338,23 +397,90 @@ mod tests {
             true,
         );
         ctrl.on_feedback(&fb(0, 0, 6_000, 0), t0, true, 1920, 1080);
-        // Sustained RTT jump > baseline + 12ms
+        // Sustained RTT jump > baseline + 25ms across 3 consecutive intervals
         ctrl.on_feedback(
-            &fb(0, 0, 28_000, 0),
+            &fb(0, 0, 40_000, 0),
             t0 + Duration::from_millis(500),
             true,
             1920,
             1080,
         );
-        let act = ctrl.on_feedback(
-            &fb(0, 0, 30_000, 0),
+        ctrl.on_feedback(
+            &fb(0, 0, 40_000, 0),
             t0 + Duration::from_secs(1),
+            true,
+            1920,
+            1080,
+        );
+        let act = ctrl.on_feedback(
+            &fb(0, 0, 40_000, 0),
+            t0 + Duration::from_millis(1500),
             true,
             1920,
             1080,
         );
         assert!(act.new_bitrate_kbps.is_some());
         assert!(ctrl.applied_bitrate_kbps < 30_000);
+    }
+
+    #[test]
+    fn wifi_jitter_does_not_trigger_bitrate_cut() {
+        let t0 = Instant::now();
+        let mut ctrl = AdaptiveController::new(
+            60_000,
+            Some(20_000),
+            10,
+            QualityPreference::Latency,
+            true,
+        );
+        ctrl.on_feedback(&fb(0, 0, 8_000, 0), t0, true, 1920, 1080);
+        for i in 1..=10 {
+            let rtt = if i % 2 == 0 { 30_000 } else { 25_000 };
+            let a = ctrl.on_feedback(
+                &fb(0, 0, rtt, 0),
+                t0 + Duration::from_millis(500 * i),
+                true,
+                1920,
+                1080,
+            );
+            assert!(
+                a.new_bitrate_kbps.is_none_or(|b| b >= 20_000),
+                "normal Wi-Fi jitter should not cut bitrate (got {:?})",
+                a.new_bitrate_kbps
+            );
+        }
+        assert!(ctrl.target_bitrate_kbps >= 20_000);
+    }
+
+    #[test]
+    fn missing_rtt_sample_does_not_double_count_streak() {
+        let t0 = Instant::now();
+        let mut ctrl = AdaptiveController::new(
+            60_000,
+            Some(20_000),
+            10,
+            QualityPreference::Latency,
+            true,
+        );
+        ctrl.on_feedback(&fb(0, 0, 8_000, 0), t0, true, 1920, 1080);
+        ctrl.on_feedback(
+            &fb(0, 0, 50_000, 0),
+            t0 + Duration::from_millis(500),
+            true,
+            1920,
+            1080,
+        );
+        assert_eq!(ctrl.high_rtt_streak, 1);
+
+        // No fresh Pong arrived in this window -> streak must remain unchanged.
+        ctrl.on_feedback(
+            &fb(0, 0, 0, 0),
+            t0 + Duration::from_secs(1),
+            true,
+            1920,
+            1080,
+        );
+        assert_eq!(ctrl.high_rtt_streak, 1);
     }
 
     #[test]
@@ -436,5 +562,45 @@ mod tests {
             1440,
         );
         assert_eq!(last.step_down_resolution, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn resolution_steps_back_up_after_sustained_clean_recovery() {
+        let t0 = Instant::now();
+        let mut ctrl = AdaptiveController::new(
+            20_000,
+            Some(MIN_BITRATE_KBPS),
+            10,
+            QualityPreference::Latency,
+            true,
+        );
+        for i in 0..=STEP_DOWN_FLOOR_INTERVALS {
+            ctrl.on_feedback(
+                &fb(200, 0, 10_000, 0),
+                t0 + Duration::from_millis(500 * i as u64),
+                true,
+                2560,
+                1440,
+            );
+        }
+        assert!(ctrl.resolution_stepped_down);
+
+        let base_t = t0 + Duration::from_millis(500 * (STEP_DOWN_FLOOR_INTERVALS as u64 + 1));
+        let mut restored = None;
+        for j in 0..(STEP_DOWN_FLOOR_INTERVALS + 10) {
+            let a = ctrl.on_feedback(
+                &fb(0, 0, 8_000, 0),
+                base_t + Duration::from_millis(500 * j as u64),
+                true,
+                1920,
+                1080,
+            );
+            if a.step_up_resolution.is_some() {
+                restored = a.step_up_resolution;
+                break;
+            }
+        }
+        assert_eq!(restored, Some((2560, 1440)));
+        assert!(!ctrl.resolution_stepped_down);
     }
 }
