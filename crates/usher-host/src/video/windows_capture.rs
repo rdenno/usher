@@ -1,6 +1,9 @@
 use super::ivf::IvfReader;
 use super::software::apply_openh264_bitrate;
-use super::{CaptureSource, EncodedFrame, EncoderKind, VideoPipelineConfig};
+use super::{
+    CaptureSource, EncodedFrame, EncoderKind, HostCursorEvent, StaticRefreshTracker,
+    VideoPipelineConfig,
+};
 use anyhow::{Context, Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{
@@ -353,7 +356,7 @@ fn encoder_candidates(
         EncoderKind::Amf => vec![WinHwVendor::Amf],
         EncoderKind::Qsv => vec![WinHwVendor::Qsv],
         EncoderKind::Openh264 => return Vec::new(),
-        EncoderKind::Vaapi | EncoderKind::Auto => {
+        EncoderKind::Vaapi | EncoderKind::Auto | EncoderKind::Ffmpeg => {
             let mut list = Vec::new();
             for v in [WinHwVendor::Nvenc, WinHwVendor::Amf, WinHwVendor::Qsv] {
                 if detected_vendors.is_empty() || detected_vendors.contains(&v) {
@@ -457,11 +460,13 @@ pub fn select_windows_backend(cfg: &VideoPipelineConfig) -> Option<WinVideoBacke
     select_ddagrab_fallback(cfg).or(Some(WinVideoBackend::NativeDxgiOpenH264))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_windows_backend(
     backend: WinVideoBackend,
     cfg: VideoPipelineConfig,
     live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
+    cursor_tx: Option<mpsc::Sender<HostCursorEvent>>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
@@ -484,6 +489,7 @@ pub async fn run_windows_backend(
                 encoder,
                 live_bitrate_kbps,
                 tx,
+                cursor_tx,
                 keyframe_req,
                 start,
                 cancel,
@@ -511,7 +517,16 @@ pub async fn run_windows_backend(
                 display = cfg.display_index,
                 "starting built-in DXGI Desktop Duplication + OpenH264 capture"
             );
-            run_native_dxgi_openh264(cfg, live_bitrate_kbps, tx, keyframe_req, start, cancel).await
+            run_native_dxgi_openh264(
+                cfg,
+                live_bitrate_kbps,
+                tx,
+                cursor_tx,
+                keyframe_req,
+                start,
+                cancel,
+            )
+            .await
         }
     }
 }
@@ -1131,6 +1146,103 @@ fn ddagrab_exit_error(
     }
 }
 
+/// Converts a DXGI pointer bitmap (`COLOR`, `MASKED_COLOR`, `MONOCHROME`) into straight RGBA8
+/// alongside clamped hotspot coordinates and a non-zero deterministic content hash (`shape_id`).
+pub fn dxgi_pointer_to_rgba(
+    info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    data: &[u8],
+) -> Option<(u16, u16, u16, u16, Vec<u8>, u32)> {
+    let pw = info.Width as usize;
+    let ptype = info.Type as i32;
+    let ph = if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+        (info.Height as usize) / 2
+    } else {
+        info.Height as usize
+    };
+    let max_dim = usher_proto::cursor::MAX_CURSOR_DIM as usize;
+    if pw == 0 || ph == 0 || pw > max_dim || ph > max_dim {
+        return None;
+    }
+
+    let pitch = info.Pitch as usize;
+    let mut rgba = vec![0u8; pw * ph * 4];
+    if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 {
+        for y in 0..ph {
+            for x in 0..pw {
+                let off = y * pitch + x * 4;
+                if off + 4 <= data.len() {
+                    let dst = (y * pw + x) * 4;
+                    rgba[dst] = data[off + 2];
+                    rgba[dst + 1] = data[off + 1];
+                    rgba[dst + 2] = data[off];
+                    rgba[dst + 3] = data[off + 3];
+                }
+            }
+        }
+    } else if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 {
+        for y in 0..ph {
+            for x in 0..pw {
+                let off = y * pitch + x * 4;
+                if off + 4 <= data.len() {
+                    let b = data[off];
+                    let g = data[off + 1];
+                    let r = data[off + 2];
+                    let mask = data[off + 3];
+                    let dst = (y * pw + x) * 4;
+                    if mask == 0 || (r | g | b) != 0 {
+                        rgba[dst] = r;
+                        rgba[dst + 1] = g;
+                        rgba[dst + 2] = b;
+                        rgba[dst + 3] = 255;
+                    }
+                }
+            }
+        }
+    } else if ptype == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+        for y in 0..ph {
+            for x in 0..pw {
+                let and_off = y * pitch + (x / 8);
+                let xor_off = (y + ph) * pitch + (x / 8);
+                if xor_off < data.len() {
+                    let bit = 1u8 << (7 - (x & 7));
+                    let and_set = (data[and_off] & bit) != 0;
+                    let xor_set = (data[xor_off] & bit) != 0;
+                    let px = match (and_set, xor_set) {
+                        (false, false) => [0, 0, 0, 255],
+                        (false, true) => [255, 255, 255, 255],
+                        (true, false) => [0, 0, 0, 0],
+                        (true, true) => [32, 32, 32, 224],
+                    };
+                    let dst = (y * pw + x) * 4;
+                    rgba[dst..dst + 4].copy_from_slice(&px);
+                }
+            }
+        }
+    } else {
+        return None;
+    }
+
+    let hotspot_x = (info.HotSpot.x as usize).min(pw - 1) as u16;
+    let hotspot_y = (info.HotSpot.y as usize).min(ph - 1) as u16;
+
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in [
+        (pw as u16).to_le_bytes(),
+        (ph as u16).to_le_bytes(),
+        hotspot_x.to_le_bytes(),
+        hotspot_y.to_le_bytes(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(rgba.iter().copied())
+    {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+
+    Some((pw as u16, ph as u16, hotspot_x, hotspot_y, rgba, hash.max(1)))
+}
+
 struct PointerOverlay<'a> {
     x: i32,
     y: i32,
@@ -1398,6 +1510,10 @@ struct DxgiSession {
     pointer_x: i32,
     pointer_y: i32,
     pointer_visible: bool,
+    has_frame: bool,
+    last_sent_shape_id: Option<u32>,
+    last_cursor_pos: Option<(bool, u16, u16)>,
+    cached_cursor_shape: Option<(u32, u16, u16, u16, u16, Vec<u8>)>,
     orig_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
     prev_desk: Option<windows::Win32::System::StationsAndDesktops::HDESK>,
 }
@@ -1496,6 +1612,10 @@ impl DxgiSession {
                 pointer_x: 0,
                 pointer_y: 0,
                 pointer_visible: false,
+                has_frame: false,
+                last_sent_shape_id: None,
+                last_cursor_pos: None,
+                cached_cursor_shape: None,
                 orig_desk,
                 prev_desk,
             })
@@ -1562,15 +1682,39 @@ impl DxgiSession {
     }
 
     /// Captures the next changed desktop frame into `frame`, returning `Ok(true)` if a new
-    /// frame was copied, `Ok(false)` on timeout (desktop unchanged).
-    fn capture_into<F: BgraFrameTarget>(&mut self, frame: &mut F, timeout_ms: u32) -> Result<bool> {
+    /// frame was copied, `Ok(false)` on timeout or cursor-only update when `separate_cursor` is active.
+    fn capture_into<F: BgraFrameTarget>(
+        &mut self,
+        frame: &mut F,
+        timeout_ms: u32,
+        separate_cursor: bool,
+        cursor_tx: Option<&mpsc::Sender<HostCursorEvent>>,
+        force_shape_resend: bool,
+    ) -> Result<bool> {
         unsafe {
+            if force_shape_resend
+                && separate_cursor
+                && let (Some(tx), Some((id, w, h, hx, hy, rgba))) =
+                    (cursor_tx, self.cached_cursor_shape.as_ref())
+            {
+                let _ = tx.try_send(HostCursorEvent::Shape {
+                    shape_id: *id,
+                    width: *w,
+                    height: *h,
+                    hotspot_x: *hx,
+                    hotspot_y: *hy,
+                    rgba: rgba.clone(),
+                });
+                self.last_sent_shape_id = Some(*id);
+            }
+
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut res = None;
             match self.dupl.AcquireNextFrame(timeout_ms, &mut info, &mut res) {
                 Ok(()) => {}
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    self.has_frame = false;
                     self.recreate()?;
                     return Ok(false);
                 }
@@ -1600,11 +1744,61 @@ impl DxgiSession {
                     {
                         self.pointer_shape.resize(req_size as usize, 0);
                         self.pointer_info = shape_info;
+                        if let Some((w, h, hx, hy, rgba, id)) =
+                            dxgi_pointer_to_rgba(&self.pointer_info, &self.pointer_shape)
+                        {
+                            self.cached_cursor_shape = Some((id, w, h, hx, hy, rgba));
+                        }
+                    }
+                }
+
+                if separate_cursor && let Some(tx) = cursor_tx {
+                    if let Some((id, w, h, hx, hy, rgba)) = self.cached_cursor_shape.as_ref()
+                        && self.last_sent_shape_id != Some(*id)
+                    {
+                        let _ = tx.try_send(HostCursorEvent::Shape {
+                            shape_id: *id,
+                            width: *w,
+                            height: *h,
+                            hotspot_x: *hx,
+                            hotspot_y: *hy,
+                            rgba: rgba.clone(),
+                        });
+                        self.last_sent_shape_id = Some(*id);
+                    }
+                    let (hx, hy) = self.cached_cursor_shape.as_ref().map_or(
+                        (
+                            self.pointer_info.HotSpot.x,
+                            self.pointer_info.HotSpot.y,
+                        ),
+                        |c| (c.3 as i32, c.4 as i32),
+                    );
+                    let spot_x = self.pointer_x + hx;
+                    let spot_y = self.pointer_y + hy;
+                    let denom_w = self.src_w.saturating_sub(1).max(1) as f64;
+                    let denom_h = self.src_h.saturating_sub(1).max(1) as f64;
+                    let x_norm =
+                        ((spot_x as f64 / denom_w).clamp(0.0, 1.0) * 65535.0).round() as u16;
+                    let y_norm =
+                        ((spot_y as f64 / denom_h).clamp(0.0, 1.0) * 65535.0).round() as u16;
+                    let pos = (self.pointer_visible, x_norm, y_norm);
+                    if self.last_cursor_pos != Some(pos) {
+                        self.last_cursor_pos = Some(pos);
+                        let _ = tx.try_send(HostCursorEvent::Position {
+                            visible: self.pointer_visible,
+                            x_norm,
+                            y_norm,
+                        });
                     }
                 }
             }
 
-            let pointer = if self.pointer_visible && !self.pointer_shape.is_empty() {
+            if separate_cursor && info.AccumulatedFrames == 0 && self.has_frame {
+                let _ = self.dupl.ReleaseFrame();
+                return Ok(false);
+            }
+
+            let pointer = if !separate_cursor && self.pointer_visible && !self.pointer_shape.is_empty() {
                 Some(PointerOverlay {
                     x: self.pointer_x,
                     y: self.pointer_y,
@@ -1643,6 +1837,7 @@ impl DxgiSession {
 
             let _ = self.dupl.ReleaseFrame();
             copy_res?;
+            self.has_frame = true;
             Ok(true)
         }
     }
@@ -1688,6 +1883,7 @@ async fn run_native_dxgi_mf(
     encoder: EncoderKind,
     live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
+    cursor_tx: Option<mpsc::Sender<HostCursorEvent>>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
@@ -1699,6 +1895,7 @@ async fn run_native_dxgi_mf(
             encoder,
             live_bitrate_kbps,
             tx,
+            cursor_tx,
             keyframe_req,
             start,
             cancel,
@@ -1715,6 +1912,7 @@ fn run_native_dxgi_mf_blocking(
     encoder_kind: EncoderKind,
     live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
+    cursor_tx: Option<mpsc::Sender<HostCursorEvent>>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
@@ -1751,6 +1949,7 @@ fn run_native_dxgi_mf_blocking(
     let mut next_tick = Instant::now();
     let mut have_first_frame = false;
     let mut initial_timeouts = 0u32;
+    let mut static_refresh = StaticRefreshTracker::new(start);
 
     while !cancel.is_cancelled() {
         if initial_session != 0
@@ -1759,9 +1958,17 @@ fn run_native_dxgi_mf_blocking(
             return Err(anyhow!("Windows console session changed during capture"));
         }
 
-        match dxgi.capture_into(&mut frame, timeout_ms) {
+        let kf_requested = keyframe_req.swap(false, Ordering::AcqRel);
+        let got_new = match dxgi.capture_into(
+            &mut frame,
+            timeout_ms,
+            cfg.separate_cursor,
+            cursor_tx.as_ref(),
+            kf_requested,
+        ) {
             Ok(true) => {
                 have_first_frame = true;
+                true
             }
             Ok(false) => {
                 if !have_first_frame {
@@ -1771,6 +1978,7 @@ fn run_native_dxgi_mf_blocking(
                     }
                     have_first_frame = true;
                 }
+                false
             }
             Err(err) => {
                 tracing::warn!("DXGI capture error ({err:#}); retrying");
@@ -1778,7 +1986,7 @@ fn run_native_dxgi_mf_blocking(
                 let _ = dxgi.recreate();
                 continue;
             }
-        }
+        };
 
         if have_encoded_first {
             let desired = live_bitrate_kbps.load(Ordering::Acquire).max(500);
@@ -1794,7 +2002,8 @@ fn run_native_dxgi_mf_blocking(
             }
         }
 
-        let force_idr = keyframe_req.swap(false, Ordering::AcqRel) || !have_encoded_first;
+        let static_idr = static_refresh.observe_bytes(&frame.nv12, got_new, Instant::now());
+        let force_idr = kf_requested || !have_encoded_first || static_idr;
         let pts_us = start.elapsed().as_micros() as u64;
         let pkts = encoder.encode_nv12(&frame.nv12, pts_us, force_idr)?;
         have_encoded_first = true;
@@ -1816,12 +2025,13 @@ async fn run_native_dxgi_openh264(
     cfg: VideoPipelineConfig,
     live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
+    cursor_tx: Option<mpsc::Sender<HostCursorEvent>>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
-        run_dxgi_blocking(cfg, live_bitrate_kbps, tx, keyframe_req, start, cancel)
+        run_dxgi_blocking(cfg, live_bitrate_kbps, tx, cursor_tx, keyframe_req, start, cancel)
     })
     .await
     .map_err(|e| anyhow!("DXGI worker panicked: {e}"))?
@@ -1831,6 +2041,7 @@ fn run_dxgi_blocking(
     cfg: VideoPipelineConfig,
     live_bitrate_kbps: Arc<AtomicU32>,
     tx: mpsc::Sender<EncodedFrame>,
+    cursor_tx: Option<mpsc::Sender<HostCursorEvent>>,
     keyframe_req: Arc<AtomicBool>,
     start: Instant,
     cancel: CancellationToken,
@@ -1865,6 +2076,7 @@ fn run_dxgi_blocking(
     let mut next_tick = Instant::now();
     let mut have_first_frame = false;
     let mut initial_timeouts = 0u32;
+    let mut static_refresh = StaticRefreshTracker::new(start);
 
     while !cancel.is_cancelled() {
         if initial_session != 0
@@ -1873,9 +2085,17 @@ fn run_dxgi_blocking(
             return Err(anyhow!("Windows console session changed during capture"));
         }
 
-        match dxgi.capture_into(&mut frame, timeout_ms) {
+        let kf_requested = keyframe_req.swap(false, Ordering::AcqRel);
+        let got_new = match dxgi.capture_into(
+            &mut frame,
+            timeout_ms,
+            cfg.separate_cursor,
+            cursor_tx.as_ref(),
+            kf_requested,
+        ) {
             Ok(true) => {
                 have_first_frame = true;
+                true
             }
             Ok(false) => {
                 if !have_first_frame {
@@ -1885,6 +2105,7 @@ fn run_dxgi_blocking(
                     }
                     have_first_frame = true;
                 }
+                false
             }
             Err(err) => {
                 tracing::warn!("DXGI capture error ({err:#}); retrying");
@@ -1892,7 +2113,7 @@ fn run_dxgi_blocking(
                 let _ = dxgi.recreate();
                 continue;
             }
-        }
+        };
 
         if have_encoded_first {
             let desired = live_bitrate_kbps.load(Ordering::Acquire).max(500);
@@ -1902,7 +2123,8 @@ fn run_dxgi_blocking(
             }
         }
 
-        if keyframe_req.swap(false, Ordering::AcqRel) {
+        let static_idr = static_refresh.observe_bytes(&frame.y, got_new, Instant::now());
+        if kf_requested || static_idr {
             encoder.force_intra_frame();
         }
 
@@ -1926,4 +2148,39 @@ fn run_dxgi_blocking(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cursor_shape_tests {
+    use super::*;
+
+    #[test]
+    fn dxgi_pointer_to_rgba_decodes_color_and_monochrome() {
+        let color_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32,
+            Width: 2,
+            Height: 1,
+            Pitch: 8,
+            HotSpot: windows::Win32::Foundation::POINT { x: 1, y: 0 },
+        };
+        // BGRA pixels: red + translucent blue
+        let bgra = [0, 0, 255, 255, 255, 0, 0, 128];
+        let (w, h, hx, hy, rgba, id) = dxgi_pointer_to_rgba(&color_info, &bgra).unwrap();
+        assert_eq!((w, h, hx, hy), (2, 1, 1, 0));
+        assert_ne!(id, 0);
+        assert_eq!(rgba, vec![255, 0, 0, 255, 0, 0, 255, 128]);
+
+        let mono_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32,
+            Width: 2,
+            Height: 2, // 1 row AND + 1 row XOR
+            Pitch: 1,
+            HotSpot: windows::Win32::Foundation::POINT { x: 0, y: 0 },
+        };
+        // pixel 0: and=0, xor=1 -> white; pixel 1: and=1, xor=0 -> transparent
+        let mono_bits = [0b0100_0000, 0b1000_0000];
+        let (mw, mh, _, _, mrgba, _) = dxgi_pointer_to_rgba(&mono_info, &mono_bits).unwrap();
+        assert_eq!((mw, mh), (2, 1));
+        assert_eq!(mrgba, vec![255, 255, 255, 255, 0, 0, 0, 0]);
+    }
 }

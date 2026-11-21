@@ -159,9 +159,14 @@ pub struct Yuv420Frame {
     pub y_stride: u32,
     pub u_stride: u32,
     pub v_stride: u32,
+    pub is_444: bool,
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+}
+
+pub fn client_supports_chroma_444() -> bool {
+    find_working_ffmpeg().is_some()
 }
 
 pub type FrameSink = Arc<dyn Fn(Yuv420Frame) + Send + Sync>;
@@ -173,11 +178,23 @@ pub trait VideoDecoder: Send {
 pub fn create_decoder(
     codec: VideoCodec,
     kind: DecoderKind,
+    chroma: usher_proto::handshake::ChromaSubsampling,
     width: u16,
     height: u16,
     use_hwaccel: bool,
     on_frame: FrameSink,
 ) -> Result<Box<dyn VideoDecoder>> {
+    if chroma == usher_proto::handshake::ChromaSubsampling::Yuv444 {
+        return Ok(Box::new(FfmpegPipeDecoder::new_with_chroma(
+            codec,
+            chroma,
+            width,
+            height,
+            false,
+            on_frame,
+        )?));
+    }
+
     if matches!(kind, DecoderKind::Auto | DecoderKind::Native) {
         #[cfg(target_os = "windows")]
         match crate::mf_decoder::MfVideoDecoder::new(
@@ -260,6 +277,7 @@ impl VideoDecoder for OpenH264Decoder {
                         y_stride: sy as u32,
                         u_stride: su as u32,
                         v_stride: sv as u32,
+                        is_444: false,
                         y: yuv.y().to_vec(),
                         u: yuv.u().to_vec(),
                         v: yuv.v().to_vec(),
@@ -296,6 +314,24 @@ impl FfmpegPipeDecoder {
 
     pub fn new_with_hwaccel(
         codec: VideoCodec,
+        width: u16,
+        height: u16,
+        use_hwaccel: bool,
+        on_frame: FrameSink,
+    ) -> Result<Self> {
+        Self::new_with_chroma(
+            codec,
+            usher_proto::handshake::ChromaSubsampling::Yuv420,
+            width,
+            height,
+            use_hwaccel,
+            on_frame,
+        )
+    }
+
+    pub fn new_with_chroma(
+        codec: VideoCodec,
+        chroma: usher_proto::handshake::ChromaSubsampling,
         width: u16,
         height: u16,
         use_hwaccel: bool,
@@ -344,6 +380,8 @@ impl FfmpegPipeDecoder {
             ]);
         }
 
+        let is_444 = chroma == usher_proto::handshake::ChromaSubsampling::Yuv444;
+        let pix_fmt = if is_444 { "yuv444p" } else { "yuv420p" };
         args.extend([
             "-f".to_string(),
             in_fmt.to_string(),
@@ -354,7 +392,7 @@ impl FfmpegPipeDecoder {
             "-f".to_string(),
             "rawvideo".to_string(),
             "-pix_fmt".to_string(),
-            "yuv420p".to_string(),
+            pix_fmt.to_string(),
             "-flush_packets".to_string(),
             "1".to_string(),
             "pipe:1".to_string(),
@@ -406,8 +444,10 @@ impl FfmpegPipeDecoder {
         let reader_handle = std::thread::Builder::new()
             .name("usher-ffmpeg-rx".into())
             .spawn(move || {
+                let c_w = if is_444 { w } else { w / 2 };
+                let c_h = if is_444 { h } else { h / 2 };
                 let y_len = (w * h) as usize;
-                let uv_len = ((w / 2) * (h / 2)) as usize;
+                let uv_len = (c_w * c_h) as usize;
                 loop {
                     let mut y = vec![0u8; y_len];
                     let mut u = vec![0u8; uv_len];
@@ -424,8 +464,9 @@ impl FfmpegPipeDecoder {
                         width: w,
                         height: h,
                         y_stride: w,
-                        u_stride: w / 2,
-                        v_stride: w / 2,
+                        u_stride: c_w,
+                        v_stride: c_w,
+                        is_444,
                         y,
                         u,
                         v,
@@ -509,6 +550,7 @@ mod tests {
 
     fn run_pipe_stream_test(
         codec: VideoCodec,
+        chroma: usher_proto::handshake::ChromaSubsampling,
         width: u16,
         height: u16,
         use_hwaccel: bool,
@@ -559,11 +601,22 @@ mod tests {
         let count_cb = count.clone();
         let sink: FrameSink = Arc::new(move |frame| {
             assert_eq!((frame.width, frame.height), (width as u32, height as u32));
+            assert_eq!(
+                frame.is_444,
+                chroma == usher_proto::handshake::ChromaSubsampling::Yuv444
+            );
             count_cb.fetch_add(1, Ordering::Release);
         });
 
-        let mut dec = FfmpegPipeDecoder::new_with_hwaccel(codec, width, height, use_hwaccel, sink)
-            .expect("spawn FfmpegPipeDecoder");
+        let mut dec = FfmpegPipeDecoder::new_with_chroma(
+            codec,
+            chroma,
+            width,
+            height,
+            use_hwaccel,
+            sink,
+        )
+        .expect("spawn FfmpegPipeDecoder");
 
         for au in &aus {
             dec.decode(&au.data).expect("write AU while stdin stays open");
@@ -587,12 +640,36 @@ mod tests {
     fn ffmpeg_pipe_decoder_streams_h264_without_deadlock() {
         let _ = run_pipe_stream_test(
             VideoCodec::H264,
+            usher_proto::handshake::ChromaSubsampling::Yuv420,
             160,
             90,
             false,
             &[
                 "-pix_fmt",
                 "yuv420p",
+                "-c:v",
+                "libx264",
+                "-tune",
+                "zerolatency",
+                "-bf",
+                "0",
+                "-g",
+                "4",
+            ],
+        );
+    }
+
+    #[test]
+    fn ffmpeg_pipe_decoder_streams_h264_yuv444_without_deadlock() {
+        let _ = run_pipe_stream_test(
+            VideoCodec::H264,
+            usher_proto::handshake::ChromaSubsampling::Yuv444,
+            160,
+            90,
+            false,
+            &[
+                "-pix_fmt",
+                "yuv444p",
                 "-c:v",
                 "libx264",
                 "-tune",
@@ -627,14 +704,29 @@ mod tests {
             "-aud",
             "1",
         ];
-        if run_pipe_stream_test(VideoCodec::Hevc, 320, 180, false, &nvenc_args) {
+        if run_pipe_stream_test(
+            VideoCodec::Hevc,
+            usher_proto::handshake::ChromaSubsampling::Yuv420,
+            320,
+            180,
+            false,
+            &nvenc_args,
+        ) {
             if cfg!(target_os = "windows") {
-                assert!(run_pipe_stream_test(VideoCodec::Hevc, 320, 180, true, &nvenc_args));
+                assert!(run_pipe_stream_test(
+                    VideoCodec::Hevc,
+                    usher_proto::handshake::ChromaSubsampling::Yuv420,
+                    320,
+                    180,
+                    true,
+                    &nvenc_args
+                ));
             }
             return;
         }
         let _ = run_pipe_stream_test(
             VideoCodec::Hevc,
+            usher_proto::handshake::ChromaSubsampling::Yuv420,
             160,
             90,
             false,

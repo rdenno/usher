@@ -1,0 +1,30 @@
+pkgname=usher
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Zero-daemon, SSH-bootstrapped remote desktop client and host"
+arch=('x86_64' 'aarch64')
+url="https://github.com/rdenno/usher"
+license=('GPL-3.0-or-later')
+depends=('alsa-lib' 'libx11' 'libxkbcommon' 'systemd-libs' 'openssh')
+makedepends=('cargo' 'nasm' 'clang')
+optdepends=(
+  'ffmpeg: fallback video capture/encode on Linux'
+  'libcap: grant CAP_SYS_ADMIN for KMS capture via setcap'
+)
+install=usher.install
+source=("$pkgname-$pkgver.tar.gz::https://github.com/rdenno/usher/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo build --release --locked --workspace
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 target/release/usher "$pkgdir/usr/bin/usher"
+  install -Dm755 target/release/usher-host "$pkgdir/usr/bin/usher-host"
+  install -Dm644 contrib/99-usher-uinput.rules "$pkgdir/usr/lib/udev/rules.d/99-usher-uinput.rules"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 SECURITY.md "$pkgdir/usr/share/doc/$pkgname/SECURITY.md"
+}

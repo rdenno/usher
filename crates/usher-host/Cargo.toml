@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Zero-daemon, SSH-bootstrapped Linux and Windows screen, audio, and input host for Usher"
 
 [[bin]]
@@ -23,11 +26,16 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-usher-proto = { path = "../usher-proto" }
+usher-proto = { version = "0.5.0", path = "../usher-proto" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.4", default-features = false, features = ["wayland-data-control"] }
+drm = "0.15"
 evdev.workspace = true
+libc = "0.2"
+libloading = "0.8"
+x11rb = { version = "0.13", default-features = false, features = ["shm", "randr"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal.workspace = true

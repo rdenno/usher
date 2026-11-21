@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -26,19 +25,22 @@ use usher_proto::adapt::{AdaptiveController, DEFAULT_MAX_BITRATE_KBPS};
 use usher_proto::audio::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use usher_proto::crypto::{Role, SessionCrypto, generate_session_key};
 use usher_proto::handshake::{
-    CodecPreference, DisplayInfo, HelloMessage, PROTOCOL_VERSION, QualityPreference, VideoCodec,
-    encode_hello_line, is_overlay_or_private_ip, parse_ssh_connection,
+    ChromaSubsampling, CodecPreference, DisplayInfo, HelloMessage, PROTOCOL_VERSION,
+    QualityPreference, VideoCodec, decode_session_cmd_b64, encode_displays_line, encode_hello_line,
+    is_overlay_or_private_ip, parse_ssh_connection, resolve_display_selector,
 };
 use usher_proto::packet::DEFAULT_MTU;
 
 use crate::audio::{AudioStreamConfig, spawn_audio_task};
+#[cfg(target_os = "windows")]
 use crate::input::create_input_sink;
 use crate::net::{NetConfig, spawn_network_tasks};
 use crate::video::drm_probe::probe_drm;
 use crate::video::headless::{HeadlessBackend, HeadlessSession};
 use crate::video::{
-    CaptureSource, EncoderKind, VideoPipelineConfig, is_in_place_bitrate_backend, negotiate_codec,
-    probe_host_codecs, resolve_effective_codec, resolve_video_backend, spawn_video_task,
+    CaptureSource, EncoderKind, HostCursorEvent, VideoPipelineConfig,
+    is_in_place_bitrate_backend, negotiate_codec, probe_host_codecs, resolve_effective_chroma,
+    resolve_effective_codec, resolve_video_backend, spawn_video_task, supports_separate_cursor,
 };
 
 const UDEV_RULE: &str = r#"KERNEL=="uinput", GROUP="input", MODE="0660""#;
@@ -86,9 +88,29 @@ struct Args {
     #[arg(long, default_value = "latency")]
     prefer: QualityPreference,
 
-    /// Host monitor index (for multi-monitor systems)
-    #[arg(long, default_value_t = 0)]
-    display: u8,
+    /// Host monitor index or name (for multi-monitor systems)
+    #[arg(long, default_value = "0")]
+    display: String,
+
+    /// Print enumerated displays as JSON (`USHER_DISPLAYS ...`) and exit
+    #[arg(long)]
+    list_displays: bool,
+
+    /// Requested chroma subsampling (420 or 444)
+    #[arg(long, default_value = "420")]
+    chroma: String,
+
+    /// Client advertises 4:4:4 chroma decode support
+    #[arg(long)]
+    client_chroma_444: bool,
+
+    /// Disable separate low-latency cursor plane (keep cursor baked into video)
+    #[arg(long)]
+    no_cursor_plane: bool,
+
+    /// Enable client->host virtual microphone passthrough
+    #[arg(long)]
+    mic: bool,
 
     /// Disable adaptive bitrate and FEC adjustments
     #[arg(long)]
@@ -126,6 +148,10 @@ struct Args {
     #[arg(long)]
     no_clipboard: bool,
 
+    /// Windows only: never elevate console worker to NT AUTHORITY\SYSTEM; use InteractiveToken (loses Lock Screen & UAC capture)
+    #[arg(long)]
+    no_system: bool,
+
     /// Seconds of inactivity before tearing down automatically
     #[arg(long, default_value_t = 15)]
     idle_timeout_secs: u64,
@@ -133,6 +159,10 @@ struct Args {
     /// Print the recommended static udev rule for /dev/uinput access and exit
     #[arg(long)]
     print_udev_rule: bool,
+
+    /// Linux Wayland only: run one-time interactive ScreenCast portal approval and save restore_token
+    #[arg(long)]
+    setup_portal: bool,
 
     /// Internal flag: running inside Windows interactive Session 1 spawned by Session 0 bridge
     #[arg(long, hide = true)]
@@ -161,6 +191,14 @@ struct Args {
     /// Internal flag: explicit absolute ffmpeg path forwarded from SSH Session 0
     #[arg(long, hide = true)]
     ffmpeg_path: Option<std::path::PathBuf>,
+
+    /// Base64-encoded JSON command array to launch inside an ephemeral headless session
+    #[arg(long)]
+    session_cmd_b64: Option<String>,
+
+    /// Optional command to launch inside an ephemeral headless session (implies --headless auto)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    session_cmd: Vec<String>,
 }
 
 fn resolve_bind_ip(explicit: Option<IpAddr>, allow_public: bool) -> Result<(IpAddr, Option<IpAddr>)> {
@@ -264,6 +302,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.setup_portal {
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(err) = video::linux_kms::drop_cap_sys_admin() {
+                eprintln!("warning: failed to drop CAP_SYS_ADMIN: {err:#}");
+            }
+            return video::linux_portal::run_setup_portal().await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("--setup-portal is only supported on Linux Wayland hosts");
+        }
+    }
+
     #[cfg(target_os = "windows")]
     if args.windows_system_launcher {
         let target_session = args
@@ -329,6 +381,7 @@ async fn main() -> Result<()> {
             args.no_audio,
             args.no_input,
             args.no_clipboard,
+            args.no_system,
         )
         .await
         {
@@ -358,7 +411,7 @@ async fn main() -> Result<()> {
     let probe = probe_drm();
 
     #[cfg(target_os = "windows")]
-    let (displays, bridge_host_codecs): (Vec<DisplayInfo>, Option<Vec<VideoCodec>>) =
+    let (mut displays, bridge_host_codecs): (Vec<DisplayInfo>, Option<Vec<VideoCodec>>) =
         if capture == CaptureSource::Testsrc {
             (Vec::new(), None)
         } else if let Some((_, ref info, _)) = console_worker {
@@ -381,17 +434,51 @@ async fn main() -> Result<()> {
             (video::windows_capture::enumerate_displays(), None)
         };
     #[cfg(target_os = "linux")]
-    let displays: Vec<DisplayInfo> = probe.displays.clone();
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    let displays: Vec<DisplayInfo> = Vec::new();
-
-    let active_display = if displays.is_empty() {
-        0
+    let mut displays: Vec<DisplayInfo> = if !probe.displays.is_empty() {
+        probe.displays.clone()
+    } else if let Ok((x11_displays, _)) = video::linux_x11::probe_x11_displays() {
+        x11_displays
     } else {
-        args.display.min((displays.len() - 1) as u8)
+        Vec::new()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let mut displays: Vec<DisplayInfo> = Vec::new();
+
+    if args.list_displays {
+        let line = encode_displays_line(&displays)?;
+        println!("{line}");
+        return Ok(());
+    }
+
+    let effective_session_cmd = if let Some(ref b64) = args.session_cmd_b64 {
+        decode_session_cmd_b64(b64)?
+    } else {
+        args.session_cmd.clone()
+    };
+    let effective_headless =
+        if !effective_session_cmd.is_empty() && args.headless == HeadlessBackend::None {
+            HeadlessBackend::Auto
+        } else {
+            args.headless
+        };
+
+    let mut active_display = if displays.is_empty()
+        || effective_headless != HeadlessBackend::None
+        || capture == CaptureSource::Testsrc
+    {
+        args.display.trim().parse::<u8>().unwrap_or(0)
+    } else {
+        resolve_display_selector(&displays, &args.display).ok_or_else(|| {
+            let available = displays
+                .iter()
+                .map(|d| format!("{}:{} ({}x{})", d.index, d.name, d.width, d.height))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("display '{}' not found (available: {available})", args.display)
+        })?
     };
 
-    let active_disp_res = if args.headless == HeadlessBackend::None
+    let active_disp_res = if effective_headless == HeadlessBackend::None
         && capture != CaptureSource::Testsrc
     {
         displays
@@ -430,7 +517,22 @@ async fn main() -> Result<()> {
     let initial_bitrate_kbps = adaptive_controller.applied_bitrate_kbps;
     let initial_fec = adaptive_controller.fec_percent;
 
-    let headless_session = HeadlessSession::start(args.headless, width, height, fps)?;
+    let headless_session = HeadlessSession::start(
+        effective_headless,
+        width,
+        height,
+        fps,
+        &effective_session_cmd,
+    )?;
+    if headless_session.wayland_display().is_some() {
+        displays = vec![DisplayInfo {
+            index: 0,
+            name: format!("HEADLESS ({:?})", headless_session.backend()),
+            width,
+            height,
+        }];
+        active_display = 0;
+    }
 
     let client_codecs: Vec<VideoCodec> = args
         .client_codecs
@@ -443,6 +545,13 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     let host_codecs = probe_host_codecs(capture, args.encoder, &probe);
     let negotiated_codec = negotiate_codec(args.codec, &client_codecs, &host_codecs);
+    let requested_chroma = ChromaSubsampling::from_arg(&args.chroma)?;
+    let wanted_chroma = if requested_chroma == ChromaSubsampling::Yuv444 && args.client_chroma_444
+    {
+        ChromaSubsampling::Yuv444
+    } else {
+        ChromaSubsampling::Yuv420
+    };
 
     let mut video_cfg = VideoPipelineConfig {
         width,
@@ -454,7 +563,9 @@ async fn main() -> Result<()> {
         encoder: args.encoder,
         prefer: args.prefer,
         display_index: active_display,
-        render_node: probe.render_node,
+        chroma: wanted_chroma,
+        separate_cursor: !args.no_cursor_plane,
+        render_node: probe.render_node.clone(),
         wayland_runtime_dir: headless_session.runtime_dir().map(std::path::Path::to_path_buf),
         wayland_display: headless_session.wayland_display().map(str::to_string),
     };
@@ -468,6 +579,46 @@ async fn main() -> Result<()> {
         );
     }
     video_cfg.codec = effective_codec;
+    video_cfg.chroma = resolve_effective_chroma(&video_cfg);
+    let cursor_plane_active = supports_separate_cursor(&video_cfg);
+    video_cfg.separate_cursor = cursor_plane_active;
+
+    #[cfg(target_os = "linux")]
+    let capture_diagnostics: Vec<String> = {
+        let rep = video::linux_native::diagnose_linux_capture(&video_cfg, &probe);
+        let uses_kms = matches!(
+            resolved_backend,
+            video::ResolvedBackend::LinuxNative(ref b)
+                if b.capture == video::linux_native::LinuxCaptureKind::Kms
+        ) || matches!(
+            resolved_backend,
+            video::ResolvedBackend::Hw(video::hw_pipeline::HwPipelineKind::DrmVaapi)
+        );
+        if !uses_kms && let Err(err) = video::linux_kms::drop_cap_sys_admin() {
+            tracing::warn!("failed to drop CAP_SYS_ADMIN: {err:#}");
+        }
+        rep.diagnostics
+    };
+    #[cfg(target_os = "windows")]
+    let capture_diagnostics: Vec<String> = {
+        let bridge_note = if let Some((_, ref info, sess)) = console_worker {
+            format!(
+                "capture: Session 0 -> session {sess} bridge (system={}, desktop={})",
+                info.is_system,
+                info.desktop_name.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            format!("capture: in-process DXGI ({} display(s))", displays.len())
+        };
+        vec![
+            bridge_note,
+            format!("encoder selected: {resolved_backend:?}, audio: WASAPI loopback"),
+        ]
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let capture_diagnostics: Vec<String> = vec![format!(
+        "capture/encoder selected: {resolved_backend:?}"
+    )];
 
     let session_key = generate_session_key()?;
     let udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
@@ -530,6 +681,11 @@ async fn main() -> Result<()> {
         video_backend: format!("{resolved_backend:?}"),
         gamepad_backend,
         hi_res_scroll: true,
+        capture_diagnostics,
+        tcp_tunnel: true,
+        chroma: video_cfg.chroma,
+        cursor_plane: cursor_plane_active,
+        mic_enabled: args.mic,
     };
 
     let hello_line = encode_hello_line(&hello)?;
@@ -554,25 +710,7 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     let start = Instant::now();
     let keyframe_req = Arc::new(AtomicBool::new(true));
-
-    // Watchdog 1: SSH stdin EOF
-    {
-        let cancel_stdin = cancel.clone();
-        tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let mut buf = [0u8; 64];
-            loop {
-                match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
-                        tracing::info!("SSH stdin closed (EOF); tearing down session");
-                        cancel_stdin.cancel();
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-            }
-        });
-    }
+    headless_session.watch_exit(cancel.clone());
 
     // Watchdog 2: OS signals (Ctrl+C, SIGTERM, SIGHUP)
     {
@@ -628,7 +766,9 @@ async fn main() -> Result<()> {
         (create_input_sink(!args.no_input), None)
     };
     #[cfg(not(target_os = "windows"))]
-    let input_sink = create_input_sink(!args.no_input);
+    let wayland_sock = headless_session.socket_path();
+    #[cfg(not(target_os = "windows"))]
+    let input_sink = crate::input::create_input_sink_for_session(!args.no_input, wayland_sock.as_deref());
     let (video_tx, video_rx) = mpsc::channel(4);
     let (audio_tx, audio_rx) = mpsc::channel(16);
     let (clip_in_tx, clip_in_rx) = mpsc::channel::<String>(16);
@@ -645,6 +785,22 @@ async fn main() -> Result<()> {
     let fec_percent = Arc::new(AtomicU8::new(initial_fec));
     let audio_enabled = Arc::new(AtomicBool::new(!args.no_audio));
     let adaptive = Arc::new(Mutex::new(adaptive_controller));
+
+    let (cursor_tx, cursor_rx) = if cursor_plane_active {
+        let (tx, rx) = mpsc::channel::<HostCursorEvent>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let (mic_in_tx, mic_in_rx) = if args.mic {
+        let (tx, rx) = mpsc::channel::<usher_proto::audio::AudioPacket>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let mic_handle = mic_in_rx.map(|rx| {
+        crate::audio::mic_sink::spawn_mic_sink_task(true, rx, cancel.clone())
+    });
 
     let net_handles = spawn_network_tasks(
         NetConfig {
@@ -673,6 +829,9 @@ async fn main() -> Result<()> {
             } else {
                 Some(clip_in_tx)
             },
+            cursor_rx,
+            mic_in_tx,
+            stdio_tunnel: true,
         },
         input_sink,
         video_rx,
@@ -696,6 +855,7 @@ async fn main() -> Result<()> {
             !args.no_audio,
             args.no_input,
             args.no_clipboard,
+            args.no_system,
             video_cfg_rx,
             live_bitrate_kbps,
             in_place_bitrate,
@@ -703,6 +863,7 @@ async fn main() -> Result<()> {
             status_notify,
             video_tx,
             audio_tx,
+            cursor_tx.clone(),
             keyframe_req,
             peer_ready,
             audio_enabled,
@@ -720,6 +881,7 @@ async fn main() -> Result<()> {
             effective_codec_atomic,
             status_notify,
             video_tx,
+            cursor_tx.clone(),
             keyframe_req,
             peer_ready,
             start,
@@ -752,6 +914,7 @@ async fn main() -> Result<()> {
             effective_codec_atomic,
             status_notify,
             video_tx,
+            cursor_tx,
             keyframe_req,
             peer_ready,
             start,
@@ -783,6 +946,9 @@ async fn main() -> Result<()> {
         let _ = video_handle.await;
         let _ = audio_handle.await;
         let _ = clip_handle.await;
+        if let Some(mh) = mic_handle {
+            let _ = mh.await;
+        }
         for h in net_handles {
             let _ = h.await;
         }
@@ -806,6 +972,8 @@ fn to_worker_video_cfg(cfg: &VideoPipelineConfig) -> windows_ipc::WorkerVideoCon
         encoder: cfg.encoder.as_str().to_string(),
         prefer: cfg.prefer,
         display_index: cfg.display_index,
+        chroma: cfg.chroma,
+        separate_cursor: cfg.separate_cursor,
     }
 }
 
@@ -952,6 +1120,7 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
     let keyframe_req = Arc::new(AtomicBool::new(true));
 
     let (v_tx, mut v_rx) = mpsc::channel::<crate::video::EncodedFrame>(8);
+    let (c_tx, mut c_rx) = mpsc::channel::<HostCursorEvent>(64);
     let video_fwd = {
         let msg_tx = msg_tx.clone();
         let cancel = worker_cancel.clone();
@@ -965,6 +1134,44 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
                                 keyframe: frame.keyframe,
                                 timestamp_us: frame.timestamp_us,
                                 data: frame.data,
+                            });
+                        }
+                        None => break,
+                    }
+                }
+            }
+        })
+    };
+    let cursor_fwd = {
+        let msg_tx = msg_tx.clone();
+        let cancel = worker_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    c = c_rx.recv() => match c {
+                        Some(HostCursorEvent::Position { visible, x_norm, y_norm }) => {
+                            let _ = msg_tx.try_send(WorkerMsg::CursorPos {
+                                visible,
+                                x_norm,
+                                y_norm,
+                            });
+                        }
+                        Some(HostCursorEvent::Shape {
+                            shape_id,
+                            width,
+                            height,
+                            hotspot_x,
+                            hotspot_y,
+                            rgba,
+                        }) => {
+                            let _ = msg_tx.try_send(WorkerMsg::CursorShape {
+                                shape_id,
+                                width,
+                                height,
+                                hotspot_x,
+                                hotspot_y,
+                                rgba,
                             });
                         }
                         None => break,
@@ -1041,6 +1248,7 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
                     eff_codec.clone(),
                     st_notify.clone(),
                     v_tx.clone(),
+                    Some(c_tx.clone()),
                     kf_req.clone(),
                     start,
                     child_cancel.clone(),
@@ -1084,6 +1292,8 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
                     encoder: EncoderKind::from_str_name(&wcfg.encoder),
                     prefer: wcfg.prefer,
                     display_index: wcfg.display_index,
+                    chroma: wcfg.chroma,
+                    separate_cursor: wcfg.separate_cursor,
                     render_node: None,
                     wayland_runtime_dir: None,
                     wayland_display: None,
@@ -1121,6 +1331,7 @@ async fn run_windows_console_worker(args: Args) -> Result<()> {
         let _ = audio_handle.await;
         let _ = audio_fwd.await;
         let _ = video_fwd.await;
+        let _ = cursor_fwd.await;
         let _ = status_fwd.await;
         let _ = clip_handle.await;
         let _ = clip_fwd.await;
@@ -1168,6 +1379,7 @@ async fn run_windows_session_supervisor(
     audio_allowed: bool,
     no_input: bool,
     no_clipboard: bool,
+    no_system: bool,
     mut video_cfg_rx: watch::Receiver<VideoPipelineConfig>,
     live_bitrate_kbps: Arc<AtomicU32>,
     in_place_bitrate: Arc<AtomicBool>,
@@ -1175,6 +1387,7 @@ async fn run_windows_session_supervisor(
     status_notify: Arc<tokio::sync::Notify>,
     video_tx: mpsc::Sender<crate::video::EncodedFrame>,
     audio_tx: mpsc::Sender<usher_proto::audio::AudioPacket>,
+    cursor_tx: Option<mpsc::Sender<HostCursorEvent>>,
     keyframe_req: Arc<AtomicBool>,
     peer_ready: Arc<tokio::sync::Notify>,
     audio_enabled: Arc<AtomicBool>,
@@ -1254,6 +1467,7 @@ async fn run_windows_session_supervisor(
                         !audio_allowed,
                         no_input,
                         no_clipboard,
+                        no_system,
                     )
                     .await
                     {
@@ -1337,6 +1551,38 @@ async fn run_windows_session_supervisor(
                 Some(Ok(WorkerMsg::ClipboardText(text))) => {
                     if !no_clipboard {
                         let _ = clip_out_tx.try_send(text);
+                    }
+                }
+                Some(Ok(WorkerMsg::CursorPos {
+                    visible,
+                    x_norm,
+                    y_norm,
+                })) => {
+                    if let Some(ref tx) = cursor_tx {
+                        let _ = tx.try_send(HostCursorEvent::Position {
+                            visible,
+                            x_norm,
+                            y_norm,
+                        });
+                    }
+                }
+                Some(Ok(WorkerMsg::CursorShape {
+                    shape_id,
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                    rgba,
+                })) => {
+                    if let Some(ref tx) = cursor_tx {
+                        let _ = tx.try_send(HostCursorEvent::Shape {
+                            shape_id,
+                            width,
+                            height,
+                            hotspot_x,
+                            hotspot_y,
+                            rgba,
+                        });
                     }
                 }
                 Some(Ok(WorkerMsg::HelloInfo(_))) => {}

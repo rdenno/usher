@@ -39,6 +39,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Headless local decode smoke test
+        run: |
+          cargo build --bin usher --bin usher-host
+          ./target/debug/usher --local --capture testsrc --no-audio --no-input --no-clipboard --smoke-frames 5
+
       - name: Verify Windows Setup installer (Inno Setup)
         if: runner.os == 'Windows'
         shell: pwsh

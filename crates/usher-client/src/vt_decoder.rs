@@ -208,6 +208,7 @@ unsafe extern "C" fn vt_output_callback(
             y_stride: w as u32,
             u_stride: cw as u32,
             v_stride: cw as u32,
+            is_444: false,
             y,
             u,
             v,

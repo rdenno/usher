@@ -1,3 +1,4 @@
+pub mod mic_sink;
 #[cfg(target_os = "linux")]
 pub mod pipewire_linux;
 pub mod test_tone;

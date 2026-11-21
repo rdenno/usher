@@ -318,6 +318,9 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                 VideoCodec::Hevc => "hevc_nvenc",
                 VideoCodec::Av1 => "av1_nvenc",
             };
+            let use_yuv444 = cfg.chroma == usher_proto::handshake::ChromaSubsampling::Yuv444
+                && matches!(cfg.codec, VideoCodec::H264 | VideoCodec::Hevc);
+            let pix_fmt = if use_yuv444 { "yuv444p" } else { "yuv420p" };
             let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
             let mut c = Command::new("ffmpeg");
             c.args([
@@ -335,7 +338,7 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                 "-i",
                 &display,
                 "-pix_fmt",
-                "yuv420p",
+                pix_fmt,
                 "-c:v",
                 enc,
                 "-preset",
@@ -359,6 +362,14 @@ fn build_command(kind: HwPipelineKind, cfg: &VideoPipelineConfig) -> Result<Comm
                 "-g",
                 &gop,
             ]);
+            if use_yuv444 {
+                let profile = match cfg.codec {
+                    VideoCodec::H264 => "high444p",
+                    VideoCodec::Hevc => "rext",
+                    VideoCodec::Av1 => unreachable!(),
+                };
+                c.args(["-profile:v", profile]);
+            }
             if matches!(cfg.codec, VideoCodec::H264 | VideoCodec::Hevc) {
                 c.args(["-aud", "1"]);
             }

@@ -344,73 +344,93 @@ async fn try_launch_via_schtasks(
     Ok(())
 }
 
+fn should_try_system_worker(no_system: bool) -> bool {
+    !no_system
+}
+
+async fn launch_interactive_worker(
+    ffmpeg_path: Option<&Path>,
+    no_audio: bool,
+    no_input: bool,
+    no_clipboard: bool,
+) -> Result<NamedPipeServer> {
+    let (pipe2, server2) = create_bridge_pipe_server()?;
+    let mut inter_args = vec![
+        "--windows-worker".to_string(),
+        "--bridge-pipe".to_string(),
+        pipe2.clone(),
+    ];
+    if let Some(ff) = ffmpeg_path {
+        inter_args.push("--ffmpeg-path".into());
+        inter_args.push(ff.to_string_lossy().into_owned());
+    }
+    if no_audio {
+        inter_args.push("--no-audio".into());
+    }
+    if no_input {
+        inter_args.push("--no-input".into());
+    }
+    if no_clipboard {
+        inter_args.push("--no-clipboard".into());
+    }
+    try_launch_via_schtasks(&pipe2, &server2, &inter_args, false).await?;
+    Ok(server2)
+}
+
 /// Spawns an ephemeral console worker in `target_session`: tries `NT AUTHORITY\SYSTEM`
 /// (capturing `Winlogon` Lock Screen & UAC prompts cleanly), falling back to `InteractiveToken`
-/// if the SSH user is not an Administrator.
+/// if the SSH user is not an Administrator (or skipping `SYSTEM` when `no_system` is set).
 pub async fn spawn_console_worker(
     target_session: u32,
     ffmpeg_path: Option<&Path>,
     no_audio: bool,
     no_input: bool,
     no_clipboard: bool,
+    no_system: bool,
 ) -> Result<(NamedPipeServer, WorkerHelloInfo, u32)> {
-    let (pipe1, mut server1) = create_bridge_pipe_server()?;
-    let mut launcher_args = vec![
-        "--windows-system-launcher".to_string(),
-        "--target-session".to_string(),
-        target_session.to_string(),
-        "--bridge-pipe".to_string(),
-        pipe1.clone(),
-    ];
-    if let Some(ff) = ffmpeg_path {
-        launcher_args.push("--ffmpeg-path".into());
-        launcher_args.push(ff.to_string_lossy().into_owned());
-    }
-    if no_audio {
-        launcher_args.push("--no-audio".into());
-    }
-    if no_input {
-        launcher_args.push("--no-input".into());
-    }
-    if no_clipboard {
-        launcher_args.push("--no-clipboard".into());
-    }
-
-    let mut active_server = match try_launch_via_schtasks(&pipe1, &server1, &launcher_args, true).await {
-        Ok(()) => server1,
-        Err(sys_err) => {
-            tracing::warn!(
-                "SYSTEM lock-screen console launcher unavailable ({sys_err:#}); falling back to InteractiveToken user session"
-            );
-            drop(server1);
-            let (pipe2, server2) = create_bridge_pipe_server()?;
-            let mut inter_args = vec![
-                "--windows-worker".to_string(),
-                "--bridge-pipe".to_string(),
-                pipe2.clone(),
-            ];
-            if let Some(ff) = ffmpeg_path {
-                inter_args.push("--ffmpeg-path".into());
-                inter_args.push(ff.to_string_lossy().into_owned());
-            }
-            if no_audio {
-                inter_args.push("--no-audio".into());
-            }
-            if no_input {
-                inter_args.push("--no-input".into());
-            }
-            if no_clipboard {
-                inter_args.push("--no-clipboard".into());
-            }
-            try_launch_via_schtasks(&pipe2, &server2, &inter_args, false).await?;
-            server2
+    let mut active_server = if should_try_system_worker(no_system) {
+        let (pipe1, server1) = create_bridge_pipe_server()?;
+        let mut launcher_args = vec![
+            "--windows-system-launcher".to_string(),
+            "--target-session".to_string(),
+            target_session.to_string(),
+            "--bridge-pipe".to_string(),
+            pipe1.clone(),
+        ];
+        if let Some(ff) = ffmpeg_path {
+            launcher_args.push("--ffmpeg-path".into());
+            launcher_args.push(ff.to_string_lossy().into_owned());
         }
+        if no_audio {
+            launcher_args.push("--no-audio".into());
+        }
+        if no_input {
+            launcher_args.push("--no-input".into());
+        }
+        if no_clipboard {
+            launcher_args.push("--no-clipboard".into());
+        }
+
+        match try_launch_via_schtasks(&pipe1, &server1, &launcher_args, true).await {
+            Ok(()) => server1,
+            Err(sys_err) => {
+                tracing::warn!(
+                    "SYSTEM lock-screen console launcher unavailable ({sys_err:#}); falling back to InteractiveToken user session"
+                );
+                drop(server1);
+                launch_interactive_worker(ffmpeg_path, no_audio, no_input, no_clipboard).await?
+            }
+        }
+    } else {
+        tracing::info!(
+            "running Windows console worker in InteractiveToken mode (--no-system; Lock Screen and UAC capture disabled)"
+        );
+        launch_interactive_worker(ffmpeg_path, no_audio, no_input, no_clipboard).await?
     };
 
-    server1 = active_server;
     let hello = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match read_worker_msg(&mut server1).await? {
+            match read_worker_msg(&mut active_server).await? {
                 WorkerMsg::HelloInfo(info) => return Ok::<WorkerHelloInfo, anyhow::Error>(info),
                 WorkerMsg::LogLine(line) => {
                     tracing::info!("[console-worker] {line}");
@@ -424,7 +444,6 @@ pub async fn spawn_console_worker(
     .await
     .context("timed out waiting 10s for console worker HelloInfo")??;
 
-    active_server = server1;
     let resolved_session = hello.worker_session;
     Ok((active_server, hello, resolved_session))
 }
@@ -573,5 +592,11 @@ mod tests {
         assert!(decoded.contains("<UserId>S-1-5-18</UserId>"));
         assert!(decoded.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(!decoded.contains("<LogonType>"));
+    }
+
+    #[test]
+    fn no_system_skips_system_worker_launch() {
+        assert!(should_try_system_worker(false));
+        assert!(!should_try_system_worker(true));
     }
 }

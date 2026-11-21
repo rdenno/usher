@@ -209,7 +209,7 @@ fn vendor_matches(kind: EncoderKind, vendor: MftVendor, name: &str) -> bool {
         EncoderKind::Nvenc => vendor == MftVendor::Nvenc,
         EncoderKind::Amf => vendor == MftVendor::Amf,
         EncoderKind::Qsv => vendor == MftVendor::Qsv,
-        EncoderKind::Openh264 => false,
+        EncoderKind::Openh264 | EncoderKind::Ffmpeg => false,
         EncoderKind::Auto | EncoderKind::Vaapi => {
             // Treat dedicated GPU MFTs and generic DX12 wrappers as valid, but sort
             // vendor-specific encoders ahead of generic Microsoft DX12 wrappers.
@@ -283,7 +283,7 @@ fn enumerate_hw_encoders(codec: VideoCodec, kind: EncoderKind) -> Result<Vec<Enu
 }
 
 pub fn probe_mf_hw_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
-    if kind == EncoderKind::Openh264 {
+    if matches!(kind, EncoderKind::Openh264 | EncoderKind::Ffmpeg) {
         return Vec::new();
     }
     let mut supported = Vec::new();

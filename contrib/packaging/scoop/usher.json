@@ -1,0 +1,30 @@
+{
+  "version": "0.5.0",
+  "description": "Zero-daemon, SSH-bootstrapped remote desktop client and host",
+  "homepage": "https://github.com/rdenno/usher",
+  "license": "GPL-3.0-or-later",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/rdenno/usher/releases/download/v0.5.0/usher-windows-x86_64.zip",
+      "hash": "REPLACE_WITH_SHA256_FROM_SHA256SUMS"
+    }
+  },
+  "bin": [
+    "usher.exe",
+    "usher-host.exe"
+  ],
+  "checkver": {
+    "github": "https://github.com/rdenno/usher"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/rdenno/usher/releases/download/v$version/usher-windows-x86_64.zip"
+      }
+    },
+    "hash": {
+      "url": "https://github.com/rdenno/usher/releases/download/v$version/SHA256SUMS.txt",
+      "regex": "$sha256\\s+$basename"
+    }
+  }
+}

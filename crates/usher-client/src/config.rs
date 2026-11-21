@@ -179,6 +179,110 @@ impl FromStr for PointerMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportPreference {
+    #[default]
+    Auto,
+    Udp,
+    Tcp,
+}
+
+impl fmt::Display for TransportPreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Auto => write!(f, "auto"),
+            Self::Udp => write!(f, "udp"),
+            Self::Tcp => write!(f, "tcp"),
+        }
+    }
+}
+
+impl FromStr for TransportPreference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "udp" => Ok(Self::Udp),
+            "tcp" => Ok(Self::Tcp),
+            other => bail!("unsupported transport '{other}' (expected auto, udp, or tcp)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DisplaySelector {
+    Index(u8),
+    Name(String),
+}
+
+impl Default for DisplaySelector {
+    fn default() -> Self {
+        Self::Index(0)
+    }
+}
+
+impl fmt::Display for DisplaySelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Index(i) => write!(f, "{i}"),
+            Self::Name(name) => f.write_str(name),
+        }
+    }
+}
+
+impl FromStr for DisplaySelector {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            bail!("display selector cannot be empty");
+        }
+        if let Ok(idx) = trimmed.parse::<u8>() {
+            Ok(Self::Index(idx))
+        } else {
+            Ok(Self::Name(trimmed.to_string()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChromaPreference {
+    #[default]
+    Auto,
+    #[serde(rename = "420", alias = "yuv420", alias = "4:2:0")]
+    Yuv420,
+    #[serde(rename = "444", alias = "yuv444", alias = "4:4:4")]
+    Yuv444,
+}
+
+impl fmt::Display for ChromaPreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Auto => f.write_str("auto"),
+            Self::Yuv420 => f.write_str("420"),
+            Self::Yuv444 => f.write_str("444"),
+        }
+    }
+}
+
+impl FromStr for ChromaPreference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "420" | "4:2:0" | "yuv420" => Ok(Self::Yuv420),
+            "444" | "4:4:4" | "yuv444" => Ok(Self::Yuv444),
+            other => bail!("unsupported chroma '{other}' (expected auto, 420, or 444)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostSettings {
@@ -187,9 +291,11 @@ pub struct HostSettings {
     pub fps: Option<FpsSetting>,
     pub codec: Option<CodecPreference>,
     pub prefer: Option<QualityPreference>,
+    pub chroma: Option<ChromaPreference>,
     pub audio: Option<bool>,
+    pub mic: Option<bool>,
     pub clipboard: Option<bool>,
-    pub display: Option<u8>,
+    pub display: Option<DisplaySelector>,
     pub pointer_mode: Option<PointerMode>,
     pub stats_overlay: Option<bool>,
     pub fullscreen: Option<bool>,
@@ -203,6 +309,10 @@ pub struct HostSettings {
     pub bind_ip: Option<IpAddr>,
     pub ssh_opts: Option<Vec<String>>,
     pub no_adaptive: Option<bool>,
+    pub no_system: Option<bool>,
+    pub batch_mode: Option<bool>,
+    pub transport: Option<TransportPreference>,
+    pub auto_install: Option<bool>,
 }
 
 impl HostSettings {
@@ -219,7 +329,9 @@ impl HostSettings {
         take_some!(fps);
         take_some!(codec);
         take_some!(prefer);
+        take_some!(chroma);
         take_some!(audio);
+        take_some!(mic);
         take_some!(display);
         take_some!(pointer_mode);
         take_some!(stats_overlay);
@@ -235,6 +347,10 @@ impl HostSettings {
         take_some!(bind_ip);
         take_some!(ssh_opts);
         take_some!(no_adaptive);
+        take_some!(no_system);
+        take_some!(batch_mode);
+        take_some!(transport);
+        take_some!(auto_install);
     }
 }
 
@@ -255,8 +371,10 @@ pub struct EffectiveConfig {
     pub fps: FpsSetting,
     pub codec: CodecPreference,
     pub prefer: QualityPreference,
+    pub chroma: ChromaPreference,
     pub audio: bool,
-    pub display: u8,
+    pub mic: bool,
+    pub display: DisplaySelector,
     pub pointer_mode: PointerMode,
     pub stats_overlay: bool,
     pub fullscreen: bool,
@@ -271,6 +389,10 @@ pub struct EffectiveConfig {
     pub bind_ip: Option<IpAddr>,
     pub ssh_opts: Vec<String>,
     pub no_adaptive: bool,
+    pub no_system: bool,
+    pub batch_mode: bool,
+    pub transport: TransportPreference,
+    pub auto_install: Option<bool>,
 }
 
 impl Default for EffectiveConfig {
@@ -282,9 +404,11 @@ impl Default for EffectiveConfig {
             fps: FpsSetting::Auto,
             codec: CodecPreference::Auto,
             prefer: QualityPreference::Latency,
+            chroma: ChromaPreference::Auto,
             audio: true,
+            mic: false,
             clipboard: true,
-            display: 0,
+            display: DisplaySelector::Index(0),
             pointer_mode: PointerMode::Absolute,
             stats_overlay: false,
             fullscreen: true,
@@ -298,6 +422,10 @@ impl Default for EffectiveConfig {
             bind_ip: None,
             ssh_opts: Vec::new(),
             no_adaptive: false,
+            no_system: false,
+            batch_mode: false,
+            transport: TransportPreference::Auto,
+            auto_install: None,
         }
     }
 }
@@ -325,7 +453,9 @@ impl EffectiveConfig {
             fps: merged.fps.unwrap_or(def.fps),
             codec: merged.codec.unwrap_or(def.codec),
             prefer: merged.prefer.unwrap_or(def.prefer),
+            chroma: merged.chroma.unwrap_or(def.chroma),
             audio: merged.audio.unwrap_or(def.audio),
+            mic: merged.mic.unwrap_or(def.mic),
             clipboard: merged.clipboard.unwrap_or(def.clipboard),
             display: merged.display.unwrap_or(def.display),
             pointer_mode: merged.pointer_mode.unwrap_or(def.pointer_mode),
@@ -341,6 +471,10 @@ impl EffectiveConfig {
             bind_ip: merged.bind_ip,
             ssh_opts: merged.ssh_opts.unwrap_or(def.ssh_opts),
             no_adaptive: merged.no_adaptive.unwrap_or(def.no_adaptive),
+            no_system: merged.no_system.unwrap_or(def.no_system),
+            batch_mode: merged.batch_mode.unwrap_or(def.batch_mode),
+            transport: merged.transport.unwrap_or(def.transport),
+            auto_install: merged.auto_install,
         }
     }
 }
@@ -436,7 +570,7 @@ display = 1
         assert_eq!(eff.prefer, QualityPreference::Quality); // inherited from global
         assert_eq!(eff.pointer_mode, PointerMode::Relative);
         assert!(!eff.audio);
-        assert_eq!(eff.display, 1);
+        assert_eq!(eff.display, DisplaySelector::Index(1));
         assert!(eff.fullscreen);
 
         let cli_windowed = HostSettings {
@@ -473,7 +607,7 @@ codec = "hevc"
             codec: Some(CodecPreference::Av1),
             prefer: Some(QualityPreference::Latency),
             audio: Some(true),
-            display: Some(2),
+            display: Some(DisplaySelector::Index(2)),
             pointer_mode: Some(PointerMode::Relative),
             stats_overlay: Some(false),
             ..Default::default()
@@ -494,5 +628,31 @@ codec = "hevc"
         assert_eq!(g.resolution, Some(ResolutionMode::MatchWindow));
         assert_eq!(g.codec, Some(CodecPreference::Av1));
         assert_eq!(g.pointer_mode, Some(PointerMode::Relative));
+    }
+
+    #[test]
+    fn parses_display_selector_chroma_and_mic_from_toml() {
+        let raw = r#"
+chroma = "444"
+mic = true
+
+[host.workstation]
+display = "HDMI-1"
+
+[host.tv]
+display = 2
+chroma = "420"
+mic = false
+"#;
+        let cfg: ConfigFile = toml::from_str(raw).unwrap();
+        let eff_ws = EffectiveConfig::resolve(&cfg, Some("workstation"), &HostSettings::default(), None);
+        assert_eq!(eff_ws.display, DisplaySelector::Name("HDMI-1".into()));
+        assert_eq!(eff_ws.chroma, ChromaPreference::Yuv444);
+        assert!(eff_ws.mic);
+
+        let eff_tv = EffectiveConfig::resolve(&cfg, Some("tv"), &HostSettings::default(), None);
+        assert_eq!(eff_tv.display, DisplaySelector::Index(2));
+        assert_eq!(eff_tv.chroma, ChromaPreference::Yuv420);
+        assert!(!eff_tv.mic);
     }
 }

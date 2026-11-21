@@ -8,6 +8,31 @@ pub const AEAD_TAG_LEN: usize = 16;
 pub const DEFAULT_MTU: usize = 1200;
 const WIRE_VERSION_NIBBLE: u8 = 1;
 pub const STREAM_STATUS_FLAG_STEPPED_DOWN: u8 = 0x01;
+pub const TUNNEL_MAGIC: [u8; 4] = *b"USTC";
+pub const MAX_TUNNEL_FRAME_LEN: usize = 16 * 1024;
+
+/// Frames an encrypted datagram for SSH stdio TCP tunnel transport: `[u16 LE len][payload]`.
+pub fn encode_tunnel_frame(datagram: &[u8]) -> Result<Vec<u8>> {
+    if datagram.is_empty() || datagram.len() > MAX_TUNNEL_FRAME_LEN {
+        bail!(
+            "tunnel frame length {} outside valid range 1..={MAX_TUNNEL_FRAME_LEN}",
+            datagram.len()
+        );
+    }
+    let mut out = Vec::with_capacity(2 + datagram.len());
+    out.extend_from_slice(&(datagram.len() as u16).to_le_bytes());
+    out.extend_from_slice(datagram);
+    Ok(out)
+}
+
+/// Validates and decodes the 2-byte little-endian length prefix of an SSH stdio tunnel frame.
+pub fn decode_tunnel_frame_len(hdr: [u8; 2]) -> Result<usize> {
+    let len = u16::from_le_bytes(hdr) as usize;
+    if len == 0 || len > MAX_TUNNEL_FRAME_LEN {
+        bail!("invalid tunnel frame length {len} (expected 1..={MAX_TUNNEL_FRAME_LEN})");
+    }
+    Ok(len)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -20,6 +45,8 @@ pub enum PacketKind {
     Ping = 5,
     Pong = 6,
     Clipboard = 7,
+    Cursor = 8,
+    MicAudio = 9,
 }
 
 impl PacketKind {
@@ -33,6 +60,8 @@ impl PacketKind {
             5 => Ok(Self::Ping),
             6 => Ok(Self::Pong),
             7 => Ok(Self::Clipboard),
+            8 => Ok(Self::Cursor),
+            9 => Ok(Self::MicAudio),
             other => bail!("unknown packet kind: {other}"),
         }
     }
@@ -455,5 +484,19 @@ mod tests {
             let decoded = ControlMessage::decode(&encoded).unwrap();
             assert_eq!(decoded, msg);
         }
+    }
+
+    #[test]
+    fn tunnel_frame_roundtrip_and_bounds() {
+        let payload = b"encrypted-datagram-bytes";
+        let framed = encode_tunnel_frame(payload).unwrap();
+        let len = decode_tunnel_frame_len([framed[0], framed[1]]).unwrap();
+        assert_eq!(len, payload.len());
+        assert_eq!(&framed[2..], payload);
+
+        assert!(encode_tunnel_frame(&[]).is_err());
+        assert!(encode_tunnel_frame(&vec![0u8; MAX_TUNNEL_FRAME_LEN + 1]).is_err());
+        assert!(decode_tunnel_frame_len([0, 0]).is_err());
+        assert!(decode_tunnel_frame_len(((MAX_TUNNEL_FRAME_LEN + 1) as u16).to_le_bytes()).is_err());
     }
 }

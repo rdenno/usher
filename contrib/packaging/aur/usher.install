@@ -1,0 +1,13 @@
+post_install() {
+  udevadm control --reload-rules >/dev/null 2>&1 || true
+  udevadm trigger /dev/uinput >/dev/null 2>&1 || true
+  if command -v setcap >/dev/null 2>&1; then
+    setcap cap_sys_admin+ep /usr/bin/usher-host >/dev/null 2>&1 || true
+  fi
+  echo "==> Add your user to the 'input' group for remote keyboard/mouse/gamepad:"
+  echo "    sudo usermod -aG input \$USER"
+}
+
+post_upgrade() {
+  post_install
+}

@@ -1,0 +1,47 @@
+[package]
+name = "usher-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+usher-proto = { path = "../crates/usher-proto" }
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fragment"
+path = "fuzz_targets/fragment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fec"
+path = "fuzz_targets/fec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_clipboard"
+path = "fuzz_targets/input_clipboard.rs"
+test = false
+doc = false
+bench = false

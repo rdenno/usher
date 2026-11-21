@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
+PackageIdentifier: rdenno.Usher
+PackageVersion: 0.5.0
+PackageLocale: en-US
+Publisher: rdenno
+PublisherUrl: https://github.com/rdenno/usher
+PublisherSupportUrl: https://github.com/rdenno/usher/issues
+PackageName: Usher
+PackageUrl: https://github.com/rdenno/usher
+License: GPL-3.0-or-later
+LicenseUrl: https://github.com/rdenno/usher/blob/main/LICENSE
+ShortDescription: Zero-daemon, SSH-bootstrapped remote desktop client and host
+Description: >-
+  Usher is ssh with a screen. It launches an ephemeral host over OpenSSH, streams
+  hardware-encoded video and Opus audio over ChaCha20-Poly1305 UDP, and tears down
+  all processes and ports on exit.
+Moniker: usher
+Tags:
+  - ssh
+  - remote-desktop
+  - streaming
+  - tailscale
+Installers:
+  - Architecture: x64
+    InstallerType: inno
+    Scope: user
+    InstallerUrl: https://github.com/rdenno/usher/releases/download/v0.5.0/usher-setup-windows-x86_64.exe
+    InstallerSha256: REPLACE_WITH_SHA256_FROM_SHA256SUMS
+    UpgradeBehavior: install
+ManifestType: singleton
+ManifestVersion: 1.6.0

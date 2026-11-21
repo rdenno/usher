@@ -4,9 +4,8 @@
     <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
     <img src="assets/logo-light.svg" width="204" alt="Usher">
   </picture>
-  <p><strong>U</strong>DP + <strong>S</strong>S<strong>H</strong> = <strong>E</strong>phemeral <strong>R</strong>emote desktop</p>
-  <p>Zero-daemon, SSH-bootstrapped remote desktop &amp; game streaming over Tailscale, ZeroTier, or WireGuard.</p>
-  <p>Zero open ports when idle &middot; Adaptive bitrate &amp; FEC &middot; Direct ChaCha20-Poly1305 UDP</p>
+  <h3><code>ssh</code> with a screen.</h3>
+  <p>If you can <code>ssh my-host</code>, you can <code>usher my-host</code>.<br>Nothing to install as a service, nothing to pair, nothing listening when you're not connected.</p>
 </div>
 
 ---
@@ -15,14 +14,19 @@
 usher my-host
 ```
 
-In one command, `usher my-host` launches a fullscreen remote desktop session, preserves the host's native aspect ratio inside your monitor bounds, picks the best mutual hardware codec (`HEVC`/`AV1`/`H.264`, falling back to `ffmpeg` or OpenH264 when needed), syncs clipboard text bidirectionally, forwards Xbox 360 gamepads, and adapts bitrate & FEC automatically to link conditions.
+For couch or TV streaming, use Moonlight. Usher is for machines you already SSH into: workstations, desktops, and home servers over LAN, Tailscale, ZeroTier, or WireGuard.
 
-- **SSH key auth only**: Uses `~/.ssh/config` aliases and public keys with no background server, PINs, or accounts required.
-- **Zero-dependency native hardware video**: Windows uses DXGI Desktop Duplication + Media Foundation (`NVENC`/`AMF`/`QSV`/`DX12` encode & DXVA/D3D11 decode with zero-hitch in-place bitrate scaling); macOS uses VideoToolbox hardware decode (`HEVC`/`H.264`). Optional `ffmpeg` and built-in OpenH264 remain as automatic fallbacks.
-- **Cut-fast, grow-slow adaptive transport**: 500 ms client network reports steer bitrate (up to 60 Mbps by default) and dynamic XOR-FEC parity within `<= 1200`-byte mesh-safe UDP datagrams.
-- **Hidden in-stream overlay (`Ctrl+Alt+S`)**: Tweak bitrate ceiling, resolution, FPS, codec, latency/quality tuning, audio, monitor, pointer mode, or HUD live and save per-host defaults.
-- **One-command diagnostics (`usher --doctor`)**: Inspects native decoders, SSH resolution, Tailscale/ZeroTier Direct P2P vs. relay path, `ViGEmBus` gamepad driver status, and runs a live encrypted UDP ping probe.
-- **Zero-state teardown**: Closing the window or dropping SSH exits `usher-host`, destroys virtual devices, and closes the UDP port.
+When you run `usher my-host`, the client invokes your existing OpenSSH config (`~/.ssh/config`), launches `usher-host` over `ssh -T`, exchanges a fresh 256-bit ChaCha20-Poly1305 session key on stdout, and streams hardware-encoded video (`HEVC`, `AV1`, or `H.264`, falling back to OpenH264), Opus audio, clipboard text, keyboard/mouse, and Xbox 360 gamepad input over encrypted UDP. When you close the window or press `Ctrl+Alt+Q`, `usher-host` tears down its virtual devices and exits—leaving zero background processes and zero open ports.
+
+What Usher deliberately skips: phone/tablet/TV clients, PIN or QR pairing flows, HDR, controller rumble, and game library launchers. Desktop streaming, SSH ergonomics, and predictable teardown come first.
+
+---
+
+## Demo & Latency
+
+- **Demo clip:** `[pending capture: 15–30s clip of typing usher desktop and interacting with a remote desktop session]`
+- **End-to-end latency vs. Moonlight (`240 fps` camera test):** `[pending 240 fps capture measurement]`
+  - Methodology: film the host monitor and laptop client side-by-side at `240 fps` while running a millisecond stopwatch/cursor-flash test over the same Wi-Fi/Tailscale link, then report median (`p50`) and `p95` glass-to-glass frame deltas honestly side-by-side with Moonlight + Sunshine.
 
 ---
 
@@ -30,12 +34,27 @@ In one command, `usher my-host` launches a fullscreen remote desktop session, pr
 
 | Parameter | Usher | Moonlight + Sunshine | Windows RDP | Parsec |
 | :--- | :--- | :--- | :--- | :--- |
-| **Background daemon & open ports** | **None.** Spawns per SSH session and closes everything on exit | Always-on Sunshine service listening on HTTPS/RTSP/UDP ports | Always-on TermService listening on TCP/UDP 3389 | Always-on background daemon |
-| **Latency & gaming** | **Low** (hardware HEVC/AV1/H.264, `ull` CBR, adaptive FEC, gamepad + relative mouse) | **Very low** (hardware stream, mature frame pacing & HDR) | **Medium** (office UI focused; no raw relative mouse or gamepads) | **Low–medium** (subject to relay servers) |
-| **Auth & security model** | **OpenSSH public-key only** (`BatchMode=yes`) + per-session ChaCha20-Poly1305 | TLS pairing with 4-digit PIN + Sunshine web login | Windows account / NLA / Kerberos | Vendor account/cloud auth (or custom self-hosted ID server) |
-| **Network & mesh VPNs** | **Mesh-first** (binds strictly to `SSH_CONNECTION` overlay/private IP, `<= 1200` B MTU) | LAN by default; remote requires UPnP/port-forwarding or manual VPN setup | LAN/VPN | Built-in WAN hole-punching & vendor relays |
-| **Setup & portability** | **Single static binary** (`usher` / `usher-host`), reuses `~/.ssh/config` | Host installer + web UI pairing + virtual display/gamepad drivers | Built into Windows Pro (none on Linux/Home hosts) | Full app installer + account or server config |
-| **Best fit** | Ad-hoc, SSH-first remote desktop & gaming over Tailscale / ZeroTier | Dedicated living-room / high-FPS game streaming rigs | Multi-monitor Windows office administration | Team screen sharing, third-party support, zero-SSH access |
+| **Background daemon & open ports** | **None.** Spawns per SSH session; exits cleanly on disconnect | Always-on Sunshine service listening on HTTPS/RTSP/UDP ports | Always-on TermService on TCP/UDP 3389 | Always-on background daemon |
+| **Client platforms & TV/mobile** | **Desktop only** (Windows, macOS, Linux). *Use Moonlight for couch/TV/mobile.* | **Excellent:** Windows, macOS, Linux, iOS, Android, tvOS, Xbox, smart TVs | Microsoft clients across desktop & mobile | Desktop, Web, Android |
+| **Color, HDR & maturity** | SDR (`HEVC`/`AV1`/`H.264`), newer project | **Mature frame pacing, HDR, mobile/TV ecosystem** | Office UI tuned (GDI/RemoteFX, ClearType) | Low-latency gaming focus |
+| **Auth & security model** | **OpenSSH keys** (`~/.ssh/config`) + ephemeral per-session ChaCha20-Poly1305 | TLS pairing with 4-digit PIN + Sunshine web UI | Windows account / NLA / Kerberos | Account / cloud auth |
+| **Network & mesh VPNs** | Binds strictly to `SSH_CONNECTION` overlay/private IP (`<= 1200` B MTU) | LAN by default; remote via UPnP, port forwarding, or manual VPN | LAN / VPN | Proprietary WAN hole-punching & relays |
+| **Best fit** | Machines you already SSH into; zero persistent host footprint | Living-room TV, mobile/tablet, HDR game streaming | Windows Pro/Enterprise IT admin | Account-managed screen sharing |
+
+---
+
+## Requirements by OS
+
+### Windows
+- **Client & Host binaries (`usher.exe`, `usher-host.exe`):** Zero external runtime dependencies on modern Windows (uses native DXGI Desktop Duplication, Windows Media Foundation `NVENC`/`AMF`/`QSV`/`DX12` encode & DXVA decode, WASAPI audio, and Win32 `SendInput`, with built-in OpenH264 software fallback). Optional `ViGEmBus` enables virtual Xbox 360 gamepads; optional `ffmpeg` acts as a fallback.
+- **SSH Hosts:** Enable OpenSSH Server (`sshd`). For Administrator accounts, `usher-host` creates an ephemeral `NT AUTHORITY\SYSTEM` worker (cleaned up immediately on exit) to capture the secure `Winlogon` Lock Screen and UAC prompts. Pass `--no-system` (`no_system = true` in `config.toml`) to restrict the worker to `InteractiveToken` only (cannot capture Lock Screen or UAC). See [SECURITY.md](SECURITY.md) for the full security model.
+
+### Linux Host (`usher-host`)
+- **Zero Link-Time C Dependencies:** Linux release tarballs and `.deb` packages are built against `manylinux_2_28` (`glibc >= 2.28`) for `x86_64` and `aarch64`. Native KMS/DRM capture, runtime-loaded VA-API & NVENC hardware encoders (`libva.so.2`, `libnvidia-encode.so.1`), PipeWire audio (`libpipewire-0.3.so.0`), and PulseAudio virtual microphone (`libpulse-simple.so.0`) are all loaded dynamically at runtime via `dlopen` with built-in OpenH264 software fallback (plus optional `ffmpeg` / `gst-launch-1.0` backends).
+- **Session, Ephemeral Headless Wayland & Permissions:** Works against an active `X11`/`Wayland` session, direct KMS/DRM console (`kmsgrab`), or `--capture testsrc`. Pass `--headless auto|sway|gamescope|cage` (or trailing command `usher my-host -- sway` / `usher my-host -- /path/to/app`) to spawn an isolated ephemeral Wayland compositor on connect and tear it down on disconnect. Grant `/dev/uinput` (`input` group + [`contrib/99-usher-uinput.rules`](contrib/99-usher-uinput.rules)) and `video`/`render` access (`./contrib/install-host.sh`, optionally `sudo setcap cap_sys_admin+ep ~/.local/bin/usher-host` for unprivileged KMS/DRM capture). Run `usher --doctor <host>` to inspect backend selection.
+
+### macOS Client (`usher`)
+- Native VideoToolbox hardware decoding (`HEVC`, `H.264`), built-in OpenH264 fallback, and `wgpu` Metal rendering on Apple Silicon (`arm64`).
 
 ---
 
@@ -45,13 +64,13 @@ In one command, `usher my-host` launches a fullscreen remote desktop session, pr
 
 | Platform | Install / Update |
 | :--- | :--- |
-| **Windows (Powershell)** | Client (default):<br>`irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>Host / Both (also works for updates):<br>`$env:USHER_ROLE='host'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>`$env:USHER_ROLE='both'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex` |
-| **Windows (Installer)** | Run **`usher-setup-windows-x86_64.exe`** from **Releases** (installs Client/Host to `%LOCALAPPDATA%\Programs\Usher` and updates User `PATH`; re-run newer releases to upgrade in place while keeping settings). |
-| **Linux** | Extract `usher-linux-x86_64.tar.gz` (`usher` + `usher-host`) and run [`./contrib/install-host.sh`](contrib/install-host.sh) once on the host for `/dev/uinput` permissions. |
-| **macOS** | Extract `usher-macos-aarch64.tar.gz` (`usher` client). |
-| **From Source** | `cargo build --release --workspace` |
+| **Windows (PowerShell)** | Client (default):<br>`irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex`<br>Host or Both:<br>`$env:USHER_ROLE='both'; irm https://raw.githubusercontent.com/rdenno/usher/main/contrib/install-windows.ps1 \| iex` |
+| **Windows (Installer / Package Managers)** | Run **`usher-setup-windows-x86_64.exe`** from **Releases**, or use the Scoop / Winget manifests in [`contrib/packaging`](contrib/packaging). |
+| **Linux (`.deb` / tarball)** | Install `usher_<version>_amd64.deb` / `arm64.deb` from **Releases**, or extract `usher-linux-<arch>.tar.gz` and run [`./contrib/install-host.sh`](contrib/install-host.sh) once on the host. See [`contrib/packaging/aur`](contrib/packaging/aur) for Arch PKGBUILD. |
+| **macOS** | Extract `usher-macos-aarch64.tar.gz` from **Releases**, or see [`contrib/packaging/homebrew`](contrib/packaging/homebrew). |
+| **Cargo / From Source** | `cargo install usher-client usher-host` or `cargo build --release --workspace` |
 
-> After a fresh Windows install, open a **new** PowerShell window (or refresh `PATH` in your current shell with `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
+> On Windows, open a new terminal after a first-time install (or refresh `PATH`: `$env:PATH = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`).
 
 ### 2. Configure SSH (`~/.ssh/config`)
 
@@ -62,43 +81,40 @@ Host desktop
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-- **Windows hosts**: Enable OpenSSH Server (`sshd`), authorize your key (`C:\ProgramData\ssh\administrators_authorized_keys` for admin users or `%USERPROFILE%\.ssh\authorized_keys`), and select **Host** or **Client + Host** in the installer. `usher-host` automatically attaches to the active console session—capturing the Lock Screen (`Winlogon`) and UAC prompts as `NT AUTHORITY\SYSTEM` for Administrator SSH accounts and seamlessly following unlock transitions (`Session 2 -> Session 1`) without dropping the stream. Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) on Windows hosts if you want virtual Xbox 360 gamepad pass-through.
+OpenSSH arguments pass straight through (`usher -p 2222 -J bastion -i ~/.ssh/key desktop`), and interactive SSH prompts (YubiKey / FIDO touch, passphrases, `ssh-agent` confirmations) work out of the box (pass `--batch-mode` if you want non-interactive `BatchMode=yes`). If UDP cannot punch through a firewall or bastion, Usher automatically falls back to tunneling encrypted frames over the existing SSH stdio stream (`--transport auto|udp|tcp`). If `usher-host` is missing on the remote machine, Usher can inspect `~/.local/bin` or upload/install the matching binary over SSH (`--auto-install` / `--no-auto-install`).
 
 ### 3. Connect & Diagnose
 
 ```bash
 usher desktop
-```
-
-Check SSH reachability, native hardware codecs, Tailscale/ZeroTier Direct P2P vs. relay status, and encrypted UDP RTT in one shot:
-
-```bash
+usher -J bastion desktop -- bash -lc "steam -tenfoot"
+usher --list-displays desktop
+usher --display HDMI-1 desktop
 usher --doctor desktop
-```
-
-Single-machine loopback check without SSH:
-
-```bash
 usher --local --capture testsrc
+usher --local --capture testsrc --no-audio --no-input --no-clipboard --smoke-frames 5
 ```
 
 ---
 
 ## Configuration (`config.toml`)
 
-Optional defaults live at `~/.config/usher/config.toml` (Linux/macOS) or `%APPDATA%\usher\config.toml` (Windows), using the same option names as CLI flags (CLI flags take priority). Press `Ctrl+Alt+S` → **Save for `<host>`** mid-stream to write a host section automatically:
+Optional defaults live at `~/.config/usher/config.toml` (Linux/macOS) or `%APPDATA%\usher\config.toml` (Windows). Press `Ctrl+Alt+S` -> **Save for `<host>`** mid-stream to persist per-host defaults:
 
 ```toml
 max_bitrate_kbps = 60000
 prefer = "latency"
+chroma = "auto"
 
 [host.desktop]
 max_bitrate_kbps = 80000
 resolution = "match-window"
 fps = 120
 codec = "auto"
-pointer_mode = "relative"
-stats_overlay = true
+chroma = "444"
+display = "DP-1"
+pointer_mode = "absolute"
+mic = false
 ```
 
 ---
@@ -108,50 +124,51 @@ stats_overlay = true
 | Shortcut / Input | Action |
 | :--- | :--- |
 | **`Ctrl+Alt+S`** | Toggle the hidden **Settings & Live Stats Overlay** |
-| **`Ctrl+Alt+G`** | Toggle **Absolute** desktop pointer / **Locked Relative** raw mouse (3D games) |
+| **`Ctrl+Alt+G`** | Toggle **Absolute** pointer / **Locked Relative** mouse |
 | **`Ctrl+Alt+F`** | Toggle borderless fullscreen |
-| **`Ctrl+Alt+Q`** | Disconnect and tear down the remote host session |
-| **Gamepads** | Polled via `gilrs` and mapped to a virtual Xbox 360 pad (`ViGEmBus` on Windows hosts, `/dev/uinput` on Linux hosts) |
-| **Clipboard** | Bidirectional UTF-8 clipboard sync (disable with `--no-clipboard` or `clipboard = false`) |
+| **`Ctrl+Alt+Q`** | Release all held remote inputs, disconnect, and tear down `usher-host` |
+| **Separate Cursor Plane** | Host sends cursor shape (`Cursor` plane) so the client draws the pointer locally with 0 ms delay in Absolute mode (pass `--no-cursor-plane` to bake into host video) |
+| **Drag & Drop** | Drop files or folders onto the Usher window to transfer via `scp` into the remote user's `Downloads/` directory |
+| **Microphone (`--mic`)** | Optional local microphone passthrough to an ephemeral host virtual mic (off by default) |
+| **Gamepads** | Xbox 360 pass-through (`ViGEmBus` on Windows hosts, `/dev/uinput` on Linux hosts) |
+| **Clipboard** | Bidirectional UTF-8 clipboard sync (disable with `--no-clipboard` / `clipboard = false`) |
 
 ---
 
-## How It Works
+## Key Flags
 
-1. **Bootstrap (`ssh -T`)**: `usher` probes client monitor/codec support and launches `usher-host` over OpenSSH public-key auth (`BatchMode=yes`).
-2. **Ephemeral Bind & Handshake**: `usher-host` reads `SSH_CONNECTION`, binds an ephemeral UDP port strictly on the overlay/private IP (never `0.0.0.0`), generates a 256-bit CSPRNG key, and emits `USHER_HELLO {...}` on stdout.
-3. **Adaptive Encrypted UDP**: Encrypted ChaCha20-Poly1305 video, XOR-FEC parity, 48 kHz Opus audio, and input events stream over `<= 1200`-byte packets while 500 ms client reports tune bitrate and FEC live.
-4. **Zero-State Teardown**: SSH `EOF`/`SIGHUP` or `Ctrl+Alt+Q` shuts down encoders, virtual devices, and sockets cleanly.
-
----
-
-## Options
-
-| Flag | Default | Values / Notes |
+| Flag | Default | Notes |
 | :--- | :--- | :--- |
-| `--max-bitrate-kbps` | `60000` | Adaptive bitrate ceiling in kbps (client/config/host) |
-| `--resolution` | `auto` | `auto` (client monitor), `native` (host monitor), `match-window`, or `WxH` |
-| `--fps` | `auto` | `auto` (client refresh rate) or `1..=240` |
-| `--codec` | `auto` | `auto` (negotiates `hevc`/`av1`/`h264`), `h264`, `hevc`, `av1` |
-| `--prefer` | `latency` | `latency` (lowest delay + higher min FEC) or `quality` |
-| `--display` | `0` | Multi-monitor host display index |
-| `--windowed` | `false` | Start in a normal window instead of borderless fullscreen (`fullscreen = false` in `config.toml`; toggle with `Ctrl+Alt+F`) |
-| `--stats-overlay` | `false` | Show compact top-left live stats HUD by default |
-| `--capture` | `auto` | `auto`, `drm`, `pipewire`, `x11`, `dxgi`, `testsrc` |
-| `--encoder` | `auto` | `auto`, `vaapi`, `nvenc`, `amf`, `qsv`, `openh264` |
-| `--decoder` | `auto` | `auto`, `native` (Media Foundation / VideoToolbox), `openh264`, `ffmpeg` |
-| `--no-clipboard` | `false` | Disable bidirectional UTF-8 clipboard synchronization (`clipboard = false` in `config.toml`) |
-| `--doctor` | `false` | Diagnose SSH resolution, native codecs, `ViGEmBus`, Tailscale/ZeroTier relay status, and live UDP RTT |
-| `--mtu` / `--fec` | `1200` / `10` | Outer UDP packet cap (`<= 1200`) and initial XOR parity % (`0..=50`) |
-
-> Keep peer-to-peer UDP hole punching active (`tailscale status` showing a direct peer rather than `relay`); `usher` warns if RTT rises above `60 ms`.
+| `--max-bitrate-kbps` | `60000` | Adaptive bitrate ceiling in kbps |
+| `--resolution` | `auto` | `auto` (fit host aspect inside client monitor), `native`, `match-window`, or `WxH` |
+| `--fps` | `auto` | `auto` or `1..=240` |
+| `--codec` | `auto` | `auto` (`hevc` -> `av1` -> `h264`), `h264`, `hevc`, `av1` |
+| `--chroma` | `auto` | `auto` (4:4:4 when host NVENC + client support it, else 4:2:0), `420`, `444` (plus 350 ms static-screen crisp IDR refresh) |
+| `--prefer` | `latency` | `latency` or `quality` |
+| `--list-displays` | `false` | Enumerate available host displays (`index: name (WxH)`) and exit |
+| `--display` | `0` | Host monitor index or connector/display name from `--list-displays` |
+| `--transport` | `auto` | `auto` (UDP with automatic SSH stdio TCP tunnel fallback), `udp`, or `tcp` |
+| `--headless` | `none` | Ephemeral remote Wayland session (`none`, `auto`, `sway`, `gamescope`, `cage`; auto-enabled with trailing `-- <cmd>`) |
+| `--windowed` | `false` | Start in a window instead of borderless fullscreen (`Ctrl+Alt+F` toggles) |
+| `--capture` / `--encoder` / `--decoder` | `auto` | Backend overrides (`dxgi`, `drm`, `pipewire`, `x11`, `testsrc`, `nvenc`, `vaapi`, `openh264`, `ffmpeg`, `native`) |
+| `--no-cursor-plane` | `false` | Disable separate local cursor rendering and bake pointer into host video |
+| `--mic` | `false` | Enable client-to-host virtual microphone passthrough (off by default) |
+| `--view-only` / `--no-input` | `false` | Disable keyboard/mouse/gamepad forwarding and file drop uploads |
+| `--no-clipboard` / `--no-audio` | `false` | Disable clipboard sync or audio streaming |
+| `--batch-mode` | `false` | Enable OpenSSH `BatchMode=yes` (off by default so hardware keys & passphrase prompts work) |
+| `--auto-install` / `--no-auto-install` | prompt | Automatically install `usher-host` over SSH when missing on remote target |
+| `--no-system` | `false` | Windows host: run console worker as `InteractiveToken` only (never `NT AUTHORITY\SYSTEM`) |
+| `--doctor` | `false` | Test SSH, codec support, Tailscale/ZeroTier P2P vs. relay, `ViGEmBus`, and UDP RTT |
+| `--smoke-frames <N>` | none | Headless connect/decode check for `N` frames (used in CI; exits `0` on success) |
 
 ---
 
-## Workspace
+## Security & Workspace
+
+See [SECURITY.md](SECURITY.md) for the full cryptographic design, nonce/anti-replay guarantees, Windows `SYSTEM` scope (`--no-system`), and `cargo-fuzz` targets.
 
 | Crate | Purpose |
 | :--- | :--- |
-| [`crates/usher-proto`](crates/usher-proto) | Wire framing, ChaCha20-Poly1305 AEAD, anti-replay, striped XOR-FEC, AIMD `AdaptiveController`, and codecs |
-| [`crates/usher-host`](crates/usher-host) | `usher-host` binary (Linux DRM/PipeWire/headless + `uinput`, Windows Session 0→1 `ddagrab`/DXGI + WASAPI + `SendInput`) |
-| [`crates/usher-client`](crates/usher-client) | `usher` binary (SSH bootstrapper, `config.toml`, `Ctrl+Alt+S` overlay, `wgpu` BT.709 renderer, `winit`/`gilrs`/`cpal`) |
+| [`crates/usher-proto`](crates/usher-proto) | Framing, BLAKE3 KDF, ChaCha20-Poly1305 AEAD, 128-packet replay window, XOR-FEC, AIMD controller |
+| [`crates/usher-host`](crates/usher-host) | `usher-host` binary (Windows Session 0->1 DXGI/MF/WASAPI/`SendInput`; Linux DRM/PipeWire/X11/`uinput`) |
+| [`crates/usher-client`](crates/usher-client) | `usher` binary (OpenSSH bootstrapper, `config.toml`, `Ctrl+Alt+S` overlay, `wgpu` shader, MF/VT/OpenH264 decode) |

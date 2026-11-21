@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 pub const HELLO_PREFIX: &str = "USHER_HELLO ";
+pub const DISPLAYS_PREFIX: &str = "USHER_DISPLAYS ";
 pub const PROTOCOL_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +166,40 @@ impl FromStr for QualityPreference {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChromaSubsampling {
+    #[default]
+    Yuv420,
+    Yuv444,
+}
+
+impl ChromaSubsampling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "420",
+            Self::Yuv444 => "444",
+        }
+    }
+
+    pub fn from_arg(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "420" | "4:2:0" | "yuv420" => Ok(Self::Yuv420),
+            "444" | "4:4:4" | "yuv444" => Ok(Self::Yuv444),
+            other => bail!("invalid chroma subsampling '{other}' (expected 420 or 444)"),
+        }
+    }
+}
+
+impl fmt::Display for ChromaSubsampling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Yuv420 => f.write_str("4:2:0"),
+            Self::Yuv444 => f.write_str("4:4:4"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayInfo {
     pub index: u8,
@@ -260,6 +295,16 @@ pub struct HelloMessage {
     pub gamepad_backend: String,
     #[serde(default)]
     pub hi_res_scroll: bool,
+    #[serde(default)]
+    pub capture_diagnostics: Vec<String>,
+    #[serde(default)]
+    pub tcp_tunnel: bool,
+    #[serde(default)]
+    pub chroma: ChromaSubsampling,
+    #[serde(default)]
+    pub cursor_plane: bool,
+    #[serde(default)]
+    pub mic_enabled: bool,
 }
 
 impl HelloMessage {
@@ -286,6 +331,59 @@ impl HelloMessage {
 pub fn encode_hello_line(msg: &HelloMessage) -> Result<String> {
     let json = serde_json::to_string(msg).context("failed to serialize HelloMessage")?;
     Ok(format!("{HELLO_PREFIX}{json}"))
+}
+
+pub fn encode_displays_line(displays: &[DisplayInfo]) -> Result<String> {
+    let json = serde_json::to_string(displays).context("failed to serialize displays list")?;
+    Ok(format!("{DISPLAYS_PREFIX}{json}"))
+}
+
+pub fn parse_displays_line(line: &str) -> Option<Result<Vec<DisplayInfo>>> {
+    let trimmed = line.trim();
+    let json_part = trimmed.strip_prefix(DISPLAYS_PREFIX)?;
+    Some(serde_json::from_str(json_part).map_err(Into::into))
+}
+
+/// Resolves a `--display` selector (numeric index or case-insensitive display name/substring)
+/// against enumerated displays.
+pub fn resolve_display_selector(displays: &[DisplayInfo], selector: &str) -> Option<u8> {
+    let sel = selector.trim();
+    if sel.is_empty() {
+        return None;
+    }
+    if let Ok(idx) = sel.parse::<u8>() {
+        if displays.is_empty() || displays.iter().any(|d| d.index == idx) {
+            return Some(idx);
+        }
+        return None;
+    }
+    if let Some(d) = displays.iter().find(|d| d.name.eq_ignore_ascii_case(sel)) {
+        return Some(d.index);
+    }
+    let lower = sel.to_ascii_lowercase();
+    displays
+        .iter()
+        .find(|d| d.name.to_ascii_lowercase().contains(&lower))
+        .map(|d| d.index)
+}
+
+/// Encodes an ephemeral session command array into a shell-safe base64 JSON payload.
+pub fn encode_session_cmd_b64(cmd: &[String]) -> String {
+    let json = serde_json::to_vec(cmd).expect("serializing session command slice");
+    BASE64_STD.encode(json)
+}
+
+/// Decodes a base64 JSON array produced by [`encode_session_cmd_b64`].
+pub fn decode_session_cmd_b64(encoded: &str) -> Result<Vec<String>> {
+    let raw = BASE64_STD
+        .decode(encoded.trim())
+        .context("decoding base64 --session-cmd-b64 payload")?;
+    let cmd: Vec<String> =
+        serde_json::from_slice(&raw).context("parsing JSON array in --session-cmd-b64 payload")?;
+    if cmd.is_empty() {
+        bail!("--session-cmd-b64 command must not be empty");
+    }
+    Ok(cmd)
 }
 
 /// Parses a line from the SSH host's stdout.
@@ -440,6 +538,11 @@ mod tests {
             video_backend: "Win(NativeDxgiMf)".into(),
             gamepad_backend: "ViGEmBus".into(),
             hi_res_scroll: true,
+            capture_diagnostics: vec!["selected: dxgi + mf".into()],
+            tcp_tunnel: true,
+            chroma: ChromaSubsampling::Yuv444,
+            cursor_plane: true,
+            mic_enabled: true,
         };
         let encoded = encode_hello_line(&msg).unwrap();
         assert!(parse_hello_line("Welcome to Ubuntu 24.04 LTS").is_none());
@@ -462,6 +565,66 @@ mod tests {
         assert_eq!(parsed_legacy.max_bitrate_kbps, 0);
         assert_eq!(parsed_legacy.prefer, QualityPreference::Latency);
         assert!(!parsed_legacy.hi_res_scroll);
+        assert!(parsed_legacy.capture_diagnostics.is_empty());
+        assert!(!parsed_legacy.tcp_tunnel);
+        assert_eq!(parsed_legacy.chroma, ChromaSubsampling::Yuv420);
+        assert!(!parsed_legacy.cursor_plane);
+        assert!(!parsed_legacy.mic_enabled);
+    }
+
+    #[test]
+    fn displays_line_and_selector_work() {
+        let displays = vec![
+            DisplayInfo {
+                index: 0,
+                name: "DISPLAY1 (Primary)".into(),
+                width: 1920,
+                height: 1080,
+            },
+            DisplayInfo {
+                index: 1,
+                name: "DP-2".into(),
+                width: 2560,
+                height: 1440,
+            },
+        ];
+        let line = encode_displays_line(&displays).unwrap();
+        let decoded = parse_displays_line(&format!("{line}\n"))
+            .expect("prefix")
+            .expect("valid displays json");
+        assert_eq!(decoded, displays);
+        assert!(parse_displays_line("unrelated line").is_none());
+
+        assert_eq!(resolve_display_selector(&displays, "0"), Some(0));
+        assert_eq!(resolve_display_selector(&displays, "1"), Some(1));
+        assert_eq!(resolve_display_selector(&displays, "2"), None);
+        assert_eq!(resolve_display_selector(&displays, "dp-2"), Some(1));
+        assert_eq!(resolve_display_selector(&displays, "primary"), Some(0));
+        assert_eq!(resolve_display_selector(&displays, ""), None);
+        assert_eq!(resolve_display_selector(&[], "3"), Some(3));
+        assert_eq!(
+            ChromaSubsampling::from_arg("4:4:4").unwrap(),
+            ChromaSubsampling::Yuv444
+        );
+        assert_eq!(
+            ChromaSubsampling::from_arg("420").unwrap(),
+            ChromaSubsampling::Yuv420
+        );
+    }
+
+    #[test]
+    fn session_cmd_b64_roundtrip() {
+        let cmd = vec![
+            "firefox".to_string(),
+            "--new-window".to_string(),
+            "https://example.com/?a=1&b=two words".to_string(),
+        ];
+        let encoded = encode_session_cmd_b64(&cmd);
+        assert!(!encoded.contains(' '));
+        assert!(!encoded.contains('&'));
+        assert_eq!(decode_session_cmd_b64(&encoded).unwrap(), cmd);
+        let empty_b64 = BASE64_STD.encode(b"[]");
+        assert!(decode_session_cmd_b64(&empty_b64).is_err());
     }
 
     #[test]

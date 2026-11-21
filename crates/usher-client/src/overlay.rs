@@ -1,4 +1,6 @@
-use crate::config::{FpsSetting, HostSettings, PointerMode, ResolutionMode, save_host_settings};
+use crate::config::{
+    DisplaySelector, FpsSetting, HostSettings, PointerMode, ResolutionMode, save_host_settings,
+};
 use crate::transport::Telemetry;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -13,8 +15,9 @@ const NUM_ROWS: usize = 10;
 
 pub const MENU_W: u32 = 512;
 pub const MENU_H: u32 = 432;
-pub const HUD_W: u32 = 576;
+pub const HUD_W: u32 = 760;
 pub const HUD_H: u32 = 34;
+pub const TOAST_H: u32 = 30;
 
 #[derive(Debug, Clone, Default)]
 pub struct OverlayAction {
@@ -68,6 +71,7 @@ pub struct OverlayState {
 
     dirty: bool,
     status_flash: Option<(String, Instant)>,
+    toast: Option<(String, Instant)>,
     last_hud_refresh: Instant,
     row_hits: Vec<RowHitRect>,
     last_panel_origin: (u32, u32),
@@ -113,6 +117,7 @@ impl OverlayState {
             pointer_mode,
             dirty: stats_hud,
             status_flash: None,
+            toast: None,
             last_hud_refresh: Instant::now() - Duration::from_secs(1),
             row_hits: Vec::with_capacity(NUM_ROWS),
             last_panel_origin: (0, 0),
@@ -121,7 +126,12 @@ impl OverlayState {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.open || self.stats_hud
+        self.open || self.stats_hud || self.toast.is_some()
+    }
+
+    pub fn show_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+        self.dirty = true;
     }
 
     pub fn mark_dirty(&mut self) {
@@ -151,6 +161,12 @@ impl OverlayState {
             && at.elapsed() >= Duration::from_secs(3)
         {
             self.status_flash = None;
+            self.dirty = true;
+        }
+        if let Some((_, at)) = &self.toast
+            && at.elapsed() >= Duration::from_secs(4)
+        {
+            self.toast = None;
             self.dirty = true;
         }
         if self.is_visible() && self.last_hud_refresh.elapsed() >= Duration::from_millis(450) {
@@ -348,7 +364,7 @@ impl OverlayState {
                     codec: Some(self.codec_pref),
                     prefer: Some(self.prefer),
                     audio: Some(self.audio_enabled),
-                    display: Some(self.display_index),
+                    display: Some(DisplaySelector::Index(self.display_index)),
                     pointer_mode: Some(self.pointer_mode),
                     stats_overlay: Some(self.stats_hud),
                     ..Default::default()
@@ -402,6 +418,7 @@ impl OverlayState {
         let active_codec = VideoCodec::from_u8(telem.active_codec.load(Ordering::Acquire))
             .unwrap_or(VideoCodec::H264);
         let stepped_down = telem.resolution_stepped_down.load(Ordering::Acquire);
+        let chroma_444 = telem.chroma_444.load(Ordering::Acquire);
 
         if self.open {
             let scale = ((ww as f32 / (MENU_W as f32 + 40.0))
@@ -513,7 +530,7 @@ impl OverlayState {
                 y += row_h;
             }
 
-            if let Some((ref flash, _)) = self.status_flash {
+            if let Some((flash, _)) = self.status_flash.as_ref().or(self.toast.as_ref()) {
                 canvas.draw_text(18, MENU_H - 38, 1, flash, [52, 211, 153, 255]);
             }
             canvas.fill_rect(18, MENU_H - 24, MENU_W - 36, 1, [51, 65, 85, 255]);
@@ -534,25 +551,58 @@ impl OverlayState {
                 panel_h,
                 rgba: canvas.rgba,
             })
+        } else if !self.stats_hud {
+            self.last_ui_scale = 1.0;
+            self.row_hits.clear();
+            let (msg, _) = self.toast.as_ref()?;
+            let max_w = ww.saturating_sub(24).max(180);
+            let canvas_w = ((msg.len() as u32) * 8 + 24).clamp(180, max_w.min(680));
+            let canvas_h = TOAST_H;
+            let panel_x = 12;
+            let panel_y = wh.saturating_sub(canvas_h + 12);
+            let mut canvas = Canvas::new(canvas_w, canvas_h);
+            canvas.fill_rounded_rect(0, 0, canvas_w, canvas_h, 6, [15, 23, 42, 225]);
+            canvas.stroke_rect(0, 0, canvas_w, canvas_h, [52, 211, 153, 200]);
+            canvas.draw_text(12, 11, 1, msg, [241, 245, 249, 255]);
+            Some(OverlayRenderOutput {
+                width: canvas_w,
+                height: canvas_h,
+                panel_x,
+                panel_y,
+                panel_w: canvas_w,
+                panel_h: canvas_h,
+                rgba: canvas.rgba,
+            })
         } else {
             self.last_ui_scale = 1.0;
             self.row_hits.clear();
+            let extra_h = if self.toast.is_some() { 6 + TOAST_H } else { 0 };
+            let canvas_h = HUD_H + extra_h;
             let panel_w = HUD_W.min(ww.saturating_sub(24));
-            let panel_h = HUD_H.min(wh.saturating_sub(24));
+            let panel_h = canvas_h.min(wh.saturating_sub(24));
             let panel_x = 12;
             let panel_y = 12;
 
-            let mut canvas = Canvas::new(HUD_W, HUD_H);
+            let mut canvas = Canvas::new(HUD_W, canvas_h);
+            let is_tcp =
+                telem.transport_mode.load(Ordering::Acquire) == crate::transport::TRANSPORT_SSH_TCP;
+            let border_col = if is_tcp {
+                [245, 158, 11, 210]
+            } else {
+                [56, 189, 248, 150]
+            };
+            let transport_label = if is_tcp { "SSH-TCP" } else { "UDP" };
             canvas.fill_rounded_rect(0, 0, HUD_W, HUD_H, 8, [15, 23, 42, 210]);
-            canvas.stroke_rect(0, 0, HUD_W, HUD_H, [56, 189, 248, 150]);
+            canvas.stroke_rect(0, 0, HUD_W, HUD_H, border_col);
             let mode = if self.pointer_mode == PointerMode::Relative {
                 "REL"
             } else {
                 "ABS"
             };
+            let chroma_tag = if chroma_444 { " | 4:4:4" } else { "" };
             let notice = if stepped_down { " | RES-STEPDOWN" } else { "" };
             let text = format!(
-                "{}x{}@{} {} | {:.0}fps | {:.1}ms | {:.1}/{}Mbps | FEC {}% | Loss {:.1}% | [{}]{}",
+                "{}x{}@{} {} | {:.0}fps | {:.1}ms | {:.1}/{}Mbps | FEC {}% | Loss {:.1}%{} | [{}] [{}]{}",
                 active_w,
                 active_h,
                 active_fps,
@@ -563,14 +613,24 @@ impl OverlayState {
                 self.max_bitrate_kbps / 1000,
                 fec,
                 loss_pct,
+                chroma_tag,
                 mode,
+                transport_label,
                 notice
             );
             canvas.draw_text(12, 13, 1, &text, [241, 245, 249, 255]);
 
+            if let Some((ref toast_msg, _)) = self.toast {
+                let ty = HUD_H + 6;
+                let tw = ((toast_msg.len() as u32) * 8 + 24).clamp(180, HUD_W);
+                canvas.fill_rounded_rect(0, ty, tw, TOAST_H, 6, [15, 23, 42, 225]);
+                canvas.stroke_rect(0, ty, tw, TOAST_H, [52, 211, 153, 200]);
+                canvas.draw_text(12, ty + 11, 1, toast_msg, [241, 245, 249, 255]);
+            }
+
             Some(OverlayRenderOutput {
                 width: HUD_W,
-                height: HUD_H,
+                height: canvas_h,
                 panel_x,
                 panel_y,
                 panel_w,

@@ -1,16 +1,20 @@
-use crate::config::{EffectiveConfig, default_config_path};
+use crate::config::EffectiveConfig;
+use crate::config::default_config_path;
 use crate::decoder::{find_working_ffmpeg, probe_client_codecs};
 use crate::ssh::{HostConnection, SshConnectConfig};
+use crate::transport::activate_stdio_tunnel;
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use usher_proto::crypto::{Role, SessionCrypto};
 use usher_proto::handshake::fit_preserving_aspect;
 use usher_proto::packet::{
-    ControlMessage, PacketKind, PingPayload, PongPayload, open_packet, seal_packet,
+    ControlMessage, PacketKind, PingPayload, PongPayload, decode_tunnel_frame_len,
+    encode_tunnel_frame, open_packet, seal_packet,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +27,7 @@ pub enum LinkPath {
 pub async fn run_doctor(
     host_alias: Option<&str>,
     is_local: bool,
+    ssh_args: &[String],
     eff: &EffectiveConfig,
     cfg_path: &std::path::Path,
 ) -> Result<()> {
@@ -113,7 +118,7 @@ pub async fn run_doctor(
     // 3) Resolve SSH target IP & Tailscale/ZeroTier link path
     let mut target_ip: Option<IpAddr> = None;
     if let Some(alias) = host_alias {
-        match resolve_ssh_hostname(alias) {
+        match resolve_ssh_hostname(alias, ssh_args) {
             Some(host_str) => {
                 println!("[INFO] SSH target `{alias}` -> HostName `{host_str}`");
                 if let Ok(ip) = host_str.parse::<IpAddr>() {
@@ -166,12 +171,15 @@ pub async fn run_doctor(
         host: host_alias.map(str::to_string),
         local: is_local,
         remote_bin: eff.remote_bin.clone(),
+        ssh_args: ssh_args.to_vec(),
         ssh_opts: eff.ssh_opts.clone(),
+        batch_mode: eff.batch_mode,
+        auto_install: eff.auto_install,
         host_args,
     };
 
     let t_ssh = Instant::now();
-    let conn = HostConnection::connect(&ssh_cfg)
+    let mut conn = HostConnection::connect(&ssh_cfg)
         .await
         .with_context(|| format!("failed to bootstrap usher-host on `{label}`"))?;
     let ssh_ms = t_ssh.elapsed().as_secs_f64() * 1000.0;
@@ -191,6 +199,12 @@ pub async fn run_doctor(
 
     if !hello.video_backend.is_empty() {
         println!("[INFO] Remote video backend: {}", hello.video_backend);
+    }
+    if !hello.capture_diagnostics.is_empty() {
+        println!("[INFO] Remote capture diagnostics:");
+        for diag in &hello.capture_diagnostics {
+            println!("       - {diag}");
+        }
     }
     if !hello.gamepad_backend.is_empty() {
         println!("[INFO] Remote gamepad support: {}", hello.gamepad_backend);
@@ -285,14 +299,33 @@ pub async fn run_doctor(
     if let Some(disc) = disc {
         let _ = socket.send(&disc).await;
     }
-    drop(conn);
 
     println!("\n==> Encrypted UDP Probe Results:");
     if rtts_ms.is_empty() {
-        println!("[FAIL] 0/5 encrypted UDP Pong replies received (100% loss).");
+        println!("[WARN] 0/5 encrypted UDP Pong replies received (100% UDP loss).");
+        if hello.tcp_tunnel
+            && let Some(io) = conn.take_stdio_tunnel()
+        {
+            println!("==> Testing SSH TCP tunnel fallback...");
+            if let Ok(mut tunnel_rtts) = probe_ssh_tcp_tunnel(io, &crypto, mtu).await
+                && !tunnel_rtts.is_empty()
+            {
+                let min_rtt = tunnel_rtts.iter().copied().fold(f64::INFINITY, f64::min);
+                let max_rtt = tunnel_rtts.iter().copied().fold(0.0_f64, f64::max);
+                let avg_rtt = tunnel_rtts.drain(..).sum::<f64>() / 3.0;
+                println!(
+                    "[WARN] Direct UDP blocked (0/5 replies), but SSH TCP tunnel fallback succeeded (RTT min={min_rtt:.1} ms avg={avg_rtt:.1} ms max={max_rtt:.1} ms)"
+                );
+                println!("       Usher will automatically fall back to SSH TCP tunnel on this host.");
+                drop(conn);
+                return Ok(());
+            }
+        }
+        drop(conn);
         println!("       Check firewall inbound UDP on remote `usher-host` or overlay routing.");
         anyhow::bail!("encrypted UDP probe failed (0/5 replies)");
     }
+    drop(conn);
 
     let min_rtt = rtts_ms.iter().copied().fold(f64::INFINITY, f64::min);
     let max_rtt = rtts_ms.iter().copied().fold(0.0_f64, f64::max);
@@ -313,6 +346,103 @@ pub async fn run_doctor(
     }
 
     Ok(())
+}
+
+async fn probe_ssh_tcp_tunnel(
+    io: crate::ssh::StdioTunnelIo,
+    crypto: &Mutex<SessionCrypto>,
+    mtu: usize,
+) -> Result<Vec<f64>> {
+    let client_hello_pkt = {
+        let mut guard = crypto.lock().expect("crypto lock poisoned");
+        seal_packet(
+            &mut guard,
+            PacketKind::Control,
+            &ControlMessage::ClientHello {
+                client_version: 2,
+                capabilities: 0x03,
+            }
+            .encode(),
+            mtu,
+        )?
+    };
+    let (mut stdin, mut stdout) = activate_stdio_tunnel(io, &client_hello_pkt).await?;
+    let start = Instant::now();
+    let mut rtts_ms = Vec::with_capacity(3);
+
+    for seq in 0..3u64 {
+        let sent_us = start.elapsed().as_micros() as u64;
+        let ping_pkt = {
+            let mut guard = crypto.lock().expect("crypto lock poisoned");
+            seal_packet(
+                &mut guard,
+                PacketKind::Ping,
+                &PingPayload { sent_us }.encode(),
+                mtu,
+            )?
+        };
+        let framed = encode_tunnel_frame(&ping_pkt)?;
+        stdin.write_all(&framed).await?;
+        stdin.flush().await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut len_hdr = [0u8; 2];
+            if tokio::time::timeout_at(deadline, stdout.read_exact(&mut len_hdr))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .is_none()
+            {
+                break;
+            }
+            let len = decode_tunnel_frame_len(len_hdr)?;
+            let mut raw = vec![0u8; len];
+            if tokio::time::timeout_at(deadline, stdout.read_exact(&mut raw))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .is_none()
+            {
+                break;
+            }
+            let opened = {
+                let mut guard = crypto.lock().expect("crypto lock poisoned");
+                open_packet(&mut guard, &raw)
+            };
+            if let Ok((PacketKind::Pong, _, pt)) = opened
+                && let Ok(pong) = PongPayload::decode(&pt)
+                && pong.sent_us == sent_us
+            {
+                let rtt = (start.elapsed().as_micros() as u64).saturating_sub(pong.sent_us) as f64
+                    / 1000.0;
+                rtts_ms.push(rtt);
+                break;
+            }
+        }
+        if seq < 2 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    }
+
+    let disc = {
+        let mut guard = crypto.lock().expect("crypto lock poisoned");
+        seal_packet(
+            &mut guard,
+            PacketKind::Control,
+            &ControlMessage::Disconnect.encode(),
+            mtu,
+        )
+        .ok()
+    };
+    if let Some(d) = disc
+        && let Ok(framed) = encode_tunnel_frame(&d)
+    {
+        let _ = stdin.write_all(&framed).await;
+        let _ = stdin.flush().await;
+    }
+
+    Ok(rtts_ms)
 }
 
 #[cfg(target_os = "windows")]
@@ -387,8 +517,9 @@ fn check_mesh_path(target_ip: IpAddr) {
     }
 }
 
-pub fn resolve_ssh_hostname(alias: &str) -> Option<String> {
+pub fn resolve_ssh_hostname(alias: &str, ssh_args: &[String]) -> Option<String> {
     let out = std::process::Command::new("ssh")
+        .args(ssh_args)
         .args(["-G", alias])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

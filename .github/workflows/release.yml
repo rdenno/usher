@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.1.0)"
+        description: "Release tag to publish (e.g. v0.5.0)"
         required: true
         type: string
 
@@ -24,9 +24,6 @@ jobs:
           - name: windows-x86_64
             os: windows-latest
             package_args: ""
-          - name: linux-x86_64
-            os: ubuntu-latest
-            package_args: ""
           - name: macos-aarch64
             os: macos-latest
             package_args: "-p usher-client"
@@ -34,19 +31,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libx11-dev libxkbcommon-dev
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
         run: cargo build --release ${{ matrix.package_args }}
+
+      - name: Sign Windows binaries (optional Azure Trusted Signing)
+        if: runner.os == 'Windows' && vars.AZURE_SIGNING_ENDPOINT != ''
+        uses: azure/trusted-signing-action@v0.5.7
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files-folder: target/release
+          files-folder-filter: usher.exe,usher-host.exe
+
+      - name: Sign & notarize macOS binary (optional)
+        if: runner.os == 'macOS' && vars.APPLE_NOTARY_ENABLED == 'true'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p build build.keychain
+          security import cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k build build.keychain
+          security list-keychains -d user -s build.keychain
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" target/release/usher
+          ditto -c -k --keepParent target/release/usher usher-notarize.zip
+          xcrun notarytool submit usher-notarize.zip --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          rm -f cert.p12 usher-notarize.zip
 
       - name: Package Windows artifacts
         if: runner.os == 'Windows'
@@ -58,6 +85,7 @@ jobs:
           Copy-Item contrib/install-windows.ps1 dist/bundle/install-windows.ps1
           Copy-Item contrib/install-windows.cmd dist/bundle/install-windows.cmd
           Copy-Item README.md dist/bundle/README.md
+          Copy-Item SECURITY.md dist/bundle/SECURITY.md
           Compress-Archive -Path dist/bundle/* -DestinationPath dist/usher-windows-x86_64.zip -Force
           Remove-Item -Recurse -Force dist/bundle
 
@@ -91,7 +119,7 @@ jobs:
           }
 
           $rawTag = "${{ github.event.inputs.tag || github.ref_name }}".TrimStart('v')
-          $appVer = if ($rawTag -match '^\d+\.\d+\.\d+') { $rawTag } else { "0.4.3" }
+          $appVer = if ($rawTag -match '^\d+\.\d+\.\d+') { $rawTag } else { "0.5.0" }
           $numVer = ([regex]::Match($appVer, '^\d+\.\d+\.\d+')).Value
 
           & $iscc `
@@ -108,24 +136,13 @@ jobs:
             throw "Expected installer dist\usher-setup-windows-x86_64.exe was not generated"
           }
 
-      - name: Package Linux artifacts
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p dist/bundle
-          cp target/release/usher dist/bundle/usher
-          cp target/release/usher-host dist/bundle/usher-host
-          cp contrib/99-usher-uinput.rules dist/bundle/99-usher-uinput.rules
-          cp contrib/install-host.sh dist/bundle/install-host.sh
-          cp README.md dist/bundle/README.md
-          tar -C dist/bundle -czf dist/usher-linux-x86_64.tar.gz .
-          rm -rf dist/bundle
-
       - name: Package macOS artifacts
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist/bundle
           cp target/release/usher dist/bundle/usher
           cp README.md dist/bundle/README.md
+          cp SECURITY.md dist/bundle/SECURITY.md
           tar -C dist/bundle -czf dist/usher-macos-aarch64.tar.gz .
           rm -rf dist/bundle
 
@@ -134,17 +151,96 @@ jobs:
           name: dist-${{ matrix.name }}
           path: dist/*
 
+  build-linux:
+    name: Build Release (linux-${{ matrix.arch }}, glibc 2.28)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            os: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          - arch: aarch64
+            deb_arch: arm64
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install AlmaLinux 8 build dependencies
+        run: |
+          dnf install -y alsa-lib-devel systemd-devel libX11-devel libxkbcommon-devel
+          if [ "$(uname -m)" = "x86_64" ] && ! command -v nasm >/dev/null 2>&1; then
+            dnf install -y epel-release
+            dnf install -y nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Verify minimum glibc <= 2.28 compatibility
+        run: |
+          for bin in target/release/usher target/release/usher-host; do
+            bad_glibc="$(readelf -V "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -uV | awk -F'[_.]' '($2*10000 + $3*100 + ($4+0)) > 22800' || true)"
+            if [[ -n "$bad_glibc" ]]; then
+              echo "error: $bin requires glibc > 2.28: $bad_glibc" >&2
+              exit 1
+            fi
+            echo "$bin max GLIBC requirement: $(readelf -V "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -uV | tail -n1)"
+          done
+
+      - name: Stage Linux tarball & deb binaries
+        run: |
+          mkdir -p dist/bundle dist/deb-${{ matrix.deb_arch }}
+          cp target/release/usher dist/bundle/usher
+          cp target/release/usher-host dist/bundle/usher-host
+          cp contrib/99-usher-uinput.rules dist/bundle/99-usher-uinput.rules
+          cp contrib/install-host.sh dist/bundle/install-host.sh
+          cp README.md dist/bundle/README.md
+          cp SECURITY.md dist/bundle/SECURITY.md
+          tar -C dist/bundle -czf dist/usher-linux-${{ matrix.arch }}.tar.gz .
+          rm -rf dist/bundle
+          cp target/release/usher dist/deb-${{ matrix.deb_arch }}/usher
+          cp target/release/usher-host dist/deb-${{ matrix.deb_arch }}/usher-host
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
-          path: release-assets
+          path: release-staging
           merge-multiple: true
+
+      - name: Build .deb packages & collect final assets
+        run: |
+          RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          APP_VER="${RAW_TAG#v}"
+          if [[ ! "$APP_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            APP_VER="0.5.0"
+          fi
+          mkdir -p release-assets
+          cp release-staging/*.zip release-staging/*.exe release-staging/*.tar.gz release-assets/
+          bash contrib/packaging/build-deb.sh "$APP_VER" amd64 release-staging/deb-amd64 release-assets
+          bash contrib/packaging/build-deb.sh "$APP_VER" arm64 release-staging/deb-arm64 release-assets
 
       - name: Generate SHA256SUMS.txt
         working-directory: release-assets

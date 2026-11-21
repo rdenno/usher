@@ -129,7 +129,7 @@ impl OverlayRectUniform {
     }
 }
 
-struct OverlayResources {
+struct QuadResources {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -140,7 +140,27 @@ struct OverlayResources {
     bind_group: wgpu::BindGroup,
     format: wgpu::TextureFormat,
     visible: bool,
+}
+
+struct OverlayResources {
+    quad: QuadResources,
     last_panel: (u32, u32, u32, u32),
+}
+
+pub struct CursorRenderData<'a> {
+    pub shape_id: u32,
+    pub width: u16,
+    pub height: u16,
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
+    pub norm_x: f32,
+    pub norm_y: f32,
+    pub rgba: &'a [u8],
+}
+
+struct CursorResources {
+    quad: QuadResources,
+    shape_id: u32,
 }
 
 #[repr(C)]
@@ -162,6 +182,7 @@ impl UniformData {
 struct YuvTextures {
     width: u32,
     height: u32,
+    is_444: bool,
     y_tex: wgpu::Texture,
     u_tex: wgpu::Texture,
     v_tex: wgpu::Texture,
@@ -179,6 +200,7 @@ pub struct Renderer {
     uniform_buf: wgpu::Buffer,
     textures: YuvTextures,
     overlay: OverlayResources,
+    cursor: CursorResources,
     has_frame: bool,
 }
 
@@ -324,9 +346,11 @@ impl Renderer {
             &uniform_buf,
             initial_video_w.max(2),
             initial_video_h.max(2),
+            false,
         );
 
         let overlay = create_overlay_resources(&device, format);
+        let cursor = create_cursor_resources(&device, format);
 
         Ok(Self {
             surface,
@@ -339,6 +363,7 @@ impl Renderer {
             uniform_buf,
             textures,
             overlay,
+            cursor,
             has_frame: false,
         })
     }
@@ -353,33 +378,34 @@ impl Renderer {
 
     pub fn update_overlay(&mut self, output: Option<&OverlayRenderOutput>) {
         let Some(out) = output else {
-            self.overlay.visible = false;
+            self.overlay.quad.visible = false;
             return;
         };
         if out.width == 0 || out.height == 0 || out.rgba.len() < (out.width * out.height * 4) as usize {
-            self.overlay.visible = false;
+            self.overlay.quad.visible = false;
             return;
         }
 
-        if self.overlay.tex_w != out.width || self.overlay.tex_h != out.height {
-            let (tex, bind_group) = allocate_overlay_texture(
+        if self.overlay.quad.tex_w != out.width || self.overlay.quad.tex_h != out.height {
+            let (tex, bind_group) = allocate_quad_texture(
                 &self.device,
-                &self.overlay.bgl,
-                &self.overlay.sampler,
-                &self.overlay.uniform_buf,
-                self.overlay.format,
+                &self.overlay.quad.bgl,
+                &self.overlay.quad.sampler,
+                &self.overlay.quad.uniform_buf,
+                "usher-overlay",
+                self.overlay.quad.format,
                 out.width,
                 out.height,
             );
-            self.overlay.tex = tex;
-            self.overlay.bind_group = bind_group;
-            self.overlay.tex_w = out.width;
-            self.overlay.tex_h = out.height;
+            self.overlay.quad.tex = tex;
+            self.overlay.quad.bind_group = bind_group;
+            self.overlay.quad.tex_w = out.width;
+            self.overlay.quad.tex_h = out.height;
         }
 
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.overlay.tex,
+                texture: &self.overlay.quad.tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -399,7 +425,88 @@ impl Renderer {
 
         self.overlay.last_panel = (out.panel_x, out.panel_y, out.panel_w, out.panel_h);
         self.write_overlay_rect_uniform();
-        self.overlay.visible = true;
+        self.overlay.quad.visible = true;
+    }
+
+    pub fn update_cursor(&mut self, data: Option<CursorRenderData<'_>>) {
+        let Some(c) = data else {
+            self.cursor.quad.visible = false;
+            return;
+        };
+        let cw = c.width as u32;
+        let ch = c.height as u32;
+        let expected_len = (cw * ch * 4) as usize;
+        if cw == 0 || ch == 0 || c.rgba.len() < expected_len {
+            self.cursor.quad.visible = false;
+            return;
+        }
+
+        if self.cursor.quad.tex_w != cw || self.cursor.quad.tex_h != ch {
+            let (tex, bind_group) = allocate_quad_texture(
+                &self.device,
+                &self.cursor.quad.bgl,
+                &self.cursor.quad.sampler,
+                &self.cursor.quad.uniform_buf,
+                "usher-cursor",
+                self.cursor.quad.format,
+                cw,
+                ch,
+            );
+            self.cursor.quad.tex = tex;
+            self.cursor.quad.bind_group = bind_group;
+            self.cursor.quad.tex_w = cw;
+            self.cursor.quad.tex_h = ch;
+            self.cursor.shape_id = 0;
+        }
+
+        if self.cursor.shape_id != c.shape_id {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.cursor.quad.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &c.rgba[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(cw * 4),
+                    rows_per_image: Some(ch),
+                },
+                wgpu::Extent3d {
+                    width: cw,
+                    height: ch,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.cursor.shape_id = c.shape_id;
+        }
+
+        let ww = self.config.width.max(1) as f64;
+        let wh = self.config.height.max(1) as f64;
+        let (rx, ry, rw, rh) = video_letterbox_rect(
+            self.config.width,
+            self.config.height,
+            self.textures.width,
+            self.textures.height,
+        );
+        let scale = (rw / self.textures.width.max(1) as f64)
+            .min(rh / self.textures.height.max(1) as f64);
+        let anchor_x = rx + (c.norm_x.clamp(0.0, 1.0) as f64) * rw;
+        let anchor_y = ry + (c.norm_y.clamp(0.0, 1.0) as f64) * rh;
+        let px = anchor_x - (c.hotspot_x as f64) * scale;
+        let py = anchor_y - (c.hotspot_y as f64) * scale;
+        let pw = (cw as f64) * scale;
+        let ph = (ch as f64) * scale;
+        let u = OverlayRectUniform {
+            x0: ((px / ww) * 2.0 - 1.0) as f32,
+            x1: (((px + pw) / ww) * 2.0 - 1.0) as f32,
+            y_top: (1.0 - (py / wh) * 2.0) as f32,
+            y_bot: (1.0 - ((py + ph) / wh) * 2.0) as f32,
+        };
+        self.queue
+            .write_buffer(&self.cursor.quad.uniform_buf, 0, u.as_bytes());
+        self.cursor.quad.visible = true;
     }
 
     fn write_overlay_rect_uniform(&self) {
@@ -413,7 +520,7 @@ impl Renderer {
             y_bot: 1.0 - ((py + ph) as f32 / wh) * 2.0,
         };
         self.queue
-            .write_buffer(&self.overlay.uniform_buf, 0, u.as_bytes());
+            .write_buffer(&self.overlay.quad.uniform_buf, 0, u.as_bytes());
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -424,14 +531,17 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.update_uniform();
-        if self.overlay.visible {
+        if self.overlay.quad.visible {
             self.write_overlay_rect_uniform();
         }
     }
 
     pub fn render(&mut self, frame: Option<&Yuv420Frame>) {
         if let Some(f) = frame {
-            if f.width != self.textures.width || f.height != self.textures.height {
+            if f.width != self.textures.width
+                || f.height != self.textures.height
+                || f.is_444 != self.textures.is_444
+            {
                 self.textures = allocate_yuv_textures(
                     &self.device,
                     &self.bind_group_layout,
@@ -439,24 +549,30 @@ impl Renderer {
                     &self.uniform_buf,
                     f.width.max(2),
                     f.height.max(2),
+                    f.is_444,
                 );
                 self.update_uniform();
             }
 
+            let (uv_w, uv_h) = if f.is_444 {
+                (f.width, f.height)
+            } else {
+                (f.width / 2, f.height / 2)
+            };
             upload_plane(&self.queue, &self.textures.y_tex, f.width, f.height, f.y_stride, &f.y);
             upload_plane(
                 &self.queue,
                 &self.textures.u_tex,
-                f.width / 2,
-                f.height / 2,
+                uv_w,
+                uv_h,
                 f.u_stride,
                 &f.u,
             );
             upload_plane(
                 &self.queue,
                 &self.textures.v_tex,
-                f.width / 2,
-                f.height / 2,
+                uv_w,
+                uv_h,
                 f.v_stride,
                 &f.v,
             );
@@ -503,9 +619,14 @@ impl Renderer {
                 pass.set_bind_group(0, &self.textures.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            if self.overlay.visible {
-                pass.set_pipeline(&self.overlay.pipeline);
-                pass.set_bind_group(0, &self.overlay.bind_group, &[]);
+            if self.cursor.quad.visible {
+                pass.set_pipeline(&self.cursor.quad.pipeline);
+                pass.set_bind_group(0, &self.cursor.quad.bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            if self.overlay.quad.visible {
+                pass.set_pipeline(&self.overlay.quad.pipeline);
+                pass.set_bind_group(0, &self.overlay.quad.bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
         }
@@ -586,10 +707,16 @@ fn allocate_yuv_textures(
     uniform_buf: &wgpu::Buffer,
     width: u32,
     height: u32,
+    is_444: bool,
 ) -> YuvTextures {
+    let (uv_w, uv_h) = if is_444 {
+        (width, height)
+    } else {
+        ((width / 2).max(1), (height / 2).max(1))
+    };
     let y_tex = create_r8_texture(device, "y-plane", width, height);
-    let u_tex = create_r8_texture(device, "u-plane", (width / 2).max(1), (height / 2).max(1));
-    let v_tex = create_r8_texture(device, "v-plane", (width / 2).max(1), (height / 2).max(1));
+    let u_tex = create_r8_texture(device, "u-plane", uv_w, uv_h);
+    let v_tex = create_r8_texture(device, "v-plane", uv_w, uv_h);
 
     let y_view = y_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let u_view = u_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -625,6 +752,7 @@ fn allocate_yuv_textures(
     YuvTextures {
         width,
         height,
+        is_444,
         y_tex,
         u_tex,
         v_tex,
@@ -723,23 +851,31 @@ fn block_on<F: Future>(fut: F) -> F::Output {
     }
 }
 
-fn create_overlay_resources(
+fn create_quad_resources(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
-) -> OverlayResources {
-    let ov_tex_format = if surface_format.is_srgb() {
+    label_prefix: &str,
+) -> QuadResources {
+    let tex_format = if surface_format.is_srgb() {
         wgpu::TextureFormat::Rgba8UnormSrgb
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     };
 
+    let shader_label = format!("{label_prefix}-shader");
+    let sampler_label = format!("{label_prefix}-sampler");
+    let uniform_label = format!("{label_prefix}-rect-uniform");
+    let bgl_label = format!("{label_prefix}-bgl");
+    let layout_label = format!("{label_prefix}-layout");
+    let pipeline_label = format!("{label_prefix}-pipeline");
+
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("usher-overlay-shader"),
+        label: Some(&shader_label),
         source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER_WGSL.into()),
     });
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("usher-overlay-sampler"),
+        label: Some(&sampler_label),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Linear,
@@ -754,13 +890,13 @@ fn create_overlay_resources(
         y_top: 0.5,
     };
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("usher-overlay-rect-uniform"),
+        label: Some(&uniform_label),
         contents: init_uniform.as_bytes(),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("usher-overlay-bgl"),
+        label: Some(&bgl_label),
         entries: &[
             tex_entry(0),
             wgpu::BindGroupLayoutEntry {
@@ -783,13 +919,13 @@ fn create_overlay_resources(
     });
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("usher-overlay-layout"),
+        label: Some(&layout_label),
         bind_group_layouts: &[Some(&bgl)],
         immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("usher-overlay-pipeline"),
+        label: Some(&pipeline_label),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -814,10 +950,18 @@ fn create_overlay_resources(
         cache: None,
     });
 
-    let (tex, bind_group) =
-        allocate_overlay_texture(device, &bgl, &sampler, &uniform_buf, ov_tex_format, 4, 4);
+    let (tex, bind_group) = allocate_quad_texture(
+        device,
+        &bgl,
+        &sampler,
+        &uniform_buf,
+        label_prefix,
+        tex_format,
+        4,
+        4,
+    );
 
-    OverlayResources {
+    QuadResources {
         pipeline,
         bgl,
         sampler,
@@ -826,23 +970,46 @@ fn create_overlay_resources(
         tex_h: 4,
         tex,
         bind_group,
-        format: ov_tex_format,
+        format: tex_format,
         visible: false,
+    }
+}
+
+fn create_overlay_resources(
+    device: &wgpu::Device,
+    surface_format: wgpu::TextureFormat,
+) -> OverlayResources {
+    OverlayResources {
+        quad: create_quad_resources(device, surface_format, "usher-overlay"),
         last_panel: (0, 0, 4, 4),
     }
 }
 
-fn allocate_overlay_texture(
+fn create_cursor_resources(
+    device: &wgpu::Device,
+    surface_format: wgpu::TextureFormat,
+) -> CursorResources {
+    CursorResources {
+        quad: create_quad_resources(device, surface_format, "usher-cursor"),
+        shape_id: 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_quad_texture(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     uniform_buf: &wgpu::Buffer,
+    label_prefix: &str,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
 ) -> (wgpu::Texture, wgpu::BindGroup) {
+    let tex_label = format!("{label_prefix}-tex");
+    let bg_label = format!("{label_prefix}-bg");
     let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("usher-overlay-tex"),
+        label: Some(&tex_label),
         size: wgpu::Extent3d {
             width: width.max(1),
             height: height.max(1),
@@ -857,7 +1024,7 @@ fn allocate_overlay_texture(
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("usher-overlay-bg"),
+        label: Some(&bg_label),
         layout: bgl,
         entries: &[
             wgpu::BindGroupEntry {

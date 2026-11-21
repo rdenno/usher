@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use usher_proto::handshake::{DisplayInfo, QualityPreference, VideoCodec};
+use usher_proto::handshake::{ChromaSubsampling, DisplayInfo, QualityPreference, VideoCodec};
 
 pub const MAX_IPC_FRAME_LEN: usize = 8 * 1024 * 1024;
 
@@ -25,6 +25,10 @@ pub struct WorkerVideoConfig {
     pub encoder: String,
     pub prefer: QualityPreference,
     pub display_index: u8,
+    #[serde(default)]
+    pub chroma: ChromaSubsampling,
+    #[serde(default)]
+    pub separate_cursor: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +46,19 @@ pub enum WorkerMsg {
         in_place_bitrate: bool,
     },
     ClipboardText(String),
+    CursorPos {
+        visible: bool,
+        x_norm: u16,
+        y_norm: u16,
+    },
+    CursorShape {
+        shape_id: u32,
+        width: u16,
+        height: u16,
+        hotspot_x: u16,
+        hotspot_y: u16,
+        rgba: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +135,34 @@ pub async fn write_worker_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &WorkerMsg)
             in_place_bitrate,
         } => write_frame(w, 0x05, &[codec.to_u8(), u8::from(*in_place_bitrate)]).await,
         WorkerMsg::ClipboardText(text) => write_frame(w, 0x06, text.as_bytes()).await,
+        WorkerMsg::CursorPos {
+            visible,
+            x_norm,
+            y_norm,
+        } => {
+            let mut buf = [0u8; 5];
+            buf[0] = u8::from(*visible);
+            buf[1..3].copy_from_slice(&x_norm.to_le_bytes());
+            buf[3..5].copy_from_slice(&y_norm.to_le_bytes());
+            write_frame(w, 0x07, &buf).await
+        }
+        WorkerMsg::CursorShape {
+            shape_id,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            rgba,
+        } => {
+            let mut buf = Vec::with_capacity(12 + rgba.len());
+            buf.extend_from_slice(&shape_id.to_le_bytes());
+            buf.extend_from_slice(&width.to_le_bytes());
+            buf.extend_from_slice(&height.to_le_bytes());
+            buf.extend_from_slice(&hotspot_x.to_le_bytes());
+            buf.extend_from_slice(&hotspot_y.to_le_bytes());
+            buf.extend_from_slice(rgba);
+            write_frame(w, 0x08, &buf).await
+        }
     }
 }
 
@@ -159,6 +204,29 @@ pub async fn read_worker_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<WorkerMs
         0x06 => Ok(WorkerMsg::ClipboardText(
             String::from_utf8_lossy(&payload).into_owned(),
         )),
+        0x07 => {
+            if payload.len() < 5 {
+                bail!("short CursorPos IPC payload");
+            }
+            Ok(WorkerMsg::CursorPos {
+                visible: payload[0] != 0,
+                x_norm: u16::from_le_bytes([payload[1], payload[2]]),
+                y_norm: u16::from_le_bytes([payload[3], payload[4]]),
+            })
+        }
+        0x08 => {
+            if payload.len() < 12 {
+                bail!("short CursorShape IPC payload");
+            }
+            Ok(WorkerMsg::CursorShape {
+                shape_id: u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")),
+                width: u16::from_le_bytes([payload[4], payload[5]]),
+                height: u16::from_le_bytes([payload[6], payload[7]]),
+                hotspot_x: u16::from_le_bytes([payload[8], payload[9]]),
+                hotspot_y: u16::from_le_bytes([payload[10], payload[11]]),
+                rgba: payload[12..].to_vec(),
+            })
+        }
         other => bail!("unknown WorkerMsg tag 0x{other:02x}"),
     }
 }
@@ -243,6 +311,19 @@ mod tests {
                 in_place_bitrate: true,
             },
             WorkerMsg::ClipboardText("copied from host".into()),
+            WorkerMsg::CursorPos {
+                visible: true,
+                x_norm: 12345,
+                y_norm: 54321,
+            },
+            WorkerMsg::CursorShape {
+                shape_id: 77,
+                width: 2,
+                height: 2,
+                hotspot_x: 1,
+                hotspot_y: 0,
+                rgba: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255],
+            },
         ];
 
         let h_cmds = vec![
@@ -256,6 +337,8 @@ mod tests {
                 encoder: "auto".into(),
                 prefer: QualityPreference::Latency,
                 display_index: 0,
+                chroma: ChromaSubsampling::Yuv444,
+                separate_cursor: true,
             }),
             HostCmd::UpdateBitrate(18_000),
             HostCmd::RequestKeyframe,

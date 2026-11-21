@@ -3,7 +3,7 @@ use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::formats::YUVSource;
 use rusty_opus::OpusDecoder;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -13,7 +13,8 @@ use usher_proto::fragment::{FrameReassembler, VideoSubheader};
 use usher_proto::handshake::{HelloMessage, VideoCodec, parse_hello_line};
 use usher_proto::input::InputEvent;
 use usher_proto::packet::{
-    ControlMessage, PacketKind, PingPayload, PongPayload, open_packet, seal_packet,
+    ControlMessage, PacketKind, PingPayload, PongPayload, TUNNEL_MAGIC, decode_tunnel_frame_len,
+    encode_tunnel_frame, open_packet, seal_packet,
 };
 
 struct ChildGuard(Option<Child>);
@@ -379,6 +380,174 @@ fn host_adapts_bitrate_and_fec_on_feedback_and_applies_reconfigure() {
     wait_clean_exit(guard, stdin);
 }
 
+#[test]
+fn host_recovers_under_simulated_loss_reordering_and_jitter() {
+    let (guard, stdin, hello, sock, mut crypto) = spawn_test_host(&[
+        "--bind-ip",
+        "127.0.0.1",
+        "--capture",
+        "testsrc",
+        "--width",
+        "1280",
+        "--height",
+        "720",
+        "--fps",
+        "30",
+        "--max-bitrate-kbps",
+        "30000",
+        "--bitrate-kbps",
+        "20000",
+        "--fec",
+        "15",
+        "--mtu",
+        "1200",
+        "--no-input",
+        "--no-audio",
+    ]);
+
+    send_ctrl(
+        &sock,
+        &mut crypto,
+        hello.mtu,
+        &ControlMessage::ClientHello {
+            client_version: 2,
+            capabilities: 0x03,
+        },
+    );
+
+    let mut reassembler = FrameReassembler::new(8);
+    let mut h264 = Decoder::with_api_config(OpenH264API::from_source(), DecoderConfig::new())
+        .expect("create OpenH264 decoder");
+    let mut dropped_for_frame = HashSet::<u32>::new();
+    let mut fec_recovered_total = 0usize;
+    let mut decoded_video_frames = 0usize;
+    let mut reorder_buf: Vec<Vec<u8>> = Vec::with_capacity(3);
+    let mut last_pli = Instant::now() - Duration::from_secs(1);
+
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline && (decoded_video_frames < 6 || fec_recovered_total < 2) {
+        if let Ok(n) = sock.recv(&mut buf) {
+            reorder_buf.push(buf[..n].to_vec());
+            if reorder_buf.len() < 3 {
+                continue;
+            }
+        } else if reorder_buf.is_empty() {
+            continue;
+        }
+
+        // Permute packets ([0,1,2] -> [2,0,1]) to simulate out-of-order UDP delivery / jitter.
+        let order: &[usize] = match reorder_buf.len() {
+            3 => &[2, 0, 1],
+            2 => &[1, 0],
+            _ => &[0],
+        };
+        let batch = std::mem::take(&mut reorder_buf);
+        for &idx in order {
+            let (kind, _seq, pt) =
+                open_packet(&mut crypto, &batch[idx]).expect("valid AEAD packet");
+            if !matches!(kind, PacketKind::VideoData | PacketKind::VideoFec) {
+                continue;
+            }
+            let (sub, _) = VideoSubheader::decode_split(&pt).expect("valid subheader");
+            // Drop shard 0 on every 2nd eligible multi-shard frame to force XOR-FEC recovery.
+            if kind == PacketKind::VideoData
+                && sub.data_shards >= 2
+                && sub.parity_shards >= 1
+                && sub.packet_idx == 0
+                && sub.frame_id.is_multiple_of(2)
+                && dropped_for_frame.insert(sub.frame_id)
+            {
+                continue;
+            }
+            let outcome = reassembler
+                .push_packet(kind, &pt)
+                .expect("valid video shard");
+            if outcome.request_keyframe && last_pli.elapsed() >= Duration::from_millis(150) {
+                last_pli = Instant::now();
+                send_ctrl(&sock, &mut crypto, hello.mtu, &ControlMessage::RequestKeyframe);
+            }
+            if let Some(frame) = outcome.completed {
+                fec_recovered_total += frame.fec_recovered;
+                for nal in openh264::nal_units(&frame.data) {
+                    if let Ok(Some(yuv)) = h264.decode(nal) {
+                        assert_eq!(yuv.dimensions(), (1280, 720));
+                        decoded_video_frames += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        fec_recovered_total >= 2,
+        "expected >= 2 XOR-FEC recoveries under reordering/loss, got {fec_recovered_total}"
+    );
+    assert!(
+        decoded_video_frames >= 6,
+        "expected >= 6 decoded frames under simulated loss+reorder, got {decoded_video_frames}"
+    );
+
+    // Inject high loss + jitter spike: host should cut bitrate and raise FEC parity.
+    send_ctrl(
+        &sock,
+        &mut crypto,
+        hello.mtu,
+        &ControlMessage::NetworkFeedback {
+            loss_after_fec_bps: 400,
+            fec_recovery_bps: 0,
+            rtt_us: 95_000,
+            late_frames: 2,
+            recv_kbps: 12_000,
+        },
+    );
+    let cut_status = recv_status(&sock, &mut crypto, |m| {
+        matches!(
+            m,
+            ControlMessage::StreamStatus {
+                target_bitrate_kbps,
+                fec_percent,
+                ..
+            } if *target_bitrate_kbps < 20_000 && *fec_percent > 15
+        )
+    });
+    let cut_br = match cut_status {
+        ControlMessage::StreamStatus {
+            target_bitrate_kbps,
+            ..
+        } => target_bitrate_kbps,
+        _ => unreachable!(),
+    };
+
+    // Send sustained clean reports: OpenH264 applies AIMD bitrate growth immediately after 2 clean windows.
+    for _ in 0..4 {
+        send_ctrl(
+            &sock,
+            &mut crypto,
+            hello.mtu,
+            &ControlMessage::NetworkFeedback {
+                loss_after_fec_bps: 0,
+                fec_recovery_bps: 0,
+                rtt_us: 12_000,
+                late_frames: 0,
+                recv_kbps: 25_000,
+            },
+        );
+    }
+    let recovered_status = recv_status(&sock, &mut crypto, |m| {
+        matches!(
+            m,
+            ControlMessage::StreamStatus {
+                target_bitrate_kbps,
+                ..
+            } if *target_bitrate_kbps > cut_br
+        )
+    });
+    assert!(matches!(recovered_status, ControlMessage::StreamStatus { .. }));
+
+    wait_clean_exit(guard, stdin);
+}
+
 #[cfg(target_os = "windows")]
 #[ignore]
 #[test]
@@ -514,4 +683,142 @@ fn windows_live_capture_from_session0_streams_real_frames() {
         !logs.iter().any(|l| l.contains("OpenH264 testsrc")),
         "expected real desktop/lock-screen capture, but fell back to OpenH264 testsrc: {logs:?}"
     );
+}
+
+#[test]
+fn host_streams_encrypted_video_over_ssh_stdio_tcp_tunnel_and_exits_on_eof() {
+    let bin = env!("CARGO_BIN_EXE_usher-host");
+    let child = Command::new(bin)
+        .args([
+            "--bind-ip",
+            "127.0.0.1",
+            "--capture",
+            "testsrc",
+            "--width",
+            "320",
+            "--height",
+            "180",
+            "--fps",
+            "30",
+            "--no-audio",
+            "--no-input",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn usher-host");
+
+    let mut guard = ChildGuard(Some(child));
+    let mut stdin = guard.0.as_mut().unwrap().stdin.take().unwrap();
+    let stdout = guard.0.as_mut().unwrap().stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let mut hello = None;
+    let mut line = String::new();
+    for _ in 0..32 {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read stdout line");
+        assert!(n > 0, "usher-host closed stdout before USHER_HELLO");
+        if let Some(res) = parse_hello_line(&line) {
+            hello = Some(res.expect("valid USHER_HELLO"));
+            break;
+        }
+    }
+    let hello = hello.expect("expected USHER_HELLO line");
+    assert!(hello.tcp_tunnel);
+
+    let key = hello.decode_session_key().expect("valid session key");
+    let mut crypto = SessionCrypto::new(&key, Role::Client);
+
+    let client_hello = seal_packet(
+        &mut crypto,
+        PacketKind::Control,
+        &ControlMessage::ClientHello {
+            client_version: 2,
+            capabilities: 0x03,
+        }
+        .encode(),
+        hello.mtu as usize,
+    )
+    .unwrap();
+    let ping = seal_packet(
+        &mut crypto,
+        PacketKind::Ping,
+        &PingPayload { sent_us: 77_777 }.encode(),
+        hello.mtu as usize,
+    )
+    .unwrap();
+
+    stdin.write_all(&TUNNEL_MAGIC).unwrap();
+    stdin
+        .write_all(&encode_tunnel_frame(&client_hello).unwrap())
+        .unwrap();
+    stdin.write_all(&encode_tunnel_frame(&ping).unwrap()).unwrap();
+    stdin.flush().unwrap();
+
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).expect("read TUNNEL_MAGIC");
+    assert_eq!(magic, TUNNEL_MAGIC);
+
+    let mut reassembler = FrameReassembler::new(8);
+    let mut h264 = Decoder::with_api_config(OpenH264API::from_source(), DecoderConfig::new())
+        .expect("init OpenH264 decoder");
+    let mut got_status = false;
+    let mut got_pong = false;
+    let mut decoded_frames = 0usize;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if got_status && got_pong && decoded_frames >= 2 {
+            break;
+        }
+        let mut len_hdr = [0u8; 2];
+        reader
+            .read_exact(&mut len_hdr)
+            .expect("read tunnel frame length");
+        let len = decode_tunnel_frame_len(len_hdr).expect("valid tunnel frame length");
+        let mut raw = vec![0u8; len];
+        reader
+            .read_exact(&mut raw)
+            .expect("read tunnel frame payload");
+
+        let (kind, _seq, pt) = open_packet(&mut crypto, &raw).expect("valid AEAD packet");
+        match kind {
+            PacketKind::Control => {
+                if let Ok(ControlMessage::StreamStatus { width, height, .. }) =
+                    ControlMessage::decode(&pt)
+                {
+                    assert_eq!((width, height), (320, 180));
+                    got_status = true;
+                }
+            }
+            PacketKind::Pong => {
+                let pong = PongPayload::decode(&pt).expect("valid Pong");
+                assert_eq!(pong.sent_us, 77_777);
+                got_pong = true;
+            }
+            PacketKind::VideoData | PacketKind::VideoFec => {
+                if let Some(frame) = reassembler
+                    .push_packet(kind, &pt)
+                    .expect("valid video shard")
+                    .completed
+                    && let Ok(Some(yuv)) = h264.decode(&frame.data)
+                {
+                    assert_eq!(yuv.dimensions(), (320, 180));
+                    decoded_frames += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_status, "did not receive StreamStatus over TCP tunnel");
+    assert!(got_pong, "did not receive Pong over TCP tunnel");
+    assert!(
+        decoded_frames >= 2,
+        "expected >= 2 decoded frames over TCP tunnel, got {decoded_frames}"
+    );
+
+    wait_clean_exit(guard, stdin);
 }

@@ -1,11 +1,12 @@
-use crate::audio::AudioPlayer;
+use crate::audio::{AudioPlayer, MicCapturer};
 use crate::config::{PointerMode, ResolutionMode};
 use crate::keymap::winit_keycode_to_evdev;
 use crate::overlay::{OverlayAction, OverlayState};
-use crate::renderer::{Renderer, video_letterbox_rect};
-use crate::transport::{AppEvent, LatestSlot, Telemetry};
-use std::sync::Arc;
+use crate::renderer::{CursorRenderData, Renderer, video_letterbox_rect};
+use crate::transport::{AppEvent, LatestSlot, RemoteCursorState, Telemetry};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,14 +28,18 @@ pub struct ConnectedSession {
     pub initial_fullscreen: bool,
     pub relative_mouse: bool,
     pub input_enabled: bool,
+    pub separate_cursor: bool,
     pub hi_res_scroll: bool,
     pub input_tx: mpsc::Sender<InputEvent>,
     pub control_tx: mpsc::Sender<ControlMessage>,
     pub frame_slot: Arc<LatestSlot<crate::decoder::Yuv420Frame>>,
+    pub cursor_state: Arc<Mutex<RemoteCursorState>>,
+    pub drop_tx: Option<mpsc::Sender<PathBuf>>,
     pub telemetry: Arc<Telemetry>,
     pub audio_muted: Arc<AtomicBool>,
     pub overlay: OverlayState,
     pub _audio_player: Option<AudioPlayer>,
+    pub _mic_capturer: Option<MicCapturer>,
 }
 
 const WHEEL_DELTA_UNITS: f64 = 120.0;
@@ -189,6 +194,7 @@ pub struct UsherApp {
     scroll_accum: ScrollAccumulator,
     cursor_pos: (f64, f64),
     cursor_inside: bool,
+    last_cursor_shape_ready: bool,
     last_title_update: Instant,
     pending_resize: Option<(u16, u16, Instant)>,
 }
@@ -213,6 +219,7 @@ impl UsherApp {
             scroll_accum: ScrollAccumulator::new(),
             cursor_pos: (0.0, 0.0),
             cursor_inside: false,
+            last_cursor_shape_ready: false,
             last_title_update: Instant::now(),
             pending_resize: None,
         }
@@ -255,8 +262,15 @@ impl UsherApp {
             return;
         };
         let lock_cursor = !sess.overlay.open && sess.relative_mouse && self.focused;
-        let hide_cursor =
-            !sess.overlay.open && self.focused && sess.input_enabled && (lock_cursor || self.cursor_inside);
+        let has_shape = sess
+            .cursor_state
+            .lock()
+            .expect("cursor state lock poisoned")
+            .has_shape();
+        let hide_cursor = !sess.overlay.open
+            && self.focused
+            && sess.input_enabled
+            && (lock_cursor || (self.cursor_inside && (!sess.separate_cursor || has_shape)));
         win.set_cursor_visible(!hide_cursor);
         if lock_cursor {
             if win.set_cursor_grab(CursorGrabMode::Locked).is_err() {
@@ -332,10 +346,17 @@ impl UsherApp {
         let mbps = sess.telemetry.kbps.load(Ordering::Acquire) as f32 / 1000.0;
         let fec = sess.telemetry.fec_recovered.load(Ordering::Acquire);
         let mode = if sess.relative_mouse { "REL" } else { "ABS" };
+        let link = if sess.telemetry.transport_mode.load(Ordering::Acquire)
+            == crate::transport::TRANSPORT_SSH_TCP
+        {
+            "SSH-TCP"
+        } else {
+            "UDP"
+        };
 
         win.set_title(&format!(
-            "Usher — {} | {:.0} fps | {:.1} ms RTT | {:.1} Mbps | FEC: {} | [{}] (Ctrl+Alt+S/G/F/Q)",
-            sess.host_label, fps, rtt_ms, mbps, fec, mode
+            "Usher — {} | {:.0} fps | {:.1} ms RTT | {:.1} Mbps | FEC: {} | [{}] [{}] (Ctrl+Alt+S/G/F/Q)",
+            sess.host_label, fps, rtt_ms, mbps, fec, mode, link
         ));
     }
 
@@ -419,9 +440,7 @@ impl ApplicationHandler<AppEvent> for UsherApp {
         #[cfg(target_os = "windows")]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
-            attrs = attrs
-                .with_taskbar_icon(win_icon)
-                .with_drag_and_drop(false);
+            attrs = attrs.with_taskbar_icon(win_icon);
         }
         if sess.initial_fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -469,6 +488,29 @@ impl ApplicationHandler<AppEvent> for UsherApp {
             AppEvent::StreamStatusChanged => {
                 if let Some(sess) = &mut self.session {
                     sess.overlay.sync_from_telemetry(&sess.telemetry);
+                }
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+            AppEvent::CursorUpdated => {
+                let shape_ready = self.session.as_ref().is_some_and(|s| {
+                    s.cursor_state
+                        .lock()
+                        .expect("cursor state lock poisoned")
+                        .has_shape()
+                });
+                if shape_ready != self.last_cursor_shape_ready {
+                    self.last_cursor_shape_ready = shape_ready;
+                    self.apply_mouse_mode();
+                }
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+            AppEvent::Toast(msg) => {
+                if let Some(sess) = &mut self.session {
+                    sess.overlay.show_toast(msg);
                 }
                 if let Some(win) = &self.window {
                     win.request_redraw();
@@ -531,6 +573,45 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                         if let Some(out) = sess.overlay.render_if_dirty(ww, wh, &sess.telemetry) {
                             renderer.update_overlay(Some(&out));
                         }
+                    }
+                    if sess.separate_cursor && !sess.overlay.open {
+                        let cs = sess
+                            .cursor_state
+                            .lock()
+                            .expect("cursor state lock poisoned")
+                            .clone();
+                        let use_local_abs = !sess.relative_mouse
+                            && sess.input_enabled
+                            && self.focused
+                            && self.cursor_inside;
+                        let (visible, nx, ny) = if use_local_abs {
+                            let (ww, wh) = renderer.window_dimensions();
+                            let (vw, vh) = renderer.video_dimensions();
+                            let (rx, ry, rw, rh) = video_letterbox_rect(ww, wh, vw, vh);
+                            let lnx =
+                                ((self.cursor_pos.0 - rx) / rw.max(1.0)).clamp(0.0, 1.0) as f32;
+                            let lny =
+                                ((self.cursor_pos.1 - ry) / rh.max(1.0)).clamp(0.0, 1.0) as f32;
+                            (cs.visible && cs.has_shape(), lnx, lny)
+                        } else {
+                            (cs.visible && cs.has_shape(), cs.norm_x, cs.norm_y)
+                        };
+                        if visible {
+                            renderer.update_cursor(Some(CursorRenderData {
+                                shape_id: cs.shape_id,
+                                width: cs.width,
+                                height: cs.height,
+                                hotspot_x: cs.hotspot_x,
+                                hotspot_y: cs.hotspot_y,
+                                norm_x: nx,
+                                norm_y: ny,
+                                rgba: &cs.rgba,
+                            }));
+                        } else {
+                            renderer.update_cursor(None);
+                        }
+                    } else {
+                        renderer.update_cursor(None);
                     }
                     let frame = sess.frame_slot.try_take();
                     renderer.render(frame.as_ref());
@@ -672,6 +753,11 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                     let x = (nx * 65535.0).round() as u16;
                     let y = (ny * 65535.0).round() as u16;
                     let _ = sess.input_tx.try_send(InputEvent::MouseMoveAbs { x, y });
+                    if sess.separate_cursor
+                        && let Some(win) = &self.window
+                    {
+                        win.request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -732,6 +818,27 @@ impl ApplicationHandler<AppEvent> for UsherApp {
                     if input_tx.try_send(ev).is_err() {
                         self.scroll_accum.restore_unsent(ev);
                     }
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(sess) = &mut self.session {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    if !sess.input_enabled {
+                        sess.overlay
+                            .show_toast(format!("View-only: ignored drop ({name})"));
+                    } else if let Some(tx) = &sess.drop_tx {
+                        sess.overlay.show_toast(format!("Sending {name}..."));
+                        if tx.try_send(path).is_err() {
+                            sess.overlay
+                                .show_toast(format!("Upload queue full: {name}"));
+                        }
+                    }
+                }
+                if let Some(win) = &self.window {
+                    win.request_redraw();
                 }
             }
             _ => {}
